@@ -677,20 +677,36 @@ def app_html() -> str:
         <button id="close-agent-prompts" type="button" title="Close Agent prompt settings">Close</button>
       </div>
       <div class="settings-body">
-        <div class="detail" id="agent-prompt-panel">
-          <h3>Role Agent Profiles</h3>
+        <div class="detail" id="agent-affirmative-profile-panel">
+          <h3>Affirmative Profiles</h3>
           <div class="detail-body">
             <div class="form-grid">
               <label>Affirmative profile<select id="agent-affirmative-profile"></select></label>
-              <label>Negative profile<select id="agent-negative-profile"></select></label>
               <label>Affirmative profile ID<input id="agent-affirmative-profile-id" placeholder="Affirmative_1"></label>
-              <label>Negative profile ID<input id="agent-negative-profile-id" placeholder="Negative_web"></label>
               <label class="wide">Affirmative AGENT.md<textarea id="agent-affirmative-instructions"></textarea></label>
-              <label class="wide">Negative AGENT.md<textarea id="agent-negative-instructions"></textarea></label>
             </div>
             <div class="toolbar">
               <button id="save-affirmative-agent" type="button">Save Affirmative</button>
+            </div>
+          </div>
+        </div>
+        <div class="detail" id="agent-negative-profile-panel">
+          <h3>Negative Profiles</h3>
+          <div class="detail-body">
+            <div class="form-grid">
+              <label>Negative profile<select id="agent-negative-profile"></select></label>
+              <label>Negative profile ID<input id="agent-negative-profile-id" placeholder="Negative_web"></label>
+              <label class="wide">Negative AGENT.md<textarea id="agent-negative-instructions"></textarea></label>
+            </div>
+            <div class="toolbar">
               <button id="save-negative-agent" type="button">Save Negative</button>
+            </div>
+          </div>
+        </div>
+        <div class="detail" id="agent-profile-actions">
+          <h3>Profile Actions</h3>
+          <div class="detail-body">
+            <div class="toolbar">
               <button id="reset-agent-prompts" type="button">Ensure Defaults</button>
             </div>
             <pre id="agent-prompts-result">No Agent prompt changes yet.</pre>
