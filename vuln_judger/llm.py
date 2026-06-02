@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+
+from .providers import ProviderConfig
+
+
+class LLMClient:
+    provider_id: Optional[str] = None
+    provider_name: Optional[str] = None
+    model: Optional[str] = None
+
+    def complete(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        raise NotImplementedError
+
+
+@dataclass
+class OpenAICompatibleLLM(LLMClient):
+    api_key: str
+    model: str
+    endpoint: str = "https://api.openai.com/v1/chat/completions"
+    timeout_seconds: int = 45
+    extra_json: Dict[str, Any] = field(default_factory=dict)
+    provider_id: Optional[str] = None
+    provider_name: Optional[str] = None
+
+    def complete(self, system_prompt: str, user_prompt: str) -> Optional[str]:
+        result = self.request(system_prompt, user_prompt)
+        if not result["ok"]:
+            return None
+        return result.get("content")
+
+    def request(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+        payload = self._payload(system_prompt, user_prompt)
+        started = time.monotonic()
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "authorization": f"Bearer {self.api_key}",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                status = response.status
+                body_text = response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            return _failure(exc.code, started, f"HTTP {exc.code}: {body[:500]}")
+        except (urllib.error.URLError, TimeoutError) as exc:
+            return _failure(None, started, str(exc))
+        try:
+            body = json.loads(body_text)
+        except json.JSONDecodeError as exc:
+            return _failure(status, started, f"invalid JSON response: {exc}")
+        choices = body.get("choices") or []
+        if not choices:
+            return _failure(status, started, "response did not include choices")
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if not content:
+            return _failure(status, started, "response did not include message content")
+        return {
+            "ok": True,
+            "status": status,
+            "latency_ms": _latency_ms(started),
+            "content": str(content).strip(),
+            "response_excerpt": str(content).strip()[:500],
+        }
+
+    def test_connection(self) -> Dict[str, Any]:
+        result = self.request("You are a connectivity test.", "Reply with exactly: OK")
+        result.update(
+            {
+                "provider_id": self.provider_id,
+                "provider_name": self.provider_name,
+                "model": self.model,
+                "endpoint": self.endpoint,
+            }
+        )
+        return result
+
+    def _payload(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if "temperature" not in self.extra_json:
+            payload["temperature"] = 0.1
+        for key, value in self.extra_json.items():
+            if key in {"model", "messages"}:
+                continue
+            payload[key] = value
+        return payload
+
+
+def build_llm_clients(
+    enabled: bool,
+    affirmative_provider: Optional[ProviderConfig] = None,
+    negative_provider: Optional[ProviderConfig] = None,
+    legacy_model: Optional[str] = None,
+    legacy_endpoint: Optional[str] = None,
+) -> tuple[Optional[LLMClient], Optional[LLMClient]]:
+    if not enabled:
+        return None, None
+    if affirmative_provider or negative_provider:
+        affirmative = build_client_from_provider(affirmative_provider) if affirmative_provider else None
+        negative = build_client_from_provider(negative_provider) if negative_provider else None
+        return affirmative, negative
+    legacy = build_legacy_llm_client(legacy_model, legacy_endpoint)
+    return legacy, legacy
+
+
+def build_client_from_provider(provider: Optional[ProviderConfig], api_key_override: Optional[str] = None) -> Optional[LLMClient]:
+    if provider is None:
+        return None
+    api_key = provider.resolved_api_key(api_key_override)
+    if not api_key:
+        return None
+    return OpenAICompatibleLLM(
+        api_key=api_key,
+        model=provider.model,
+        endpoint=provider.endpoint,
+        extra_json=dict(provider.extra_json),
+        provider_id=provider.id,
+        provider_name=provider.name,
+    )
+
+
+def build_legacy_llm_client(model: Optional[str], endpoint: Optional[str]) -> Optional[LLMClient]:
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("VULN_JUDGER_LLM_API_KEY")
+    chosen_model = model or os.environ.get("VULN_JUDGER_LLM_MODEL")
+    if not api_key or not chosen_model:
+        return None
+    return OpenAICompatibleLLM(
+        api_key=api_key,
+        model=chosen_model,
+        endpoint=endpoint or os.environ.get("VULN_JUDGER_LLM_ENDPOINT") or OpenAICompatibleLLM.endpoint,
+        provider_id="legacy",
+        provider_name="Legacy environment provider",
+    )
+
+
+def test_provider_connection(provider: ProviderConfig, api_key_override: Optional[str] = None) -> Dict[str, Any]:
+    client = build_client_from_provider(provider, api_key_override=api_key_override)
+    if client is None:
+        return {
+            "ok": False,
+            "provider_id": provider.id,
+            "provider_name": provider.name,
+            "model": provider.model,
+            "endpoint": provider.endpoint,
+            "latency_ms": 0,
+            "error": "API key is not configured or environment variable is not set",
+        }
+    if isinstance(client, OpenAICompatibleLLM):
+        return client.test_connection()
+    return {"ok": False, "provider_id": provider.id, "error": "unsupported client type"}
+
+
+def _failure(status: Optional[int], started: float, error: str) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "status": status,
+        "latency_ms": _latency_ms(started),
+        "error": error,
+    }
+
+
+def _latency_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)

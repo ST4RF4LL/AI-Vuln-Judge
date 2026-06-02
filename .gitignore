@@ -1,0 +1,18 @@
+.DS_Store
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+
+# Local analyzer indexes
+.atlas/
+
+# Local vuln-judger runtime state and secrets
+.vuln-judger/providers.json
+.vuln-judger/runs/

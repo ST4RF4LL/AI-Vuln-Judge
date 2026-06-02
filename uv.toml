@@ -1,0 +1,8 @@
+# Project-local uv configuration.
+# The interpreter version is pinned in .python-version.
+
+required-version = ">=0.11.0"
+python-preference = "managed"
+python-downloads = "automatic"
+link-mode = "copy"
+compile-bytecode = false
