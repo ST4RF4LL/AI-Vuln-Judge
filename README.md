@@ -42,10 +42,16 @@ Only OpenAI-compatible Chat Completions APIs are supported. Prefer
 `api_key_env` to avoid writing plaintext keys to disk; plaintext keys are
 supported for local-only development and are masked by the API/UI.
 
-Default Agent prompts are stored in `.vuln-judger/agent_prompts.json` by
-default. The web UI exposes this through the top-right `Agent Prompts` button.
-New runs inherit those prompts unless the run start form or API payload
-overrides them.
+Agent prompts are maintained as role-specific profile directories. Each profile
+stores its prompt in `AGENT.md`, for example:
+
+```text
+agents/Affirmative/Affirmative_1/AGENT.md
+agents/Negative/Negative_web/AGENT.md
+```
+
+The web UI exposes these profiles through the top-right `Agent Prompts` button.
+New runs choose one affirmative profile and one negative profile.
 
 Example provider file:
 
@@ -96,17 +102,16 @@ uv run vuln-judger run \
   --negative-provider qwen-fast
 ```
 
-正方/反方 Agent role settings can be customized per run. The configuration is
-recorded with the run and is injected into LLM debate prompts:
+正方/反方 Agent profiles can be selected per run. The selected `AGENT.md`
+content is recorded with the run and injected into LLM debate prompts:
 
 ```bash
 uv run vuln-judger run \
   --report report.md \
   --source ./target-project \
-  --affirmative-agent-name "Exploit Prosecutor" \
-  --affirmative-agent-instructions "Prioritize source-backed exploitability and asset impact." \
-  --negative-agent-name "Mitigation Reviewer" \
-  --negative-agent-instructions "Challenge reachability, protections, and impact exaggeration."
+  --agents-dir agents \
+  --affirmative-agent-profile Affirmative_1 \
+  --negative-agent-profile Negative_web
 ```
 
 The older `--llm-model` / `--llm-endpoint` path still works as a shared legacy
@@ -120,7 +125,7 @@ uv run vuln-judger api \
   --port 8765 \
   --records-dir .vuln-judger/runs \
   --providers-file .vuln-judger/providers.json \
-  --agent-prompts-file .vuln-judger/agent_prompts.json
+  --agents-dir agents
 ```
 
 Open http://127.0.0.1:8765 to view saved judgement records. The page shows
@@ -141,14 +146,8 @@ curl -X POST http://127.0.0.1:8765/runs \
     "enable_llm": true,
     "affirmative_provider_id": "openai-main",
     "negative_provider_id": "qwen-fast",
-    "affirmative_agent": {
-      "name": "Exploit Prosecutor",
-      "instructions": "Prioritize source-backed exploitability and asset impact."
-    },
-    "negative_agent": {
-      "name": "Mitigation Reviewer",
-      "instructions": "Challenge reachability, protections, and impact exaggeration."
-    }
+    "affirmative_agent_profile": "Affirmative_1",
+    "negative_agent_profile": "Negative_web"
   }'
 ```
 
@@ -161,6 +160,7 @@ curl http://127.0.0.1:8765/runs/<run_id>/findings
 curl http://127.0.0.1:8765/runs/<run_id>/findings/<finding_id>
 curl http://127.0.0.1:8765/providers
 curl http://127.0.0.1:8765/providers/defaults
+curl http://127.0.0.1:8765/agent-prompts
 ```
 
 Test provider connectivity:

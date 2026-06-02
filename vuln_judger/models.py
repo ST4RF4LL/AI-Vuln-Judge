@@ -110,6 +110,9 @@ class ProjectContext:
 class AgentConfig:
     name: str
     instructions: str = ""
+    role: Optional[str] = None
+    profile_id: Optional[str] = None
+    path: Optional[str] = None
 
 
 @dataclass

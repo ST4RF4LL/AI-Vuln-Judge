@@ -11,7 +11,7 @@ from typing import Optional
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
-from .agents import DEFAULT_AGENT_PROMPTS_FILE, AgentPromptStore
+from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
 from .llm import test_provider_connection
 from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import run_judgement
@@ -27,26 +27,26 @@ def serve(
     port: int = 8765,
     records_dir: Path = DEFAULT_RECORDS_DIR,
     providers_file: Path = DEFAULT_PROVIDERS_FILE,
-    agent_prompts_file: Path = DEFAULT_AGENT_PROMPTS_FILE,
+    agents_dir: Path = DEFAULT_AGENTS_DIR,
 ) -> None:
     store = RunRecordStore(records_dir)
     provider_store = ProviderStore(providers_file)
-    agent_prompt_store = AgentPromptStore(agent_prompts_file)
-    server = ThreadingHTTPServer((host, port), make_handler(store, provider_store, agent_prompt_store))
+    agent_store = AgentDirectoryStore(agents_dir)
+    server = ThreadingHTTPServer((host, port), make_handler(store, provider_store, agent_store))
     print(f"vuln-judger UI listening on http://{host}:{port}")
     print(f"records directory: {store.root}")
     print(f"providers file: {provider_store.path}")
-    print(f"agent prompts file: {agent_prompt_store.path}")
+    print(f"agents directory: {agent_store.root}")
     server.serve_forever()
 
 
 def make_handler(
     store: RunRecordStore,
     provider_store: Optional[ProviderStore] = None,
-    agent_prompt_store: Optional[AgentPromptStore] = None,
+    agent_store: Optional[AgentDirectoryStore] = None,
 ):
     provider_store = provider_store or ProviderStore(store.root.parent / "providers.json")
-    agent_prompt_store = agent_prompt_store or AgentPromptStore(store.root.parent / "agent_prompts.json")
+    agent_store = agent_store or AgentDirectoryStore(DEFAULT_AGENTS_DIR)
     tasks = {}
     tasks_lock = Lock()
 
@@ -59,7 +59,7 @@ def make_handler(
                 if parts == ["runs"]:
                     payload = self._read_json()
                     run_id = _new_run_id()
-                    config = _config_from_payload(payload, provider_store.path, run_id, agent_prompt_store)
+                    config = _config_from_payload(payload, provider_store.path, run_id, agent_store)
                     task = _task_from_config(config, run_id, "running")
                     with tasks_lock:
                         tasks[run_id] = task
@@ -84,9 +84,13 @@ def make_handler(
                 if parts == ["agent-prompts"]:
                     payload = self._read_json()
                     if payload.get("reset"):
-                        self._json(agent_prompt_store.reset())
+                        agent_store.ensure_defaults()
+                        self._json(agent_store.summary())
                     else:
-                        self._json(agent_prompt_store.save(payload))
+                        role = payload.get("role")
+                        profile_id = payload.get("profile_id")
+                        instructions = payload.get("instructions")
+                        self._json(to_jsonable(agent_store.save_profile(role, profile_id, instructions)), HTTPStatus.CREATED)
                     return
                 if len(parts) == 3 and parts[0] == "providers" and parts[2] == "test":
                     provider = provider_store.get(parts[1])
@@ -127,10 +131,10 @@ def make_handler(
                 self._json(provider_store.defaults())
                 return
             if parts == ["agent-prompts"]:
-                self._json(agent_prompt_store.get())
+                self._json(agent_store.summary())
                 return
             if parts == ["agent-prompts", "defaults"]:
-                self._json(agent_prompt_store.defaults())
+                self._json(agent_store.defaults())
                 return
             if len(parts) == 2 and parts[0] == "providers":
                 provider = provider_store.get(parts[1])
@@ -209,7 +213,7 @@ def _config_from_payload(
     payload,
     providers_file: Path,
     run_id: Optional[str] = None,
-    agent_prompt_store: Optional[AgentPromptStore] = None,
+    agent_store: Optional[AgentDirectoryStore] = None,
 ) -> RunConfig:
     languages = payload.get("languages") or ["java", "cpp", "python"]
     if isinstance(languages, str):
@@ -220,11 +224,11 @@ def _config_from_payload(
         raise ValueError("report_path or sarif_path is required")
     affirmative_agent = _agent_config_from_payload(payload, "affirmative")
     negative_agent = _agent_config_from_payload(payload, "negative")
-    if agent_prompt_store is not None:
+    if agent_store is not None:
         if affirmative_agent is None:
-            affirmative_agent = agent_prompt_store.agent("affirmative")
+            affirmative_agent = agent_store.agent("affirmative", payload.get("affirmative_agent_profile"))
         if negative_agent is None:
-            negative_agent = agent_prompt_store.agent("negative")
+            negative_agent = agent_store.agent("negative", payload.get("negative_agent_profile"))
     return RunConfig(
         sarif_path=Path(report_path),
         source_path=Path(payload["source_path"]),
@@ -668,23 +672,26 @@ def app_html() -> str:
       <div class="settings-head">
         <div>
           <h2 id="agent-prompts-title">Agent Prompts</h2>
-          <div class="muted">Configure default affirmative and negative role prompts for new runs.</div>
+          <div class="muted">Configure role profile directories and AGENT.md prompts.</div>
         </div>
         <button id="close-agent-prompts" type="button" title="Close Agent prompt settings">Close</button>
       </div>
       <div class="settings-body">
         <div class="detail" id="agent-prompt-panel">
-          <h3>Default Role Prompts</h3>
+          <h3>Role Agent Profiles</h3>
           <div class="detail-body">
             <div class="form-grid">
-              <label>Affirmative agent<input id="agent-affirmative-name" placeholder="Affirmative Agent"></label>
-              <label>Negative agent<input id="agent-negative-name" placeholder="Negative Agent"></label>
-              <label class="wide">Affirmative prompt<textarea id="agent-affirmative-instructions"></textarea></label>
-              <label class="wide">Negative prompt<textarea id="agent-negative-instructions"></textarea></label>
+              <label>Affirmative profile<select id="agent-affirmative-profile"></select></label>
+              <label>Negative profile<select id="agent-negative-profile"></select></label>
+              <label>Affirmative profile ID<input id="agent-affirmative-profile-id" placeholder="Affirmative_1"></label>
+              <label>Negative profile ID<input id="agent-negative-profile-id" placeholder="Negative_web"></label>
+              <label class="wide">Affirmative AGENT.md<textarea id="agent-affirmative-instructions"></textarea></label>
+              <label class="wide">Negative AGENT.md<textarea id="agent-negative-instructions"></textarea></label>
             </div>
             <div class="toolbar">
-              <button id="save-agent-prompts" type="button">Save Prompts</button>
-              <button id="reset-agent-prompts" type="button">Reset Defaults</button>
+              <button id="save-affirmative-agent" type="button">Save Affirmative</button>
+              <button id="save-negative-agent" type="button">Save Negative</button>
+              <button id="reset-agent-prompts" type="button">Ensure Defaults</button>
             </div>
             <pre id="agent-prompts-result">No Agent prompt changes yet.</pre>
           </div>
@@ -713,10 +720,8 @@ def app_html() -> str:
               <label>Max rounds<input id="run-max-rounds" type="number" min="1" value="4"></label>
               <label>Affirmative provider<select id="run-affirmative-provider"></select></label>
               <label>Negative provider<select id="run-negative-provider"></select></label>
-              <label>Affirmative agent<input id="run-affirmative-agent-name" value="Affirmative Agent"></label>
-              <label>Negative agent<input id="run-negative-agent-name" value="Negative Agent"></label>
-              <label class="wide">Affirmative instructions<textarea id="run-affirmative-agent-instructions">Collect evidence that the report is grounded in real source code, validate reachability/data flow, assess missing protections, and state practical impact without exaggeration.</textarea></label>
-              <label class="wide">Negative instructions<textarea id="run-negative-agent-instructions">Challenge the vulnerability claim by checking hallucination risk, unreachable paths, mitigating controls, weak exploit preconditions, and overstated impact.</textarea></label>
+              <label>Affirmative agent profile<select id="run-affirmative-agent-profile"></select></label>
+              <label>Negative agent profile<select id="run-negative-agent-profile"></select></label>
             </div>
             <div class="chips">
               <label><input id="run-external-tools" type="checkbox" checked> External tools</label>
@@ -758,8 +763,10 @@ def app_html() -> str:
       providerExtra: document.getElementById('provider-extra'),
       defaultAffirmative: document.getElementById('default-affirmative'),
       defaultNegative: document.getElementById('default-negative'),
-      agentAffirmativeName: document.getElementById('agent-affirmative-name'),
-      agentNegativeName: document.getElementById('agent-negative-name'),
+      agentAffirmativeProfile: document.getElementById('agent-affirmative-profile'),
+      agentNegativeProfile: document.getElementById('agent-negative-profile'),
+      agentAffirmativeProfileId: document.getElementById('agent-affirmative-profile-id'),
+      agentNegativeProfileId: document.getElementById('agent-negative-profile-id'),
       agentAffirmativeInstructions: document.getElementById('agent-affirmative-instructions'),
       agentNegativeInstructions: document.getElementById('agent-negative-instructions'),
       runSarif: document.getElementById('run-sarif'),
@@ -769,10 +776,8 @@ def app_html() -> str:
       runMaxRounds: document.getElementById('run-max-rounds'),
       runAffirmativeProvider: document.getElementById('run-affirmative-provider'),
       runNegativeProvider: document.getElementById('run-negative-provider'),
-      runAffirmativeAgentName: document.getElementById('run-affirmative-agent-name'),
-      runNegativeAgentName: document.getElementById('run-negative-agent-name'),
-      runAffirmativeAgentInstructions: document.getElementById('run-affirmative-agent-instructions'),
-      runNegativeAgentInstructions: document.getElementById('run-negative-agent-instructions'),
+      runAffirmativeAgentProfile: document.getElementById('run-affirmative-agent-profile'),
+      runNegativeAgentProfile: document.getElementById('run-negative-agent-profile'),
       runExternalTools: document.getElementById('run-external-tools'),
       runAutoIndex: document.getElementById('run-auto-index'),
       runLlm: document.getElementById('run-llm'),
@@ -820,13 +825,16 @@ def app_html() -> str:
     document.getElementById('test-provider').addEventListener('click', testProvider);
     document.getElementById('delete-provider').addEventListener('click', deleteProvider);
     document.getElementById('save-defaults').addEventListener('click', saveDefaults);
-    document.getElementById('save-agent-prompts').addEventListener('click', saveAgentPrompts);
+    document.getElementById('save-affirmative-agent').addEventListener('click', () => saveAgentProfile('affirmative'));
+    document.getElementById('save-negative-agent').addEventListener('click', () => saveAgentProfile('negative'));
     document.getElementById('reset-agent-prompts').addEventListener('click', resetAgentPrompts);
     document.getElementById('start-run').addEventListener('click', startRun);
     document.getElementById('fill-demo-run').addEventListener('click', fillDemoRun);
     document.getElementById('fill-markdown-demo-run').addEventListener('click', fillMarkdownDemoRun);
     el.runAffirmativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
     el.runNegativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
+    el.agentAffirmativeProfile.addEventListener('change', () => fillAgentProfileEditor('affirmative'));
+    el.agentNegativeProfile.addEventListener('change', () => fillAgentProfileEditor('negative'));
 
     function esc(value) {{
       return String(value ?? '').replace(/[&<>"']/g, ch => ({{
@@ -881,36 +889,61 @@ def app_html() -> str:
     }}
 
     function renderAgentPrompts() {{
-      const affirmative = state.agentPrompts.affirmative || {{}};
-      const negative = state.agentPrompts.negative || {{}};
-      el.agentAffirmativeName.value = affirmative.name || '';
-      el.agentNegativeName.value = negative.name || '';
-      el.agentAffirmativeInstructions.value = affirmative.instructions || '';
-      el.agentNegativeInstructions.value = negative.instructions || '';
-      el.runAffirmativeAgentName.value = affirmative.name || 'Affirmative Agent';
-      el.runNegativeAgentName.value = negative.name || 'Negative Agent';
-      el.runAffirmativeAgentInstructions.value = affirmative.instructions || '';
-      el.runNegativeAgentInstructions.value = negative.instructions || '';
+      const affirmativeOptions = profileOptions('affirmative');
+      const negativeOptions = profileOptions('negative');
+      el.agentAffirmativeProfile.innerHTML = affirmativeOptions;
+      el.agentNegativeProfile.innerHTML = negativeOptions;
+      el.runAffirmativeAgentProfile.innerHTML = affirmativeOptions;
+      el.runNegativeAgentProfile.innerHTML = negativeOptions;
+      el.agentAffirmativeProfile.value = defaultProfileId('affirmative');
+      el.agentNegativeProfile.value = defaultProfileId('negative');
+      el.runAffirmativeAgentProfile.value = defaultProfileId('affirmative');
+      el.runNegativeAgentProfile.value = defaultProfileId('negative');
+      fillAgentProfileEditor('affirmative');
+      fillAgentProfileEditor('negative');
     }}
 
-    function agentPromptPayloadFromPanel() {{
-      return {{
-        affirmative: {{
-          name: el.agentAffirmativeName.value.trim(),
-          instructions: el.agentAffirmativeInstructions.value.trim()
-        }},
-        negative: {{
-          name: el.agentNegativeName.value.trim(),
-          instructions: el.agentNegativeInstructions.value.trim()
-        }}
-      }};
+    function profileOptions(role) {{
+      return profilesFor(role).map(profile => (
+        `<option value="${{esc(profile.profile_id)}}">${{esc(profile.profile_id)}} / ${{esc(profile.path || 'AGENT.md')}}</option>`
+      )).join('');
     }}
 
-    async function saveAgentPrompts() {{
+    function profilesFor(role) {{
+      return ((state.agentPrompts.roles || {{}})[role] || []);
+    }}
+
+    function defaultProfileId(role) {{
+      const defaults = state.agentPrompts.defaults || {{}};
+      const profiles = profilesFor(role);
+      return defaults[role] || (profiles[0] && profiles[0].profile_id) || '';
+    }}
+
+    function findAgentProfile(role, profileId) {{
+      return profilesFor(role).find(profile => profile.profile_id === profileId) || profilesFor(role)[0] || null;
+    }}
+
+    function fillAgentProfileEditor(role) {{
+      const select = role === 'affirmative' ? el.agentAffirmativeProfile : el.agentNegativeProfile;
+      const idInput = role === 'affirmative' ? el.agentAffirmativeProfileId : el.agentNegativeProfileId;
+      const promptInput = role === 'affirmative' ? el.agentAffirmativeInstructions : el.agentNegativeInstructions;
+      const profile = findAgentProfile(role, select.value);
+      idInput.value = profile ? profile.profile_id : '';
+      promptInput.value = profile ? profile.instructions : '';
+    }}
+
+    async function saveAgentProfile(role) {{
       try {{
-        state.agentPrompts = await fetchJson('/agent-prompts', jsonPost(agentPromptPayloadFromPanel()));
-        renderAgentPrompts();
-        el.agentPromptsResult.textContent = JSON.stringify(state.agentPrompts, null, 2);
+        const profileId = role === 'affirmative' ? el.agentAffirmativeProfileId.value.trim() : el.agentNegativeProfileId.value.trim();
+        const instructions = role === 'affirmative' ? el.agentAffirmativeInstructions.value.trim() : el.agentNegativeInstructions.value.trim();
+        const saved = await fetchJson('/agent-prompts', jsonPost({{ role, profile_id: profileId, instructions }}));
+        await loadAgentPrompts();
+        const select = role === 'affirmative' ? el.agentAffirmativeProfile : el.agentNegativeProfile;
+        const runSelect = role === 'affirmative' ? el.runAffirmativeAgentProfile : el.runNegativeAgentProfile;
+        select.value = saved.profile_id;
+        runSelect.value = saved.profile_id;
+        fillAgentProfileEditor(role);
+        el.agentPromptsResult.textContent = JSON.stringify(saved, null, 2);
       }} catch (error) {{
         el.agentPromptsResult.textContent = error.message;
       }}
@@ -1059,14 +1092,8 @@ def app_html() -> str:
           enable_llm: el.runLlm.checked,
           affirmative_provider_id: el.runAffirmativeProvider.value || null,
           negative_provider_id: el.runNegativeProvider.value || null,
-          affirmative_agent: {{
-            name: el.runAffirmativeAgentName.value.trim(),
-            instructions: el.runAffirmativeAgentInstructions.value.trim()
-          }},
-          negative_agent: {{
-            name: el.runNegativeAgentName.value.trim(),
-            instructions: el.runNegativeAgentInstructions.value.trim()
-          }}
+          affirmative_agent_profile: el.runAffirmativeAgentProfile.value || null,
+          negative_agent_profile: el.runNegativeAgentProfile.value || null
         }};
         if (!payload.report_path || !payload.source_path) {{
           throw new Error('Report path and source path are required.');
@@ -1245,16 +1272,17 @@ def app_html() -> str:
 
     function agentLabel(value) {{
       if (!value) return 'default';
-      return value.name || 'Agent';
+      if (value.profile_id && value.path) return `${{value.profile_id}} (${{value.path}})`;
+      return value.name || value.profile_id || 'Agent';
     }}
 
     function agentInstructions(agents) {{
       const lines = [];
       if (agents.affirmative && agents.affirmative.instructions) {{
-        lines.push(`${{agentLabel(agents.affirmative)}}: ${{agents.affirmative.instructions}}`);
+        lines.push(`Affirmative / ${{agentLabel(agents.affirmative)}}:\\n${{agents.affirmative.instructions}}`);
       }}
       if (agents.negative && agents.negative.instructions) {{
-        lines.push(`${{agentLabel(agents.negative)}}: ${{agents.negative.instructions}}`);
+        lines.push(`Negative / ${{agentLabel(agents.negative)}}:\\n${{agents.negative.instructions}}`);
       }}
       return lines.join('\\n\\n');
     }}

@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Thread
 
 from vuln_judger.api import app_html, make_handler
-from vuln_judger.agents import AgentPromptStore
+from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
 from vuln_judger.llm import LLMClient
@@ -148,8 +148,8 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('id="open-agent-prompts"', html)
         self.assertIn('id="agent-prompts-modal"', html)
         self.assertIn('id="agent-prompt-panel"', html)
-        self.assertIn('id="run-affirmative-agent-name"', html)
-        self.assertIn('id="run-negative-agent-instructions"', html)
+        self.assertIn('id="run-affirmative-agent-profile"', html)
+        self.assertIn('id="run-negative-agent-profile"', html)
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -235,7 +235,7 @@ class PipelineTests(unittest.TestCase):
             sarif, skills = write_python_fixture(root)
             store = RunRecordStore(root / "records")
             provider_store = ProviderStore(root / "providers.json")
-            agent_store = AgentPromptStore(root / "agent_prompts.json")
+            agent_store = AgentDirectoryStore(root / "agents")
             api_server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(store, provider_store, agent_store))
             api_thread = Thread(target=api_server.serve_forever, daemon=True)
             api_thread.start()
@@ -243,21 +243,24 @@ class PipelineTests(unittest.TestCase):
             try:
                 with urllib.request.urlopen(f"{base}/agent-prompts", timeout=5) as response:
                     defaults = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(defaults["affirmative"]["name"], "Affirmative Agent")
+                self.assertEqual(defaults["defaults"]["affirmative"], "Affirmative_1")
                 saved = post_json(
                     f"{base}/agent-prompts",
                     {
-                        "affirmative": {
-                            "name": "Exploit Prosecutor",
-                            "instructions": "Prioritize value asset impact.",
-                        },
-                        "negative": {
-                            "name": "Mitigation Reviewer",
-                            "instructions": "Challenge reachability and guards.",
-                        },
+                        "role": "affirmative",
+                        "profile_id": "Affirmative_1",
+                        "instructions": "Prioritize value asset impact.",
                     },
                 )
-                self.assertEqual(saved["negative"]["name"], "Mitigation Reviewer")
+                self.assertEqual(saved["profile_id"], "Affirmative_1")
+                post_json(
+                    f"{base}/agent-prompts",
+                    {
+                        "role": "negative",
+                        "profile_id": "Negative_web",
+                        "instructions": "Challenge reachability and guards.",
+                    },
+                )
                 created = post_json(
                     f"{base}/runs",
                     {
@@ -268,10 +271,11 @@ class PipelineTests(unittest.TestCase):
                     },
                 )
                 run = wait_for_run_completed(base, created["run_id"])
-                self.assertEqual(run["agent_configs"]["affirmative"]["name"], "Exploit Prosecutor")
+                self.assertEqual(run["agent_configs"]["affirmative"]["profile_id"], "Affirmative_1")
+                self.assertEqual(run["agent_configs"]["affirmative"]["instructions"], "Prioritize value asset impact.")
                 self.assertEqual(run["agent_configs"]["negative"]["instructions"], "Challenge reachability and guards.")
                 reset = post_json(f"{base}/agent-prompts", {"reset": True})
-                self.assertEqual(reset["affirmative"]["name"], "Affirmative Agent")
+                self.assertEqual(reset["defaults"]["negative"], "Negative_web")
             finally:
                 api_server.shutdown()
                 api_server.server_close()

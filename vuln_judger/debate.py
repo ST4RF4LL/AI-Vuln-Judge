@@ -260,7 +260,13 @@ def _agent_or_default(config: Optional[AgentConfig], default: AgentConfig) -> Ag
         return default
     name = config.name.strip() or default.name
     instructions = config.instructions.strip() or default.instructions
-    return AgentConfig(name=name, instructions=instructions)
+    return AgentConfig(
+        name=name,
+        instructions=instructions,
+        role=config.role or default.role,
+        profile_id=config.profile_id or default.profile_id,
+        path=config.path or default.path,
+    )
 
 
 def _by_kind(evidence: Iterable[CodeEvidence]) -> Dict[EvidenceKind, List[CodeEvidence]]:

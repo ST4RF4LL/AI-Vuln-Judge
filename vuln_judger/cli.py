@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .api import DEFAULT_RECORDS_DIR, serve
-from .agents import DEFAULT_AGENT_PROMPTS_FILE
+from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
 from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
@@ -36,6 +36,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--affirmative-agent-instructions", help="Custom instructions for the affirmative role agent")
     run_parser.add_argument("--negative-agent-name", help="Display name for the negative role agent")
     run_parser.add_argument("--negative-agent-instructions", help="Custom instructions for the negative role agent")
+    run_parser.add_argument("--agents-dir", type=Path, default=DEFAULT_AGENTS_DIR, help="Directory containing role Agent profiles")
+    run_parser.add_argument("--affirmative-agent-profile", help="Affirmative profile directory under agents/Affirmative")
+    run_parser.add_argument("--negative-agent-profile", help="Negative profile directory under agents/Negative")
     run_parser.add_argument("--out", type=Path, help="Write JSON report to this path")
     run_parser.add_argument("--record", action="store_true", help="Save this run to the UI records directory")
     run_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="Directory for saved run records")
@@ -45,13 +48,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     api_parser.add_argument("--port", default=8765, type=int)
     api_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="Directory for saved run records")
     api_parser.add_argument("--providers-file", type=Path, default=DEFAULT_PROVIDERS_FILE, help="Path to provider configuration")
-    api_parser.add_argument("--agent-prompts-file", type=Path, default=DEFAULT_AGENT_PROMPTS_FILE, help="Path to Agent prompt configuration")
+    api_parser.add_argument("--agents-dir", type=Path, default=DEFAULT_AGENTS_DIR, help="Directory containing role Agent profiles")
 
     args = parser.parse_args(argv)
     if args.command == "api":
-        serve(args.host, args.port, args.records_dir, args.providers_file, args.agent_prompts_file)
+        serve(args.host, args.port, args.records_dir, args.providers_file, args.agents_dir)
         return 0
     if args.command == "run":
+        agent_store = AgentDirectoryStore(args.agents_dir)
         config = RunConfig(
             sarif_path=args.sarif,
             source_path=args.source,
@@ -66,8 +70,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             providers_file=args.providers_file,
             affirmative_provider_id=args.affirmative_provider,
             negative_provider_id=args.negative_provider,
-            affirmative_agent=_agent_config(args.affirmative_agent_name, args.affirmative_agent_instructions),
-            negative_agent=_agent_config(args.negative_agent_name, args.negative_agent_instructions),
+            affirmative_agent=_agent_config(args.affirmative_agent_name, args.affirmative_agent_instructions)
+            or agent_store.agent("affirmative", args.affirmative_agent_profile),
+            negative_agent=_agent_config(args.negative_agent_name, args.negative_agent_instructions)
+            or agent_store.agent("negative", args.negative_agent_profile),
         )
         report = run_judgement(config)
         if args.record:
