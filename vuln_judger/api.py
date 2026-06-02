@@ -735,7 +735,7 @@ def app_html() -> str:
             <div class="profile-grid" id="agent-affirmative-profile-list"></div>
             <div class="form-grid">
               <label>Affirmative profile<select id="agent-affirmative-profile"></select></label>
-              <label>Affirmative profile ID<input id="agent-affirmative-profile-id" placeholder="Affirmative_1"></label>
+              <label>Affirmative profile ID<input id="agent-affirmative-profile-id" placeholder="Affirmative_default"></label>
               <label class="wide">Affirmative AGENT.md<textarea id="agent-affirmative-instructions"></textarea></label>
             </div>
             <div class="toolbar">
@@ -749,7 +749,7 @@ def app_html() -> str:
             <div class="profile-grid" id="agent-negative-profile-list"></div>
             <div class="form-grid">
               <label>Negative profile<select id="agent-negative-profile"></select></label>
-              <label>Negative profile ID<input id="agent-negative-profile-id" placeholder="Negative_web"></label>
+              <label>Negative profile ID<input id="agent-negative-profile-id" placeholder="Negative_default"></label>
               <label class="wide">Negative AGENT.md<textarea id="agent-negative-instructions"></textarea></label>
             </div>
             <div class="toolbar">

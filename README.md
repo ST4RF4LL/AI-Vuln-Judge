@@ -46,14 +46,14 @@ Agent prompts are maintained as role-specific profile directories. Each profile
 stores its prompt in `AGENT.md`, for example:
 
 ```text
-agents/Affirmative/Affirmative_1/AGENT.md
-agents/Negative/Negative_web/AGENT.md
+agents/Affirmative/Affirmative_default/AGENT.md
+agents/Negative/Negative_default/AGENT.md
 ```
 
 The web UI exposes these profiles through the top-right `Agent Prompts` button.
 New runs choose one affirmative profile and one negative profile. Profiles can
 be starred in the UI, and non-default profiles can be deleted. The built-in
-default profiles `Affirmative_1` and `Negative_web` cannot be deleted.
+default profiles `Affirmative_default` and `Negative_default` cannot be deleted.
 
 Example provider file:
 
@@ -112,8 +112,8 @@ uv run vuln-judger run \
   --report report.md \
   --source ./target-project \
   --agents-dir agents \
-  --affirmative-agent-profile Affirmative_1 \
-  --negative-agent-profile Negative_web
+  --affirmative-agent-profile Affirmative_default \
+  --negative-agent-profile Negative_default
 ```
 
 The older `--llm-model` / `--llm-endpoint` path still works as a shared legacy
@@ -148,8 +148,8 @@ curl -X POST http://127.0.0.1:8765/runs \
     "enable_llm": true,
     "affirmative_provider_id": "openai-main",
     "negative_provider_id": "qwen-fast",
-    "affirmative_agent_profile": "Affirmative_1",
-    "negative_agent_profile": "Negative_web"
+    "affirmative_agent_profile": "Affirmative_default",
+    "negative_agent_profile": "Negative_default"
   }'
 ```
 

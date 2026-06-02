@@ -18,31 +18,31 @@ ROLE_DIRS = {
     "negative": "Negative",
 }
 DEFAULT_PROFILE_IDS = {
-    "affirmative": "Affirmative_1",
-    "negative": "Negative_web",
+    "affirmative": "Affirmative_default",
+    "negative": "Negative_default",
 }
 
 DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
-    name="Affirmative_1",
+    name="Affirmative_default",
     instructions=(
         "Collect evidence that the report is grounded in real source code, "
         "validate reachability/data flow, assess missing protections, and state practical impact without exaggeration."
     ),
     role="Affirmative",
-    profile_id="Affirmative_1",
-    path=str(DEFAULT_AGENTS_DIR / "Affirmative" / "Affirmative_1" / AGENT_FILE),
+    profile_id="Affirmative_default",
+    path=str(DEFAULT_AGENTS_DIR / "Affirmative" / "Affirmative_default" / AGENT_FILE),
     deletable=False,
     is_default=True,
 )
 DEFAULT_NEGATIVE_AGENT = AgentConfig(
-    name="Negative_web",
+    name="Negative_default",
     instructions=(
         "Challenge the vulnerability claim by checking hallucination risk, unreachable paths, mitigating controls, "
         "weak exploit preconditions, and overstated impact."
     ),
     role="Negative",
-    profile_id="Negative_web",
-    path=str(DEFAULT_AGENTS_DIR / "Negative" / "Negative_web" / AGENT_FILE),
+    profile_id="Negative_default",
+    path=str(DEFAULT_AGENTS_DIR / "Negative" / "Negative_default" / AGENT_FILE),
     deletable=False,
     is_default=True,
 )
