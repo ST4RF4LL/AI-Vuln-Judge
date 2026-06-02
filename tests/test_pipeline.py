@@ -152,6 +152,8 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('id="agent-negative-profile-panel"', html)
         self.assertIn('id="agent-affirmative-profile-list"', html)
         self.assertIn('id="agent-negative-profile-list"', html)
+        self.assertIn('id="new-affirmative-agent"', html)
+        self.assertIn('id="new-negative-agent"', html)
         self.assertIn('id="agent-profile-actions"', html)
         self.assertIn('id="run-affirmative-agent-profile"', html)
         self.assertIn('id="run-negative-agent-profile"', html)

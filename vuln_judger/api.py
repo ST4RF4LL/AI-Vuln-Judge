@@ -607,16 +607,18 @@ def app_html() -> str:
       grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
       gap: 10px;
       align-items: stretch;
+      grid-auto-rows: minmax(220px, auto);
     }}
     .profile-card {{
       min-width: 0;
-      min-height: 154px;
+      min-height: 220px;
+      height: 100%;
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 10px;
       background: #fbfcfe;
-      display: grid;
-      grid-template-rows: auto minmax(52px, 1fr) auto;
+      display: flex;
+      flex-direction: column;
       gap: 8px;
       overflow: hidden;
     }}
@@ -629,9 +631,10 @@ def app_html() -> str:
       color: var(--muted);
       font-size: 12px;
       line-height: 1.45;
+      flex: 1 1 auto;
       overflow: hidden;
       display: -webkit-box;
-      -webkit-line-clamp: 3;
+      -webkit-line-clamp: 6;
       -webkit-box-orient: vertical;
     }}
     .profile-actions {{ display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }}
@@ -739,6 +742,7 @@ def app_html() -> str:
               <label class="wide">Affirmative AGENT.md<textarea id="agent-affirmative-instructions"></textarea></label>
             </div>
             <div class="toolbar">
+              <button id="new-affirmative-agent" type="button">New Affirmative</button>
               <button id="save-affirmative-agent" type="button">Save Affirmative</button>
             </div>
           </div>
@@ -753,6 +757,7 @@ def app_html() -> str:
               <label class="wide">Negative AGENT.md<textarea id="agent-negative-instructions"></textarea></label>
             </div>
             <div class="toolbar">
+              <button id="new-negative-agent" type="button">New Negative</button>
               <button id="save-negative-agent" type="button">Save Negative</button>
             </div>
           </div>
@@ -897,6 +902,8 @@ def app_html() -> str:
     document.getElementById('test-provider').addEventListener('click', testProvider);
     document.getElementById('delete-provider').addEventListener('click', deleteProvider);
     document.getElementById('save-defaults').addEventListener('click', saveDefaults);
+    document.getElementById('new-affirmative-agent').addEventListener('click', () => newAgentProfile('affirmative'));
+    document.getElementById('new-negative-agent').addEventListener('click', () => newAgentProfile('negative'));
     document.getElementById('save-affirmative-agent').addEventListener('click', () => saveAgentProfile('affirmative'));
     document.getElementById('save-negative-agent').addEventListener('click', () => saveAgentProfile('negative'));
     document.getElementById('reset-agent-prompts').addEventListener('click', resetAgentPrompts);
@@ -1054,6 +1061,29 @@ def app_html() -> str:
       const profile = findAgentProfile(role, select.value);
       idInput.value = profile ? profile.profile_id : '';
       promptInput.value = profile ? profile.instructions : '';
+    }}
+
+    function newAgentProfile(role) {{
+      const idInput = role === 'affirmative' ? el.agentAffirmativeProfileId : el.agentNegativeProfileId;
+      const promptInput = role === 'affirmative' ? el.agentAffirmativeInstructions : el.agentNegativeInstructions;
+      const prefix = role === 'affirmative' ? 'Affirmative_custom' : 'Negative_custom';
+      const profileId = nextAgentProfileId(role, prefix);
+      const baseProfile = findAgentProfile(role, defaultProfileId(role)) || findAgentProfile(role, '');
+      idInput.value = profileId;
+      promptInput.value = baseProfile ? baseProfile.instructions : '';
+      el.agentPromptsResult.textContent = `New ${{role}} Agent draft: ${{profileId}}. Edit AGENT.md and save to create it.`;
+    }}
+
+    function nextAgentProfileId(role, prefix) {{
+      const existing = new Set(profilesFor(role).map(profile => profile.profile_id));
+      const seed = String(Date.now()).slice(-6);
+      let candidate = `${{prefix}}_${{seed}}`;
+      let index = 2;
+      while (existing.has(candidate)) {{
+        candidate = `${{prefix}}_${{seed}}_${{index}}`;
+        index += 1;
+      }}
+      return candidate;
     }}
 
     async function saveAgentProfile(role) {{
