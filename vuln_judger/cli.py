@@ -8,10 +8,13 @@ from typing import List, Optional
 
 from .api import DEFAULT_RECORDS_DIR, serve
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
+from .logging_config import DEFAULT_LOG_FILE, configure_logging, logger
 from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
 from .records import RunRecordStore
+
+LOG = logger("cli")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -42,6 +45,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--out", type=Path, help="将 JSON 研判报告写入该路径")
     run_parser.add_argument("--record", action="store_true", help="将本次运行保存到 Web 记录目录")
     run_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="运行记录保存目录")
+    run_parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE, help="日志文件路径")
 
     api_parser = subparsers.add_parser("api", help="启动本地 HTTP API 和 Web 界面")
     api_parser.add_argument("--host", default="127.0.0.1")
@@ -49,12 +53,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     api_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="运行记录保存目录")
     api_parser.add_argument("--providers-file", type=Path, default=DEFAULT_PROVIDERS_FILE, help="provider 配置文件路径")
     api_parser.add_argument("--agents-dir", type=Path, default=DEFAULT_AGENTS_DIR, help="包含角色 Agent 配置的目录")
+    api_parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE, help="日志文件路径")
 
     args = parser.parse_args(argv)
     if args.command == "api":
-        serve(args.host, args.port, args.records_dir, args.providers_file, args.agents_dir)
+        serve(args.host, args.port, args.records_dir, args.providers_file, args.agents_dir, args.log_file)
         return 0
     if args.command == "run":
+        log_path = configure_logging(args.log_file)
+        LOG.info("CLI 运行开始 report=%s source=%s log=%s", args.sarif, args.source, log_path)
         agent_store = AgentDirectoryStore(args.agents_dir)
         config = RunConfig(
             sarif_path=args.sarif,
@@ -78,12 +85,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         report = run_judgement(config)
         if args.record:
             RunRecordStore(args.records_dir).save(report)
+            LOG.info("CLI 运行已保存记录 run_id=%s records_dir=%s", report.run_id, args.records_dir)
         payload = json.dumps(to_jsonable(report), ensure_ascii=False, indent=2, sort_keys=True)
         if args.out:
             args.out.expanduser().resolve().write_text(payload + "\n", encoding="utf-8")
+            LOG.info("CLI 运行已写入输出 run_id=%s out=%s", report.run_id, args.out)
             print(_summary(report))
         else:
             print(payload)
+        LOG.info("CLI 运行完成 run_id=%s", report.run_id)
         return 0
     return 2
 

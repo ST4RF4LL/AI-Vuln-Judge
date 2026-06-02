@@ -186,9 +186,9 @@ def _run_tool(binary: str, args: Sequence[str], cwd: Path, timeout: int) -> Tool
             timeout=timeout,
             check=False,
         )
-        return ToolCompleted(completed.returncode, completed.stdout, completed.stderr)
+        return ToolCompleted(completed.returncode, _text(completed.stdout), _text(completed.stderr))
     except subprocess.TimeoutExpired as exc:
-        return ToolCompleted(124, exc.stdout or "", exc.stderr or f"{timeout}s 后超时")
+        return ToolCompleted(124, _text(exc.stdout), _text(exc.stderr) or f"{timeout}s 后超时")
 
 
 def _evidence_from_tool_output(
@@ -231,6 +231,14 @@ def _try_json(text: str):
         return json.loads(text)
     except json.JSONDecodeError:
         return None
+
+
+def _text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _tool_unavailable(finding: Finding, tool_name: str, reason: str) -> CodeEvidence:

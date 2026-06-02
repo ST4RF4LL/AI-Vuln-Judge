@@ -179,14 +179,18 @@ class RunReport:
 
 
 def to_jsonable(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, Path):
         return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
     if hasattr(value, "__dataclass_fields__"):
         return {key: to_jsonable(item) for key, item in asdict(value).items()}
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple, set)):
         return [to_jsonable(item) for item in value]
     if isinstance(value, dict):
         return {str(key): to_jsonable(item) for key, item in value.items()}
-    return value
+    return str(value)

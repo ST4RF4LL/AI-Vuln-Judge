@@ -8,7 +8,11 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from .logging_config import logger
 from .providers import ProviderConfig
+
+
+LOG = logger("llm")
 
 
 class LLMClient:
@@ -39,6 +43,12 @@ class OpenAICompatibleLLM(LLMClient):
     def request(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
         payload = self._payload(system_prompt, user_prompt)
         started = time.monotonic()
+        LOG.info(
+            "LLM 请求开始 provider=%s model=%s endpoint=%s",
+            self.provider_id or self.provider_name or "unknown",
+            self.model,
+            self.endpoint,
+        )
         request = urllib.request.Request(
             self.endpoint,
             data=json.dumps(payload).encode("utf-8"),
@@ -54,20 +64,61 @@ class OpenAICompatibleLLM(LLMClient):
                 body_text = response.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
+            LOG.warning(
+                "LLM HTTP 错误 provider=%s status=%s latency_ms=%s body=%s",
+                self.provider_id or self.provider_name or "unknown",
+                exc.code,
+                _latency_ms(started),
+                body[:500],
+            )
             return _failure(exc.code, started, f"HTTP {exc.code}: {body[:500]}")
         except (urllib.error.URLError, TimeoutError) as exc:
+            LOG.warning(
+                "LLM 网络错误 provider=%s latency_ms=%s error=%s",
+                self.provider_id or self.provider_name or "unknown",
+                _latency_ms(started),
+                exc,
+            )
             return _failure(None, started, str(exc))
         try:
             body = json.loads(body_text)
         except json.JSONDecodeError as exc:
+            LOG.warning(
+                "LLM 响应 JSON 解析失败 provider=%s status=%s latency_ms=%s body=%s",
+                self.provider_id or self.provider_name or "unknown",
+                status,
+                _latency_ms(started),
+                body_text[:500],
+            )
             return _failure(status, started, f"响应不是合法 JSON：{exc}")
         choices = body.get("choices") or []
         if not choices:
+            LOG.warning(
+                "LLM 响应缺少 choices provider=%s status=%s latency_ms=%s body=%s",
+                self.provider_id or self.provider_name or "unknown",
+                status,
+                _latency_ms(started),
+                body_text[:500],
+            )
             return _failure(status, started, "响应中没有 choices")
         message = choices[0].get("message") or {}
         content = message.get("content")
         if not content:
+            LOG.warning(
+                "LLM 响应缺少 message.content provider=%s status=%s latency_ms=%s body=%s",
+                self.provider_id or self.provider_name or "unknown",
+                status,
+                _latency_ms(started),
+                body_text[:500],
+            )
             return _failure(status, started, "响应中没有 message.content")
+        LOG.info(
+            "LLM 请求完成 provider=%s status=%s latency_ms=%s content_chars=%s",
+            self.provider_id or self.provider_name or "unknown",
+            status,
+            _latency_ms(started),
+            len(str(content)),
+        )
         return {
             "ok": True,
             "status": status,

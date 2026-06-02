@@ -11,6 +11,7 @@ from .analyzers import AnalyzerSettings, AnalyzerSuite
 from .debate import DebateOrchestrator
 from .evidence import EvidenceCollector
 from .llm import LLMClient, build_llm_clients
+from .logging_config import logger
 from .models import RunConfig, RunReport, to_jsonable
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderConfig, ProviderStore
 from .sarif import load_report
@@ -18,11 +19,25 @@ from .skills import load_project_context
 from .source import SourceIndexer
 
 
+LOG = logger("pipeline")
+
+
 def run_judgement(config: RunConfig) -> RunReport:
     source_path = config.source_path.expanduser().resolve()
     sarif_path = config.sarif_path.expanduser().resolve()
+    LOG.info(
+        "开始漏洞研判 run_id=%s report=%s source=%s languages=%s llm=%s external_tools=%s",
+        config.run_id,
+        sarif_path,
+        source_path,
+        ",".join(config.languages),
+        config.enable_llm,
+        config.enable_external_tools,
+    )
     findings = load_report(sarif_path)
+    LOG.info("报告解析完成 findings=%s report=%s", len(findings), sarif_path)
     project_context = load_project_context(config.skills_path)
+    LOG.info("项目知识库加载完成 facts=%s skills=%s", len(project_context.facts), config.skills_path)
     indexer = SourceIndexer(source_path, config.languages)
     analyzer_settings = AnalyzerSettings(
         enabled=config.enable_external_tools,
@@ -36,6 +51,11 @@ def run_judgement(config: RunConfig) -> RunReport:
         languages=config.languages,
     )
     affirmative_provider, negative_provider = _resolve_providers(config)
+    LOG.info(
+        "Provider 解析完成 affirmative=%s negative=%s",
+        affirmative_provider.id if affirmative_provider else None,
+        negative_provider.id if negative_provider else None,
+    )
     affirmative_client, negative_client = build_llm_clients(
         enabled=config.enable_llm,
         affirmative_provider=affirmative_provider,
@@ -53,10 +73,20 @@ def run_judgement(config: RunConfig) -> RunReport:
     reports = []
     diagnostics = []
     for finding in findings:
+        LOG.info("开始处理 finding=%s rule=%s", finding.finding_id, finding.rule_id)
         bundle = collector.collect(finding)
         diagnostics.extend(f"{finding.finding_id}: {item}" for item in bundle.diagnostics)
-        reports.append(orchestrator.adjudicate(bundle))
-    return RunReport(
+        verdict = orchestrator.adjudicate(bundle)
+        reports.append(verdict)
+        LOG.info(
+            "完成处理 finding=%s verdict=%s confidence=%s evidence=%s diagnostics=%s",
+            finding.finding_id,
+            verdict.verdict.value,
+            verdict.confidence,
+            len(verdict.evidence_chain),
+            len(bundle.diagnostics),
+        )
+    report = RunReport(
         run_id=config.run_id or _run_id(sarif_path, source_path, config.languages),
         created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         source_path=str(source_path),
@@ -75,6 +105,8 @@ def run_judgement(config: RunConfig) -> RunReport:
         agent_configs=_agent_config_metadata(orchestrator),
         diagnostics=diagnostics,
     )
+    LOG.info("漏洞研判完成 run_id=%s findings=%s diagnostics=%s", report.run_id, report.finding_count, len(report.diagnostics))
+    return report
 
 
 def run_to_json(config: RunConfig, output_path: Optional[Path] = None) -> str:

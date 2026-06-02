@@ -14,7 +14,7 @@ from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
 from vuln_judger.llm import LLMClient
-from vuln_judger.models import AgentConfig, RunConfig, Verdict
+from vuln_judger.models import AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, RunConfig, Verdict, to_jsonable
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunRecordStore
@@ -188,6 +188,20 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(negative.id, "main")
             raw = json.loads((Path(tmp) / "providers.json").read_text(encoding="utf-8"))
             self.assertEqual(raw["providers"][0]["api_key"], "secret")
+
+    def test_to_jsonable_decodes_nested_bytes(self):
+        evidence = CodeEvidence(
+            evidence_id="ev-bytes",
+            kind=EvidenceKind.TOOL_DIAGNOSTIC,
+            strength=EvidenceStrength.WEAK,
+            summary="bytes test",
+            source="unit",
+            data={"raw": b"hello", "nested": [b"\xe4\xb8\xad\xe6\x96\x87"], "bad": b"\xff"},
+        )
+        payload = to_jsonable(evidence)
+        self.assertEqual(payload["data"]["raw"], "hello")
+        self.assertEqual(payload["data"]["nested"][0], "中文")
+        json.dumps(payload, ensure_ascii=False)
 
     def test_provider_store_rejects_reserved_extra_json_fields(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
 from .llm import test_provider_connection
+from .logging_config import DEFAULT_LOG_FILE, configure_logging, logger
 from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderStore
@@ -20,6 +21,7 @@ from .records import RunRecordStore
 
 
 DEFAULT_RECORDS_DIR = Path(".vuln-judger") / "runs"
+LOG = logger("api")
 
 
 def serve(
@@ -28,7 +30,9 @@ def serve(
     records_dir: Path = DEFAULT_RECORDS_DIR,
     providers_file: Path = DEFAULT_PROVIDERS_FILE,
     agents_dir: Path = DEFAULT_AGENTS_DIR,
+    log_file: Path = DEFAULT_LOG_FILE,
 ) -> None:
+    configured_log = configure_logging(log_file)
     store = RunRecordStore(records_dir)
     provider_store = ProviderStore(providers_file)
     agent_store = AgentDirectoryStore(agents_dir)
@@ -37,6 +41,8 @@ def serve(
     print(f"运行记录目录：{store.root}")
     print(f"提供商配置文件：{provider_store.path}")
     print(f"Agent 配置目录：{agent_store.root}")
+    print(f"日志文件：{configured_log}")
+    LOG.info("API 服务启动 host=%s port=%s records=%s providers=%s agents=%s", host, port, store.root, provider_store.path, agent_store.root)
     server.serve_forever()
 
 
@@ -59,6 +65,7 @@ def make_handler(
                 if parts == ["runs"]:
                     payload = self._read_json()
                     run_id = _new_run_id()
+                    LOG.info("收到创建任务请求 run_id=%s payload=%s", run_id, _safe_payload(payload))
                     config = _config_from_payload(payload, provider_store.path, run_id, agent_store)
                     task = _task_from_config(config, run_id, "running")
                     with tasks_lock:
@@ -108,12 +115,14 @@ def make_handler(
                         self._json({"error": "提供商未找到"}, HTTPStatus.NOT_FOUND)
                         return
                     payload = self._read_json()
+                    LOG.info("Provider 连通性测试 provider=%s override_key=%s", parts[1], bool(payload.get("api_key")))
                     result = test_provider_connection(provider, api_key_override=payload.get("api_key"))
                     result.pop("content", None)
                     self._json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
                     return
                 self._json({"error": "未找到"}, HTTPStatus.NOT_FOUND)
             except Exception as exc:
+                LOG.exception("POST 处理失败 path=%s", self.path)
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
         def do_DELETE(self) -> None:  # noqa: N802
@@ -122,6 +131,7 @@ def make_handler(
                 try:
                     self._json(agent_store.delete_profile(parts[1], parts[2]))
                 except Exception as exc:
+                    LOG.exception("删除 Agent 配置失败 role=%s profile=%s", parts[1], parts[2])
                     self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
             if len(parts) == 2 and parts[0] == "providers":
@@ -331,6 +341,7 @@ def _task_from_config(config: RunConfig, run_id: str, status: str, error: Option
 
 def _run_task(config: RunConfig, store: RunRecordStore, tasks: dict, tasks_lock: Lock) -> None:
     try:
+        LOG.info("后台任务开始 run_id=%s report=%s source=%s", config.run_id, config.sarif_path, config.source_path)
         report = run_judgement(config)
         store.save(report)
         with tasks_lock:
@@ -349,7 +360,9 @@ def _run_task(config: RunConfig, store: RunRecordStore, tasks: dict, tasks_lock:
                 "agent_configs": report.agent_configs,
                 "verdict_counts": _verdict_counts(to_jsonable(report)),
             }
+        LOG.info("后台任务完成 run_id=%s findings=%s", report.run_id, report.finding_count)
     except Exception as exc:
+        LOG.exception("后台任务失败 run_id=%s", config.run_id)
         with tasks_lock:
             existing = tasks.get(config.run_id or "")
             failed = dict(existing or _task_from_config(config, config.run_id or _new_run_id(), "failed"))
@@ -357,6 +370,17 @@ def _run_task(config: RunConfig, store: RunRecordStore, tasks: dict, tasks_lock:
             failed["error"] = str(exc)
             failed["diagnostics"] = [str(exc)]
             tasks[failed["run_id"]] = failed
+
+
+def _safe_payload(payload) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    masked = dict(payload)
+    for key in list(masked):
+        lowered = str(key).lower()
+        if "api_key" in lowered or "key" in lowered or "token" in lowered or "secret" in lowered:
+            masked[key] = "***"
+    return masked
 
 
 def _finding_summary(report):

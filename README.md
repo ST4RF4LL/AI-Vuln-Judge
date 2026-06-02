@@ -124,12 +124,17 @@ uv run vuln-judger api \
   --port 8765 \
   --records-dir .vuln-judger/runs \
   --providers-file .vuln-judger/providers.json \
-  --agents-dir agents
+  --agents-dir agents \
+  --log-file .vuln-judger/logs/vuln-judger.log
 ```
 
 打开 http://127.0.0.1:8765 查看保存的研判记录。页面提供运行历史、结论统计、发现摘要、
 证据链、博弈过程、防护分析、影响分析、LLM 提供商配置、正反方默认提供商选择、
 提供商连通性测试，以及正反方 Agent 配置管理。
+
+默认日志文件为 `.vuln-judger/logs/vuln-judger.log`，会记录 API 启动、任务创建、后台任务
+执行、LLM 请求状态、Provider 连通性测试和异常 traceback。日志文件会自动轮转，且已被
+`.gitignore` 忽略。
 
 创建任务：
 
