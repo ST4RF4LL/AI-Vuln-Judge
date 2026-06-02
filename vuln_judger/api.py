@@ -582,6 +582,46 @@ def app_html() -> str:
       max-height: 280px;
       overflow: auto;
     }}
+    .markdown-body {{
+      display: grid;
+      gap: 8px;
+      line-height: 1.65;
+      overflow-wrap: anywhere;
+    }}
+    .markdown-body p {{ margin: 0; }}
+    .markdown-body ul,
+    .markdown-body ol {{ margin: 0; padding-left: 22px; }}
+    .markdown-body li {{ margin: 3px 0; }}
+    .markdown-body h1,
+    .markdown-body h2,
+    .markdown-body h3,
+    .markdown-body h4 {{
+      margin: 2px 0 0;
+      font-size: 14px;
+      line-height: 1.4;
+    }}
+    .markdown-body blockquote {{
+      margin: 0;
+      padding: 8px 10px;
+      border-left: 3px solid var(--line);
+      background: #f8fafc;
+      color: var(--muted);
+    }}
+    .markdown-body code {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      background: #eef2f7;
+      border-radius: 4px;
+      padding: 1px 4px;
+    }}
+    .markdown-body pre {{
+      max-height: none;
+      white-space: pre-wrap;
+    }}
+    .debate-turn {{
+      display: grid;
+      gap: 8px;
+    }}
     .empty {{ padding: 42px 18px; color: var(--muted); text-align: center; }}
     .error {{ color: var(--bad); }}
     .success {{ color: var(--tp); }}
@@ -931,6 +971,96 @@ def app_html() -> str:
       return String(value ?? '').replace(/[&<>"']/g, ch => ({{
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       }}[ch]));
+    }}
+    function renderMarkdown(value) {{
+      const text = String(value ?? '').replace(/\r\n?/g, '\\n');
+      if (!text.trim()) return '';
+      const lines = text.split('\\n');
+      const html = [];
+      let list = null;
+      let inCode = false;
+      let codeLines = [];
+
+      function closeList() {{
+        if (list) {{
+          html.push(`</${{list}}>`);
+          list = null;
+        }}
+      }}
+      function flushCode() {{
+        html.push(`<pre><code>${{esc(codeLines.join('\\n'))}}</code></pre>`);
+        codeLines = [];
+      }}
+      function inlineMarkdown(raw) {{
+        let output = esc(raw);
+        output = output.replace(/`([^`]+)`/g, '<code>$1</code>');
+        output = output.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+        output = output.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+        output = output.replace(/(^|\\s)\\*([^*]+)\\*/g, '$1<em>$2</em>');
+        output = output.replace(/(^|\\s)_([^_]+)_/g, '$1<em>$2</em>');
+        return output;
+      }}
+
+      for (const line of lines) {{
+        const fence = line.match(/^```/);
+        if (fence) {{
+          if (inCode) {{
+            flushCode();
+            inCode = false;
+          }} else {{
+            closeList();
+            inCode = true;
+            codeLines = [];
+          }}
+          continue;
+        }}
+        if (inCode) {{
+          codeLines.push(line);
+          continue;
+        }}
+        if (!line.trim()) {{
+          closeList();
+          continue;
+        }}
+        const heading = line.match(/^(#{1,4})\\s+(.+)$/);
+        if (heading) {{
+          closeList();
+          const level = heading[1].length;
+          html.push(`<h${{level}}>${{inlineMarkdown(heading[2])}}</h${{level}}>`);
+          continue;
+        }}
+        const quote = line.match(/^>\\s?(.+)$/);
+        if (quote) {{
+          closeList();
+          html.push(`<blockquote>${{inlineMarkdown(quote[1])}}</blockquote>`);
+          continue;
+        }}
+        const unordered = line.match(/^\\s*[-*+]\\s+(.+)$/);
+        if (unordered) {{
+          if (list !== 'ul') {{
+            closeList();
+            list = 'ul';
+            html.push('<ul>');
+          }}
+          html.push(`<li>${{inlineMarkdown(unordered[1])}}</li>`);
+          continue;
+        }}
+        const ordered = line.match(/^\\s*\\d+[.)]\\s+(.+)$/);
+        if (ordered) {{
+          if (list !== 'ol') {{
+            closeList();
+            list = 'ol';
+            html.push('<ol>');
+          }}
+          html.push(`<li>${{inlineMarkdown(ordered[1])}}</li>`);
+          continue;
+        }}
+        closeList();
+        html.push(`<p>${{inlineMarkdown(line)}}</p>`);
+      }}
+      if (inCode) flushCode();
+      closeList();
+      return html.join('');
     }}
     function fmtDate(value) {{
       if (!value) return '未知时间';
@@ -1560,9 +1690,9 @@ def app_html() -> str:
         <div class="detail">
           <h3>博弈过程</h3>
           <div class="detail-body">
-            ${{debate.map(turn => `<div>
+            ${{debate.map(turn => `<div class="debate-turn">
               <strong>${{esc(roleLabel(turn.role))}} 第 ${{esc(turn.round_index)}} 回合</strong>
-              <div>${{esc(turn.claim)}}</div>
+              <div class="markdown-body">${{renderMarkdown(turn.claim)}}</div>
               <div class="path">证据：${{esc((turn.evidence_ids || []).join(', '))}}</div>
             </div>`).join('') || '<div class="muted">暂无博弈回合记录。</div>'}}
           </div>

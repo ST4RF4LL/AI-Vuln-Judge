@@ -161,6 +161,9 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('id="agent-profile-actions"', html)
         self.assertIn('id="run-affirmative-agent-profile"', html)
         self.assertIn('id="run-negative-agent-profile"', html)
+        self.assertIn('function renderMarkdown(value)', html)
+        self.assertIn('class="markdown-body"', html)
+        self.assertIn('renderMarkdown(turn.claim)', html)
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
