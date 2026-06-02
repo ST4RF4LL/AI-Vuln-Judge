@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 from .evidence import EvidenceBundle
 from .llm import LLMClient
 from .models import (
+    AgentConfig,
     CodeEvidence,
     DebateRole,
     DebateTurn,
@@ -26,6 +27,22 @@ class DebateDecision:
     recommended_next_steps: List[str]
 
 
+DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
+    name="Affirmative Agent",
+    instructions=(
+        "Collect evidence that the report is grounded in real source code, "
+        "validate reachability/data flow, assess missing protections, and state practical impact without exaggeration."
+    ),
+)
+DEFAULT_NEGATIVE_AGENT = AgentConfig(
+    name="Negative Agent",
+    instructions=(
+        "Challenge the vulnerability claim by checking hallucination risk, unreachable paths, mitigating controls, "
+        "weak exploit preconditions, and overstated impact."
+    ),
+)
+
+
 class DebateOrchestrator:
     def __init__(
         self,
@@ -33,10 +50,14 @@ class DebateOrchestrator:
         llm_client: Optional[LLMClient] = None,
         affirmative_client: Optional[LLMClient] = None,
         negative_client: Optional[LLMClient] = None,
+        affirmative_agent: Optional[AgentConfig] = None,
+        negative_agent: Optional[AgentConfig] = None,
     ):
         self.max_rounds = max_rounds
         self.affirmative_client = affirmative_client or llm_client
         self.negative_client = negative_client or llm_client
+        self.affirmative_agent = _agent_or_default(affirmative_agent, DEFAULT_AFFIRMATIVE_AGENT)
+        self.negative_agent = _agent_or_default(negative_agent, DEFAULT_NEGATIVE_AGENT)
 
     def adjudicate(self, bundle: EvidenceBundle) -> VerdictReport:
         evidence = bundle.evidence
@@ -145,16 +166,21 @@ class DebateOrchestrator:
         client = self.affirmative_client if role == "AFFIRMATIVE" else self.negative_client
         if client is None:
             return None
+        agent = self.affirmative_agent if role == "AFFIRMATIVE" else self.negative_agent
+        agent_name = agent.name.strip() or role.title()
+        agent_instructions = agent.instructions.strip()
         evidence_lines = []
         for item in bundle.evidence[:20]:
             evidence_lines.append(
                 f"- {item.evidence_id} | {item.kind.value} | {item.strength.value} | {item.summary}"
             )
         system = (
-            f"You are the {role} agent in a static vulnerability adjudication debate. "
+            f"You are {agent_name}, the {role} agent in a static vulnerability adjudication debate. "
             "You must not invent files, data flows, protections, or impacts. "
             "Every concrete claim must cite one or more evidence IDs from the prompt."
         )
+        if agent_instructions:
+            system += f"\nRole configuration:\n{agent_instructions}"
         user = (
             f"Task: {task}\n"
             f"Finding: {bundle.finding.rule_id} - {bundle.finding.message}\n"
@@ -242,6 +268,14 @@ class DebateOrchestrator:
 def _ids(evidence: Iterable[CodeEvidence], *kinds: EvidenceKind) -> List[str]:
     accepted = set(kinds)
     return [item.evidence_id for item in evidence if item.kind in accepted]
+
+
+def _agent_or_default(config: Optional[AgentConfig], default: AgentConfig) -> AgentConfig:
+    if config is None:
+        return default
+    name = config.name.strip() or default.name
+    instructions = config.instructions.strip() or default.instructions
+    return AgentConfig(name=name, instructions=instructions)
 
 
 def _by_kind(evidence: Iterable[CodeEvidence]) -> Dict[EvidenceKind, List[CodeEvidence]]:

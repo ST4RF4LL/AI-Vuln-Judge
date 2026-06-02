@@ -91,6 +91,19 @@ uv run vuln-judger run \
   --negative-provider qwen-fast
 ```
 
+正方/反方 Agent role settings can be customized per run. The configuration is
+recorded with the run and is injected into LLM debate prompts:
+
+```bash
+uv run vuln-judger run \
+  --report report.md \
+  --source ./target-project \
+  --affirmative-agent-name "Exploit Prosecutor" \
+  --affirmative-agent-instructions "Prioritize source-backed exploitability and asset impact." \
+  --negative-agent-name "Mitigation Reviewer" \
+  --negative-agent-instructions "Challenge reachability, protections, and impact exaggeration."
+```
+
 The older `--llm-model` / `--llm-endpoint` path still works as a shared legacy
 provider when no provider IDs are selected.
 
@@ -120,7 +133,15 @@ curl -X POST http://127.0.0.1:8765/runs \
     "skills_path": "./skills",
     "enable_llm": true,
     "affirmative_provider_id": "openai-main",
-    "negative_provider_id": "qwen-fast"
+    "negative_provider_id": "qwen-fast",
+    "affirmative_agent": {
+      "name": "Exploit Prosecutor",
+      "instructions": "Prioritize source-backed exploitability and asset impact."
+    },
+    "negative_agent": {
+      "name": "Mitigation Reviewer",
+      "instructions": "Challenge reachability, protections, and impact exaggeration."
+    }
   }'
 ```
 

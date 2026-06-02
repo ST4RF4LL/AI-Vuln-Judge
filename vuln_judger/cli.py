@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .api import DEFAULT_RECORDS_DIR, serve
-from .models import RunConfig, to_jsonable
+from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
 from .records import RunRecordStore
@@ -31,6 +31,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--providers-file", type=Path, default=DEFAULT_PROVIDERS_FILE, help="Path to provider configuration")
     run_parser.add_argument("--affirmative-provider", help="Provider id for the affirmative agent")
     run_parser.add_argument("--negative-provider", help="Provider id for the negative agent")
+    run_parser.add_argument("--affirmative-agent-name", help="Display name for the affirmative role agent")
+    run_parser.add_argument("--affirmative-agent-instructions", help="Custom instructions for the affirmative role agent")
+    run_parser.add_argument("--negative-agent-name", help="Display name for the negative role agent")
+    run_parser.add_argument("--negative-agent-instructions", help="Custom instructions for the negative role agent")
     run_parser.add_argument("--out", type=Path, help="Write JSON report to this path")
     run_parser.add_argument("--record", action="store_true", help="Save this run to the UI records directory")
     run_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="Directory for saved run records")
@@ -60,6 +64,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             providers_file=args.providers_file,
             affirmative_provider_id=args.affirmative_provider,
             negative_provider_id=args.negative_provider,
+            affirmative_agent=_agent_config(args.affirmative_agent_name, args.affirmative_agent_instructions),
+            negative_agent=_agent_config(args.negative_agent_name, args.negative_agent_instructions),
         )
         report = run_judgement(config)
         if args.record:
@@ -77,6 +83,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 def _parse_languages(raw: str) -> List[str]:
     languages = [item.strip().lower() for item in raw.split(",") if item.strip()]
     return languages or ["java", "cpp", "python"]
+
+
+def _agent_config(name: Optional[str], instructions: Optional[str]) -> Optional[AgentConfig]:
+    name = (name or "").strip()
+    instructions = (instructions or "").strip()
+    if not name and not instructions:
+        return None
+    return AgentConfig(name=name, instructions=instructions)
 
 
 def _summary(report) -> str:

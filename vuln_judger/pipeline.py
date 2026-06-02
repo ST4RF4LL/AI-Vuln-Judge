@@ -47,6 +47,8 @@ def run_judgement(config: RunConfig) -> RunReport:
         max_rounds=config.max_rounds,
         affirmative_client=affirmative_client,
         negative_client=negative_client,
+        affirmative_agent=config.affirmative_agent,
+        negative_agent=config.negative_agent,
     )
     reports = []
     diagnostics = []
@@ -70,6 +72,7 @@ def run_judgement(config: RunConfig) -> RunReport:
             affirmative_client,
             negative_client,
         ),
+        agent_configs=_agent_config_metadata(orchestrator),
         diagnostics=diagnostics,
     )
 
@@ -109,6 +112,13 @@ def _llm_provider_metadata(
         "enabled": enabled,
         "affirmative": _role_provider_metadata(enabled, affirmative_provider, affirmative_client),
         "negative": _role_provider_metadata(enabled, negative_provider, negative_client),
+    }
+
+
+def _agent_config_metadata(orchestrator: DebateOrchestrator) -> dict:
+    return {
+        "affirmative": to_jsonable(orchestrator.affirmative_agent),
+        "negative": to_jsonable(orchestrator.negative_agent),
     }
 
 

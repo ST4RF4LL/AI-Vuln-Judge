@@ -107,6 +107,12 @@ class ProjectContext:
 
 
 @dataclass
+class AgentConfig:
+    name: str
+    instructions: str = ""
+
+
+@dataclass
 class DebateTurn:
     role: DebateRole
     round_index: int
@@ -147,6 +153,8 @@ class RunConfig:
     llm_endpoint: Optional[str] = None
     affirmative_provider_id: Optional[str] = None
     negative_provider_id: Optional[str] = None
+    affirmative_agent: Optional[AgentConfig] = None
+    negative_agent: Optional[AgentConfig] = None
 
 
 @dataclass
@@ -160,6 +168,7 @@ class RunReport:
     project_context_facts: int
     reports: List[VerdictReport]
     llm_providers: Dict[str, Any] = field(default_factory=dict)
+    agent_configs: Dict[str, Any] = field(default_factory=dict)
     diagnostics: List[str] = field(default_factory=list)
 
 

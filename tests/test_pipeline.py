@@ -12,7 +12,7 @@ from vuln_judger.api import app_html, make_handler
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
 from vuln_judger.llm import LLMClient
-from vuln_judger.models import RunConfig, Verdict
+from vuln_judger.models import AgentConfig, RunConfig, Verdict
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunRecordStore
@@ -144,6 +144,8 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('id="open-providers"', html)
         self.assertIn('id="providers-modal"', html)
         self.assertIn('id="provider-panel"', html)
+        self.assertIn('id="run-affirmative-agent-name"', html)
+        self.assertIn('id="run-negative-agent-instructions"', html)
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -251,6 +253,39 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(affirmative.calls)
             self.assertTrue(negative.calls)
 
+    def test_agent_config_is_used_by_llm_prompts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            finding = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            ).reports[0]
+            bundle = EvidenceBundle(
+                finding=type("FindingLike", (), {})(),
+                evidence=finding.evidence_chain,
+                diagnostics=[],
+            )
+            bundle.finding.finding_id = finding.finding_id
+            bundle.finding.rule_id = finding.rule_id
+            bundle.finding.message = "demo"
+            bundle.finding.locations = finding.source_locations
+            affirmative = FakeLLM("AFFIRMATIVE_FROM_CLIENT")
+            negative = FakeLLM("NEGATIVE_FROM_CLIENT")
+            DebateOrchestrator(
+                affirmative_client=affirmative,
+                negative_client=negative,
+                affirmative_agent=AgentConfig("Exploit Prosecutor", "Prioritize asset-theft evidence."),
+                negative_agent=AgentConfig("Reachability Reviewer", "Challenge dead code and mitigations."),
+            ).adjudicate(bundle)
+            self.assertIn("Exploit Prosecutor", affirmative.calls[0][0])
+            self.assertIn("Prioritize asset-theft evidence.", affirmative.calls[0][0])
+            self.assertIn("Reachability Reviewer", negative.calls[0][0])
+            self.assertIn("Challenge dead code and mitigations.", negative.calls[0][0])
+
     def test_run_report_records_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -281,6 +316,23 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(report.llm_providers["negative"]["provider_id"], "fake")
             self.assertTrue(report.llm_providers["affirmative"]["client_available"])
             self.assertEqual(report.llm_providers["affirmative"]["status"], "ready")
+
+    def test_run_report_records_agent_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, skills = write_python_fixture(root)
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    skills_path=skills,
+                    enable_external_tools=False,
+                    affirmative_agent=AgentConfig("Exploit Prosecutor", "Focus on value assets."),
+                    negative_agent=AgentConfig("Mitigation Reviewer", "Focus on reachable mitigations."),
+                )
+            )
+            self.assertEqual(report.agent_configs["affirmative"]["name"], "Exploit Prosecutor")
+            self.assertEqual(report.agent_configs["negative"]["instructions"], "Focus on reachable mitigations.")
 
     def test_run_report_records_disabled_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

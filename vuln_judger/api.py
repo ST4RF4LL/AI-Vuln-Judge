@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from .llm import test_provider_connection
-from .models import RunConfig, to_jsonable
+from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderStore
 from .records import RunRecordStore
@@ -206,6 +206,8 @@ def _config_from_payload(payload, providers_file: Path, run_id: Optional[str] = 
         llm_endpoint=payload.get("llm_endpoint"),
         affirmative_provider_id=payload.get("affirmative_provider_id"),
         negative_provider_id=payload.get("negative_provider_id"),
+        affirmative_agent=_agent_config_from_payload(payload, "affirmative"),
+        negative_agent=_agent_config_from_payload(payload, "negative"),
     )
 
 
@@ -221,6 +223,7 @@ def _run_detail(run):
         "project_context_facts": run.get("project_context_facts", 0),
         "diagnostics": run.get("diagnostics", []),
         "llm_providers": run.get("llm_providers", {}),
+        "agent_configs": run.get("agent_configs", {}),
         "verdict_counts": _verdict_counts(run),
     }
 
@@ -266,6 +269,7 @@ def _task_from_config(config: RunConfig, run_id: str, status: str, error: Option
         "diagnostic_count": 0,
         "diagnostics": [],
         "llm_providers": {},
+        "agent_configs": _agent_task_metadata(config),
         "verdict_counts": {},
         "error": error,
     }
@@ -288,6 +292,7 @@ def _run_task(config: RunConfig, store: RunRecordStore, tasks: dict, tasks_lock:
                 "diagnostic_count": len(report.diagnostics),
                 "diagnostics": report.diagnostics,
                 "llm_providers": report.llm_providers,
+                "agent_configs": report.agent_configs,
                 "verdict_counts": _verdict_counts(to_jsonable(report)),
             }
     except Exception as exc:
@@ -310,6 +315,29 @@ def _finding_summary(report):
         "source_locations": report.get("source_locations", []),
         "evidence_count": len(report.get("evidence_chain", [])),
         "debate_turn_count": len(report.get("debate", [])),
+    }
+
+
+def _agent_config_from_payload(payload, role: str) -> Optional[AgentConfig]:
+    raw = payload.get(f"{role}_agent") or {}
+    name = ""
+    instructions = ""
+    if isinstance(raw, dict):
+        name = str(raw.get("name") or "")
+        instructions = str(raw.get("instructions") or "")
+    elif raw:
+        instructions = str(raw)
+    name = str(payload.get(f"{role}_agent_name") or name).strip()
+    instructions = str(payload.get(f"{role}_agent_instructions") or instructions).strip()
+    if not name and not instructions:
+        return None
+    return AgentConfig(name=name, instructions=instructions)
+
+
+def _agent_task_metadata(config: RunConfig) -> dict:
+    return {
+        "affirmative": to_jsonable(config.affirmative_agent) if config.affirmative_agent else None,
+        "negative": to_jsonable(config.negative_agent) if config.negative_agent else None,
     }
 
 
@@ -621,6 +649,10 @@ def app_html() -> str:
               <label>Max rounds<input id="run-max-rounds" type="number" min="1" value="4"></label>
               <label>Affirmative provider<select id="run-affirmative-provider"></select></label>
               <label>Negative provider<select id="run-negative-provider"></select></label>
+              <label>Affirmative agent<input id="run-affirmative-agent-name" value="Affirmative Agent"></label>
+              <label>Negative agent<input id="run-negative-agent-name" value="Negative Agent"></label>
+              <label class="wide">Affirmative instructions<textarea id="run-affirmative-agent-instructions">Collect evidence that the report is grounded in real source code, validate reachability/data flow, assess missing protections, and state practical impact without exaggeration.</textarea></label>
+              <label class="wide">Negative instructions<textarea id="run-negative-agent-instructions">Challenge the vulnerability claim by checking hallucination risk, unreachable paths, mitigating controls, weak exploit preconditions, and overstated impact.</textarea></label>
             </div>
             <div class="chips">
               <label><input id="run-external-tools" type="checkbox" checked> External tools</label>
@@ -667,6 +699,10 @@ def app_html() -> str:
       runMaxRounds: document.getElementById('run-max-rounds'),
       runAffirmativeProvider: document.getElementById('run-affirmative-provider'),
       runNegativeProvider: document.getElementById('run-negative-provider'),
+      runAffirmativeAgentName: document.getElementById('run-affirmative-agent-name'),
+      runNegativeAgentName: document.getElementById('run-negative-agent-name'),
+      runAffirmativeAgentInstructions: document.getElementById('run-affirmative-agent-instructions'),
+      runNegativeAgentInstructions: document.getElementById('run-negative-agent-instructions'),
       runExternalTools: document.getElementById('run-external-tools'),
       runAutoIndex: document.getElementById('run-auto-index'),
       runLlm: document.getElementById('run-llm'),
@@ -885,7 +921,15 @@ def app_html() -> str:
           auto_index_tools: el.runAutoIndex.checked,
           enable_llm: el.runLlm.checked,
           affirmative_provider_id: el.runAffirmativeProvider.value || null,
-          negative_provider_id: el.runNegativeProvider.value || null
+          negative_provider_id: el.runNegativeProvider.value || null,
+          affirmative_agent: {{
+            name: el.runAffirmativeAgentName.value.trim(),
+            instructions: el.runAffirmativeAgentInstructions.value.trim()
+          }},
+          negative_agent: {{
+            name: el.runNegativeAgentName.value.trim(),
+            instructions: el.runNegativeAgentInstructions.value.trim()
+          }}
         }};
         if (!payload.report_path || !payload.source_path) {{
           throw new Error('Report path and source path are required.');
@@ -976,6 +1020,7 @@ def app_html() -> str:
     function renderRunDetail(run, findings) {{
       const counts = run.verdict_counts || {{}};
       const providers = run.llm_providers || {{}};
+      const agents = run.agent_configs || {{}};
       const status = run.status || 'completed';
       el.status.textContent = `${{status}} / ${{findings.length}} findings`;
       if (status !== 'completed') {{
@@ -1009,6 +1054,9 @@ def app_html() -> str:
             <div><strong>Languages:</strong> ${{esc((run.languages || []).join(', '))}}</div>
             <div><strong>Affirmative LLM:</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
             <div><strong>Negative LLM:</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
+            <div><strong>Affirmative Agent:</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
+            <div><strong>Negative Agent:</strong> ${{esc(agentLabel(agents.negative))}}</div>
+            ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}
             ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
           </div>
         </div>
@@ -1056,6 +1104,22 @@ def app_html() -> str:
       }}[status] || status.replace(/_/g, ' ');
       if (status === 'not_configured') return statusText;
       return `${{label}} (${{statusText}})`;
+    }}
+
+    function agentLabel(value) {{
+      if (!value) return 'default';
+      return value.name || 'Agent';
+    }}
+
+    function agentInstructions(agents) {{
+      const lines = [];
+      if (agents.affirmative && agents.affirmative.instructions) {{
+        lines.push(`${{agentLabel(agents.affirmative)}}: ${{agents.affirmative.instructions}}`);
+      }}
+      if (agents.negative && agents.negative.instructions) {{
+        lines.push(`${{agentLabel(agents.negative)}}: ${{agents.negative.instructions}}`);
+      }}
+      return lines.join('\\n\\n');
     }}
 
     async function selectFinding(findingId) {{
