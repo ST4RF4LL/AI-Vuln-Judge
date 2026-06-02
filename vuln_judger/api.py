@@ -127,6 +127,15 @@ def make_handler(
 
         def do_DELETE(self) -> None:  # noqa: N802
             parts = _parts(self.path)
+            if len(parts) == 2 and parts[0] == "runs":
+                deleted_record = store.delete(parts[1])
+                deleted_task = _delete_task(tasks, tasks_lock, parts[1])
+                if deleted_record or deleted_task:
+                    LOG.info("删除运行记录 run_id=%s record=%s task=%s", parts[1], deleted_record, deleted_task)
+                    self._json({"deleted": True, "run_id": parts[1]})
+                else:
+                    self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
+                return
             if len(parts) == 3 and parts[0] == "agent-prompts":
                 try:
                     self._json(agent_store.delete_profile(parts[1], parts[2]))
@@ -310,6 +319,11 @@ def _get_task(tasks: dict, tasks_lock: Lock, run_id: str):
     with tasks_lock:
         task = tasks.get(run_id)
         return dict(task) if task else None
+
+
+def _delete_task(tasks: dict, tasks_lock: Lock, run_id: str) -> bool:
+    with tasks_lock:
+        return tasks.pop(run_id, None) is not None
 
 
 def _new_run_id() -> str:
@@ -545,6 +559,8 @@ def app_html() -> str:
     .chip.tp {{ color: var(--tp); border-color: #8fd4aa; background: #effaf3; }}
     .chip.fp {{ color: var(--fp); border-color: #edc391; background: #fff7ed; }}
     .chip.inc {{ color: var(--inc); border-color: #c9c1ef; background: #f6f3ff; }}
+    .chip.run-delete {{ cursor: pointer; color: var(--bad); }}
+    .chip.run-delete:hover {{ border-color: var(--bad); background: #fff1f0; }}
     .content {{ padding: 16px; display: grid; gap: 16px; }}
     .summary-grid {{
       display: grid;
@@ -1548,11 +1564,44 @@ def app_html() -> str:
             <span class="chip tp">真实 ${{counts.TRUE_POSITIVE || 0}}</span>
             <span class="chip fp">误报 ${{counts.FALSE_POSITIVE || 0}}</span>
             <span class="chip inc">不足 ${{counts.INCONCLUSIVE || 0}}</span>
+            <span class="chip run-delete" data-run-delete="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="删除该任务记录">删除</span>
           </div>
         </button>`;
       }}).join('');
       for (const button of el.list.querySelectorAll('button[data-run-id]')) {{
         button.addEventListener('click', () => selectRun(button.dataset.runId));
+      }}
+      for (const button of el.list.querySelectorAll('[data-run-delete]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          deleteRun(button.dataset.runId);
+        }});
+        button.addEventListener('keydown', event => {{
+          if (event.key === 'Enter' || event.key === ' ') {{
+            event.preventDefault();
+            event.stopPropagation();
+            deleteRun(button.dataset.runId);
+          }}
+        }});
+      }}
+    }}
+
+    async function deleteRun(runId) {{
+      if (!runId) return;
+      try {{
+        await fetchJson(`/runs/${{encodeURIComponent(runId)}}`, {{ method: 'DELETE' }});
+        if (state.selectedRun === runId) {{
+          state.selectedRun = null;
+          state.selectedFinding = null;
+        }}
+        await loadRuns();
+        if (!state.selectedRun && state.runs.length > 0) {{
+          await selectRun(state.runs[0].run_id);
+        }} else if (!state.runs.length) {{
+          renderEmpty('暂无记录。可以通过“启动任务”按钮、POST /runs 或 CLI/API 工作流创建任务。');
+        }}
+      }} catch (error) {{
+        renderError(error);
       }}
     }}
 

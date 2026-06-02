@@ -95,6 +95,9 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(records[0]["run_id"], report.run_id)
             self.assertEqual(records[0]["verdict_counts"]["TRUE_POSITIVE"], 1)
             self.assertIsNotNone(store.get(report.run_id))
+            self.assertTrue(store.delete(report.run_id))
+            self.assertIsNone(store.get(report.run_id))
+            self.assertFalse(store.delete(report.run_id))
 
     def test_api_serves_records_and_html(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -131,6 +134,13 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(len(runs), 1)
                 self.assertEqual(findings[0]["verdict"], "TRUE_POSITIVE")
                 self.assertIn("漏洞研判记录", html)
+                delete_request = urllib.request.Request(f"{base}/runs/{created['run_id']}", method="DELETE")
+                with urllib.request.urlopen(delete_request, timeout=5) as response:
+                    deleted = json.loads(response.read().decode("utf-8"))
+                self.assertTrue(deleted["deleted"])
+                with urllib.request.urlopen(f"{base}/runs", timeout=5) as response:
+                    runs_after_delete = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(runs_after_delete, [])
             finally:
                 server.shutdown()
                 server.server_close()
@@ -165,6 +175,8 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('class="markdown-body"', html)
         self.assertIn('renderMarkdown(turn.claim)', html)
         self.assertIn("replace(/\\r\\n?/g, '\\n')", html)
+        self.assertIn('data-run-delete="true"', html)
+        self.assertIn('async function deleteRun(runId)', html)
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -24,6 +24,13 @@ class RunRecordStore:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def delete(self, run_id: str) -> bool:
+        path = self._path(run_id)
+        if not path.exists():
+            return False
+        path.unlink()
+        return True
+
     def list(self) -> List[Dict[str, Any]]:
         records = []
         for path in sorted(self.root.glob("run-*.json")):
