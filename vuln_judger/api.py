@@ -555,6 +555,18 @@ def app_html() -> str:
       background: #fbfcfe;
     }}
     .detail-body {{ padding: 14px; display: grid; gap: 12px; }}
+    #agent-affirmative-profile-panel,
+    #agent-negative-profile-panel {{
+      min-height: 560px;
+      height: auto;
+      overflow: visible;
+    }}
+    #agent-affirmative-profile-panel .detail-body,
+    #agent-negative-profile-panel .detail-body {{
+      min-height: 500px;
+      align-content: start;
+      grid-auto-rows: max-content;
+    }}
     .form-grid {{ display: grid; grid-template-columns: repeat(2, minmax(160px, 1fr)); gap: 12px; }}
     .form-grid .wide {{ grid-column: 1 / -1; }}
     pre {{
