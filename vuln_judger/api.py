@@ -11,6 +11,7 @@ from typing import Optional
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
+from .agents import DEFAULT_AGENT_PROMPTS_FILE, AgentPromptStore
 from .llm import test_provider_connection
 from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import run_judgement
@@ -26,18 +27,26 @@ def serve(
     port: int = 8765,
     records_dir: Path = DEFAULT_RECORDS_DIR,
     providers_file: Path = DEFAULT_PROVIDERS_FILE,
+    agent_prompts_file: Path = DEFAULT_AGENT_PROMPTS_FILE,
 ) -> None:
     store = RunRecordStore(records_dir)
     provider_store = ProviderStore(providers_file)
-    server = ThreadingHTTPServer((host, port), make_handler(store, provider_store))
+    agent_prompt_store = AgentPromptStore(agent_prompts_file)
+    server = ThreadingHTTPServer((host, port), make_handler(store, provider_store, agent_prompt_store))
     print(f"vuln-judger UI listening on http://{host}:{port}")
     print(f"records directory: {store.root}")
     print(f"providers file: {provider_store.path}")
+    print(f"agent prompts file: {agent_prompt_store.path}")
     server.serve_forever()
 
 
-def make_handler(store: RunRecordStore, provider_store: Optional[ProviderStore] = None):
+def make_handler(
+    store: RunRecordStore,
+    provider_store: Optional[ProviderStore] = None,
+    agent_prompt_store: Optional[AgentPromptStore] = None,
+):
     provider_store = provider_store or ProviderStore(store.root.parent / "providers.json")
+    agent_prompt_store = agent_prompt_store or AgentPromptStore(store.root.parent / "agent_prompts.json")
     tasks = {}
     tasks_lock = Lock()
 
@@ -50,7 +59,7 @@ def make_handler(store: RunRecordStore, provider_store: Optional[ProviderStore] 
                 if parts == ["runs"]:
                     payload = self._read_json()
                     run_id = _new_run_id()
-                    config = _config_from_payload(payload, provider_store.path, run_id)
+                    config = _config_from_payload(payload, provider_store.path, run_id, agent_prompt_store)
                     task = _task_from_config(config, run_id, "running")
                     with tasks_lock:
                         tasks[run_id] = task
@@ -71,6 +80,13 @@ def make_handler(store: RunRecordStore, provider_store: Optional[ProviderStore] 
                 if parts == ["providers", "defaults"]:
                     payload = self._read_json()
                     self._json(provider_store.set_defaults(payload.get("affirmative"), payload.get("negative")))
+                    return
+                if parts == ["agent-prompts"]:
+                    payload = self._read_json()
+                    if payload.get("reset"):
+                        self._json(agent_prompt_store.reset())
+                    else:
+                        self._json(agent_prompt_store.save(payload))
                     return
                 if len(parts) == 3 and parts[0] == "providers" and parts[2] == "test":
                     provider = provider_store.get(parts[1])
@@ -109,6 +125,12 @@ def make_handler(store: RunRecordStore, provider_store: Optional[ProviderStore] 
                 return
             if parts == ["providers", "defaults"]:
                 self._json(provider_store.defaults())
+                return
+            if parts == ["agent-prompts"]:
+                self._json(agent_prompt_store.get())
+                return
+            if parts == ["agent-prompts", "defaults"]:
+                self._json(agent_prompt_store.defaults())
                 return
             if len(parts) == 2 and parts[0] == "providers":
                 provider = provider_store.get(parts[1])
@@ -183,7 +205,12 @@ def _parts(path: str) -> list[str]:
     return [unquote(part) for part in urlparse(path).path.strip("/").split("/") if part]
 
 
-def _config_from_payload(payload, providers_file: Path, run_id: Optional[str] = None) -> RunConfig:
+def _config_from_payload(
+    payload,
+    providers_file: Path,
+    run_id: Optional[str] = None,
+    agent_prompt_store: Optional[AgentPromptStore] = None,
+) -> RunConfig:
     languages = payload.get("languages") or ["java", "cpp", "python"]
     if isinstance(languages, str):
         languages = [item.strip().lower() for item in languages.split(",") if item.strip()]
@@ -191,6 +218,13 @@ def _config_from_payload(payload, providers_file: Path, run_id: Optional[str] = 
     report_path = payload.get("sarif_path") or payload.get("report_path")
     if not report_path:
         raise ValueError("report_path or sarif_path is required")
+    affirmative_agent = _agent_config_from_payload(payload, "affirmative")
+    negative_agent = _agent_config_from_payload(payload, "negative")
+    if agent_prompt_store is not None:
+        if affirmative_agent is None:
+            affirmative_agent = agent_prompt_store.agent("affirmative")
+        if negative_agent is None:
+            negative_agent = agent_prompt_store.agent("negative")
     return RunConfig(
         sarif_path=Path(report_path),
         source_path=Path(payload["source_path"]),
@@ -206,8 +240,8 @@ def _config_from_payload(payload, providers_file: Path, run_id: Optional[str] = 
         llm_endpoint=payload.get("llm_endpoint"),
         affirmative_provider_id=payload.get("affirmative_provider_id"),
         negative_provider_id=payload.get("negative_provider_id"),
-        affirmative_agent=_agent_config_from_payload(payload, "affirmative"),
-        negative_agent=_agent_config_from_payload(payload, "negative"),
+        affirmative_agent=affirmative_agent,
+        negative_agent=negative_agent,
     )
 
 
@@ -566,6 +600,7 @@ def app_html() -> str:
     <div class="toolbar">
       <button id="open-run-config" type="button" title="Start a new judgement run">Start Run</button>
       <button id="open-providers" type="button" title="Configure LLM providers">LLM Providers</button>
+      <button id="open-agent-prompts" type="button" title="Configure Agent prompts">Agent Prompts</button>
       <button id="refresh" type="button" title="Refresh records">Refresh</button>
       <button id="clear-selection" type="button" title="Clear current detail">Clear</button>
     </div>
@@ -628,6 +663,35 @@ def app_html() -> str:
       </div>
     </section>
   </div>
+  <div class="modal-backdrop" id="agent-prompts-modal" role="dialog" aria-modal="true" aria-labelledby="agent-prompts-title">
+    <section class="settings-panel" aria-label="Agent prompt settings">
+      <div class="settings-head">
+        <div>
+          <h2 id="agent-prompts-title">Agent Prompts</h2>
+          <div class="muted">Configure default affirmative and negative role prompts for new runs.</div>
+        </div>
+        <button id="close-agent-prompts" type="button" title="Close Agent prompt settings">Close</button>
+      </div>
+      <div class="settings-body">
+        <div class="detail" id="agent-prompt-panel">
+          <h3>Default Role Prompts</h3>
+          <div class="detail-body">
+            <div class="form-grid">
+              <label>Affirmative agent<input id="agent-affirmative-name" placeholder="Affirmative Agent"></label>
+              <label>Negative agent<input id="agent-negative-name" placeholder="Negative Agent"></label>
+              <label class="wide">Affirmative prompt<textarea id="agent-affirmative-instructions"></textarea></label>
+              <label class="wide">Negative prompt<textarea id="agent-negative-instructions"></textarea></label>
+            </div>
+            <div class="toolbar">
+              <button id="save-agent-prompts" type="button">Save Prompts</button>
+              <button id="reset-agent-prompts" type="button">Reset Defaults</button>
+            </div>
+            <pre id="agent-prompts-result">No Agent prompt changes yet.</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
   <div class="modal-backdrop" id="run-config-modal" role="dialog" aria-modal="true" aria-labelledby="run-config-title">
     <section class="settings-panel" aria-label="Run configuration">
       <div class="settings-head">
@@ -671,7 +735,7 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, providers: [], defaults: {{}} }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, providers: [], defaults: {{}}, agentPrompts: {{}} }};
     const el = {{
       list: document.getElementById('run-list'),
       count: document.getElementById('run-count'),
@@ -681,8 +745,10 @@ def app_html() -> str:
       subtitle: document.getElementById('subtitle'),
       providerList: document.getElementById('provider-list'),
       providersModal: document.getElementById('providers-modal'),
+      agentPromptsModal: document.getElementById('agent-prompts-modal'),
       runConfigModal: document.getElementById('run-config-modal'),
       providerResult: document.getElementById('provider-result'),
+      agentPromptsResult: document.getElementById('agent-prompts-result'),
       providerId: document.getElementById('provider-id'),
       providerName: document.getElementById('provider-name'),
       providerEndpoint: document.getElementById('provider-endpoint'),
@@ -692,6 +758,10 @@ def app_html() -> str:
       providerExtra: document.getElementById('provider-extra'),
       defaultAffirmative: document.getElementById('default-affirmative'),
       defaultNegative: document.getElementById('default-negative'),
+      agentAffirmativeName: document.getElementById('agent-affirmative-name'),
+      agentNegativeName: document.getElementById('agent-negative-name'),
+      agentAffirmativeInstructions: document.getElementById('agent-affirmative-instructions'),
+      agentNegativeInstructions: document.getElementById('agent-negative-instructions'),
       runSarif: document.getElementById('run-sarif'),
       runSource: document.getElementById('run-source'),
       runSkills: document.getElementById('run-skills'),
@@ -711,7 +781,7 @@ def app_html() -> str:
 
     document.getElementById('open-run-config').addEventListener('click', async () => {{
       el.runConfigModal.classList.add('open');
-      await loadProviders();
+      await Promise.all([loadProviders(), loadAgentPrompts()]);
     }});
     document.getElementById('close-run-config').addEventListener('click', () => {{
       el.runConfigModal.classList.remove('open');
@@ -729,6 +799,16 @@ def app_html() -> str:
     el.providersModal.addEventListener('click', (event) => {{
       if (event.target === el.providersModal) el.providersModal.classList.remove('open');
     }});
+    document.getElementById('open-agent-prompts').addEventListener('click', async () => {{
+      el.agentPromptsModal.classList.add('open');
+      await loadAgentPrompts();
+    }});
+    document.getElementById('close-agent-prompts').addEventListener('click', () => {{
+      el.agentPromptsModal.classList.remove('open');
+    }});
+    el.agentPromptsModal.addEventListener('click', (event) => {{
+      if (event.target === el.agentPromptsModal) el.agentPromptsModal.classList.remove('open');
+    }});
     document.getElementById('refresh').addEventListener('click', refreshAll);
     document.getElementById('clear-selection').addEventListener('click', () => {{
       state.selectedRun = null;
@@ -740,6 +820,8 @@ def app_html() -> str:
     document.getElementById('test-provider').addEventListener('click', testProvider);
     document.getElementById('delete-provider').addEventListener('click', deleteProvider);
     document.getElementById('save-defaults').addEventListener('click', saveDefaults);
+    document.getElementById('save-agent-prompts').addEventListener('click', saveAgentPrompts);
+    document.getElementById('reset-agent-prompts').addEventListener('click', resetAgentPrompts);
     document.getElementById('start-run').addEventListener('click', startRun);
     document.getElementById('fill-demo-run').addEventListener('click', fillDemoRun);
     document.getElementById('fill-markdown-demo-run').addEventListener('click', fillMarkdownDemoRun);
@@ -775,7 +857,7 @@ def app_html() -> str:
     }}
 
     async function refreshAll() {{
-      await Promise.all([loadProviders(), loadRuns()]);
+      await Promise.all([loadProviders(), loadAgentPrompts(), loadRuns()]);
     }}
 
     async function loadProviders() {{
@@ -786,6 +868,61 @@ def app_html() -> str:
         renderProviders();
       }} catch (error) {{
         el.providerResult.textContent = error.message;
+      }}
+    }}
+
+    async function loadAgentPrompts() {{
+      try {{
+        state.agentPrompts = await fetchJson('/agent-prompts');
+        renderAgentPrompts();
+      }} catch (error) {{
+        el.agentPromptsResult.textContent = error.message;
+      }}
+    }}
+
+    function renderAgentPrompts() {{
+      const affirmative = state.agentPrompts.affirmative || {{}};
+      const negative = state.agentPrompts.negative || {{}};
+      el.agentAffirmativeName.value = affirmative.name || '';
+      el.agentNegativeName.value = negative.name || '';
+      el.agentAffirmativeInstructions.value = affirmative.instructions || '';
+      el.agentNegativeInstructions.value = negative.instructions || '';
+      el.runAffirmativeAgentName.value = affirmative.name || 'Affirmative Agent';
+      el.runNegativeAgentName.value = negative.name || 'Negative Agent';
+      el.runAffirmativeAgentInstructions.value = affirmative.instructions || '';
+      el.runNegativeAgentInstructions.value = negative.instructions || '';
+    }}
+
+    function agentPromptPayloadFromPanel() {{
+      return {{
+        affirmative: {{
+          name: el.agentAffirmativeName.value.trim(),
+          instructions: el.agentAffirmativeInstructions.value.trim()
+        }},
+        negative: {{
+          name: el.agentNegativeName.value.trim(),
+          instructions: el.agentNegativeInstructions.value.trim()
+        }}
+      }};
+    }}
+
+    async function saveAgentPrompts() {{
+      try {{
+        state.agentPrompts = await fetchJson('/agent-prompts', jsonPost(agentPromptPayloadFromPanel()));
+        renderAgentPrompts();
+        el.agentPromptsResult.textContent = JSON.stringify(state.agentPrompts, null, 2);
+      }} catch (error) {{
+        el.agentPromptsResult.textContent = error.message;
+      }}
+    }}
+
+    async function resetAgentPrompts() {{
+      try {{
+        state.agentPrompts = await fetchJson('/agent-prompts', jsonPost({{ reset: true }}));
+        renderAgentPrompts();
+        el.agentPromptsResult.textContent = JSON.stringify(state.agentPrompts, null, 2);
+      }} catch (error) {{
+        el.agentPromptsResult.textContent = error.message;
       }}
     }}
 

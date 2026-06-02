@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .api import DEFAULT_RECORDS_DIR, serve
+from .agents import DEFAULT_AGENT_PROMPTS_FILE
 from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
@@ -44,10 +45,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     api_parser.add_argument("--port", default=8765, type=int)
     api_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="Directory for saved run records")
     api_parser.add_argument("--providers-file", type=Path, default=DEFAULT_PROVIDERS_FILE, help="Path to provider configuration")
+    api_parser.add_argument("--agent-prompts-file", type=Path, default=DEFAULT_AGENT_PROMPTS_FILE, help="Path to Agent prompt configuration")
 
     args = parser.parse_args(argv)
     if args.command == "api":
-        serve(args.host, args.port, args.records_dir, args.providers_file)
+        serve(args.host, args.port, args.records_dir, args.providers_file, args.agent_prompts_file)
         return 0
     if args.command == "run":
         config = RunConfig(

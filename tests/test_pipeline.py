@@ -9,6 +9,7 @@ from pathlib import Path
 from threading import Thread
 
 from vuln_judger.api import app_html, make_handler
+from vuln_judger.agents import AgentPromptStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
 from vuln_judger.llm import LLMClient
@@ -144,6 +145,9 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('id="open-providers"', html)
         self.assertIn('id="providers-modal"', html)
         self.assertIn('id="provider-panel"', html)
+        self.assertIn('id="open-agent-prompts"', html)
+        self.assertIn('id="agent-prompts-modal"', html)
+        self.assertIn('id="agent-prompt-panel"', html)
         self.assertIn('id="run-affirmative-agent-name"', html)
         self.assertIn('id="run-negative-agent-instructions"', html)
 
@@ -224,6 +228,54 @@ class PipelineTests(unittest.TestCase):
                 llm_server.shutdown()
                 llm_server.server_close()
                 llm_thread.join(timeout=5)
+
+    def test_api_agent_prompt_crud_and_run_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, skills = write_python_fixture(root)
+            store = RunRecordStore(root / "records")
+            provider_store = ProviderStore(root / "providers.json")
+            agent_store = AgentPromptStore(root / "agent_prompts.json")
+            api_server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(store, provider_store, agent_store))
+            api_thread = Thread(target=api_server.serve_forever, daemon=True)
+            api_thread.start()
+            base = f"http://127.0.0.1:{api_server.server_port}"
+            try:
+                with urllib.request.urlopen(f"{base}/agent-prompts", timeout=5) as response:
+                    defaults = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(defaults["affirmative"]["name"], "Affirmative Agent")
+                saved = post_json(
+                    f"{base}/agent-prompts",
+                    {
+                        "affirmative": {
+                            "name": "Exploit Prosecutor",
+                            "instructions": "Prioritize value asset impact.",
+                        },
+                        "negative": {
+                            "name": "Mitigation Reviewer",
+                            "instructions": "Challenge reachability and guards.",
+                        },
+                    },
+                )
+                self.assertEqual(saved["negative"]["name"], "Mitigation Reviewer")
+                created = post_json(
+                    f"{base}/runs",
+                    {
+                        "report_path": str(sarif),
+                        "source_path": str(root),
+                        "skills_path": str(skills),
+                        "enable_external_tools": False,
+                    },
+                )
+                run = wait_for_run_completed(base, created["run_id"])
+                self.assertEqual(run["agent_configs"]["affirmative"]["name"], "Exploit Prosecutor")
+                self.assertEqual(run["agent_configs"]["negative"]["instructions"], "Challenge reachability and guards.")
+                reset = post_json(f"{base}/agent-prompts", {"reset": True})
+                self.assertEqual(reset["affirmative"]["name"], "Affirmative Agent")
+            finally:
+                api_server.shutdown()
+                api_server.server_close()
+                api_thread.join(timeout=5)
 
     def test_affirmative_and_negative_use_independent_clients(self):
         with tempfile.TemporaryDirectory() as tmp:

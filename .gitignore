@@ -14,5 +14,6 @@ __pycache__/
 .atlas/
 
 # Local vuln-judger runtime state and secrets
+.vuln-judger/agent_prompts.json
 .vuln-judger/providers.json
 .vuln-judger/runs/

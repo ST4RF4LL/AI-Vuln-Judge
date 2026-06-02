@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence
 
+from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_NEGATIVE_AGENT
 from .evidence import EvidenceBundle
 from .llm import LLMClient
 from .models import (
@@ -25,22 +26,6 @@ class DebateDecision:
     disputed_points: List[str]
     reasoning_summary: str
     recommended_next_steps: List[str]
-
-
-DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
-    name="Affirmative Agent",
-    instructions=(
-        "Collect evidence that the report is grounded in real source code, "
-        "validate reachability/data flow, assess missing protections, and state practical impact without exaggeration."
-    ),
-)
-DEFAULT_NEGATIVE_AGENT = AgentConfig(
-    name="Negative Agent",
-    instructions=(
-        "Challenge the vulnerability claim by checking hallucination risk, unreachable paths, mitigating controls, "
-        "weak exploit preconditions, and overstated impact."
-    ),
-)
 
 
 class DebateOrchestrator:

@@ -42,6 +42,11 @@ Only OpenAI-compatible Chat Completions APIs are supported. Prefer
 `api_key_env` to avoid writing plaintext keys to disk; plaintext keys are
 supported for local-only development and are masked by the API/UI.
 
+Default Agent prompts are stored in `.vuln-judger/agent_prompts.json` by
+default. The web UI exposes this through the top-right `Agent Prompts` button.
+New runs inherit those prompts unless the run start form or API payload
+overrides them.
+
 Example provider file:
 
 ```json
@@ -114,13 +119,15 @@ uv run vuln-judger api \
   --host 127.0.0.1 \
   --port 8765 \
   --records-dir .vuln-judger/runs \
-  --providers-file .vuln-judger/providers.json
+  --providers-file .vuln-judger/providers.json \
+  --agent-prompts-file .vuln-judger/agent_prompts.json
 ```
 
 Open http://127.0.0.1:8765 to view saved judgement records. The page shows
 run history, verdict counts, finding summaries, evidence, debate turns,
 protection analysis, impact analysis, LLM provider settings, default
-正方/反方 provider selection, and provider connectivity testing.
+正方/反方 provider selection, provider connectivity testing, and default
+正方/反方 Agent prompt configuration.
 
 Create a run:
 
