@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vuln-judger"
 version = "0.1.0"
-description = "LLM-assisted static vulnerability adjudication from SARIF, source code, and project skills."
+description = "基于 SARIF/Markdown 报告、源码和项目 skill 知识库的 LLM 辅助静态漏洞研判平台。"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

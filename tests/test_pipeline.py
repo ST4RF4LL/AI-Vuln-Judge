@@ -46,16 +46,16 @@ class PipelineTests(unittest.TestCase):
             markdown.write_text(
                 "\n".join(
                     [
-                        "# Static Analysis Markdown Report",
+                        "# 静态分析 Markdown 报告",
                         "",
-                        "## Finding 1: python-command-injection",
+                        "## 发现 1：python-command-injection",
                         "",
-                        "- Rule: python-command-injection",
-                        "- Severity: error",
-                        "- Message: user input reaches command execution",
-                        "- Location: app.py:5:5",
+                        "- 规则：python-command-injection",
+                        "- 严重性：error",
+                        "- 消息：用户输入可到达命令执行点",
+                        "- 位置：app.py:5:5",
                         "",
-                        "### Code Flow",
+                        "### 代码流",
                         "",
                         "- app.py:4:11",
                         "- app.py:5:5",
@@ -130,7 +130,7 @@ class PipelineTests(unittest.TestCase):
                     html = response.read().decode("utf-8")
                 self.assertEqual(len(runs), 1)
                 self.assertEqual(findings[0]["verdict"], "TRUE_POSITIVE")
-                self.assertIn("Vulnerability Judger Records", html)
+                self.assertIn("漏洞研判记录", html)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -138,6 +138,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_app_html_contains_core_mount_points(self):
         html = app_html()
+        self.assertIn('<html lang="zh-CN">', html)
         self.assertIn('id="run-list"', html)
         self.assertIn('id="detail"', html)
         self.assertIn('id="open-run-config"', html)
@@ -259,7 +260,7 @@ class PipelineTests(unittest.TestCase):
                     {
                         "role": "affirmative",
                         "profile_id": "Affirmative_default",
-                        "instructions": "Prioritize value asset impact.",
+                        "instructions": "优先关注价值资产影响。",
                     },
                 )
                 self.assertEqual(saved["profile_id"], "Affirmative_default")
@@ -268,7 +269,7 @@ class PipelineTests(unittest.TestCase):
                     {
                         "role": "affirmative",
                         "profile_id": "Affirmative_custom",
-                        "instructions": "Custom affirmative profile.",
+                        "instructions": "自定义正方配置档案。",
                     },
                 )
                 self.assertTrue(custom["deletable"])
@@ -287,7 +288,7 @@ class PipelineTests(unittest.TestCase):
                     {
                         "role": "negative",
                         "profile_id": "Negative_default",
-                        "instructions": "Challenge reachability and guards.",
+                        "instructions": "质疑可达性和防护条件。",
                     },
                 )
                 created = post_json(
@@ -301,8 +302,10 @@ class PipelineTests(unittest.TestCase):
                 )
                 run = wait_for_run_completed(base, created["run_id"])
                 self.assertEqual(run["agent_configs"]["affirmative"]["profile_id"], "Affirmative_default")
-                self.assertEqual(run["agent_configs"]["affirmative"]["instructions"], "Prioritize value asset impact.")
-                self.assertEqual(run["agent_configs"]["negative"]["instructions"], "Challenge reachability and guards.")
+                self.assertTrue(run["agent_configs"]["affirmative"]["is_default"])
+                self.assertFalse(run["agent_configs"]["affirmative"]["deletable"])
+                self.assertEqual(run["agent_configs"]["affirmative"]["instructions"], "优先关注价值资产影响。")
+                self.assertEqual(run["agent_configs"]["negative"]["instructions"], "质疑可达性和防护条件。")
                 delete_request = urllib.request.Request(
                     f"{base}/agent-prompts/affirmative/Affirmative_custom",
                     method="DELETE",
@@ -379,13 +382,13 @@ class PipelineTests(unittest.TestCase):
             DebateOrchestrator(
                 affirmative_client=affirmative,
                 negative_client=negative,
-                affirmative_agent=AgentConfig("Exploit Prosecutor", "Prioritize asset-theft evidence."),
-                negative_agent=AgentConfig("Reachability Reviewer", "Challenge dead code and mitigations."),
+                affirmative_agent=AgentConfig("利用证据指证员", "优先关注资产窃取证据。"),
+                negative_agent=AgentConfig("可达性复核员", "质疑死代码和缓解措施。"),
             ).adjudicate(bundle)
-            self.assertIn("Exploit Prosecutor", affirmative.calls[0][0])
-            self.assertIn("Prioritize asset-theft evidence.", affirmative.calls[0][0])
-            self.assertIn("Reachability Reviewer", negative.calls[0][0])
-            self.assertIn("Challenge dead code and mitigations.", negative.calls[0][0])
+            self.assertIn("利用证据指证员", affirmative.calls[0][0])
+            self.assertIn("优先关注资产窃取证据。", affirmative.calls[0][0])
+            self.assertIn("可达性复核员", negative.calls[0][0])
+            self.assertIn("质疑死代码和缓解措施。", negative.calls[0][0])
 
     def test_run_report_records_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -428,12 +431,12 @@ class PipelineTests(unittest.TestCase):
                     source_path=root,
                     skills_path=skills,
                     enable_external_tools=False,
-                    affirmative_agent=AgentConfig("Exploit Prosecutor", "Focus on value assets."),
-                    negative_agent=AgentConfig("Mitigation Reviewer", "Focus on reachable mitigations."),
+                    affirmative_agent=AgentConfig("利用证据指证员", "关注价值资产。"),
+                    negative_agent=AgentConfig("缓解措施复核员", "关注可达缓解措施。"),
                 )
             )
-            self.assertEqual(report.agent_configs["affirmative"]["name"], "Exploit Prosecutor")
-            self.assertEqual(report.agent_configs["negative"]["instructions"], "Focus on reachable mitigations.")
+            self.assertEqual(report.agent_configs["affirmative"]["name"], "利用证据指证员")
+            self.assertEqual(report.agent_configs["negative"]["instructions"], "关注可达缓解措施。")
 
     def test_run_report_records_disabled_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -557,7 +560,7 @@ class PipelineTests(unittest.TestCase):
                 )
             )
             self.assertEqual(report.reports[0].verdict, Verdict.INCONCLUSIVE)
-            self.assertIn("compile", report.reports[0].reasoning_summary.lower())
+            self.assertIn("编译数据库", report.reports[0].reasoning_summary)
 
 
 def write_python_fixture(root: Path):
@@ -577,7 +580,7 @@ def write_python_fixture(root: Path):
     skills = root / "skills"
     skills.mkdir()
     (skills / "SKILL.md").write_text(
-        "# Payments threat model\napp.py handles payment admin commands and customer data.",
+        "# 支付系统威胁模型\napp.py 处理支付管理命令和客户数据。",
         encoding="utf-8",
     )
     sarif = root / "report.sarif"
@@ -592,7 +595,7 @@ def write_python_fixture(root: Path):
                             {
                                 "ruleId": "python-command-injection",
                                 "level": "error",
-                                "message": {"text": "user input reaches command execution"},
+                                "message": {"text": "用户输入可到达命令执行点"},
                                 "locations": [
                                     {
                                         "physicalLocation": {

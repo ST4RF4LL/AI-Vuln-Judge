@@ -33,10 +33,10 @@ def serve(
     provider_store = ProviderStore(providers_file)
     agent_store = AgentDirectoryStore(agents_dir)
     server = ThreadingHTTPServer((host, port), make_handler(store, provider_store, agent_store))
-    print(f"vuln-judger UI listening on http://{host}:{port}")
-    print(f"records directory: {store.root}")
-    print(f"providers file: {provider_store.path}")
-    print(f"agents directory: {agent_store.root}")
+    print(f"vuln-judger Web 界面监听：http://{host}:{port}")
+    print(f"运行记录目录：{store.root}")
+    print(f"提供商配置文件：{provider_store.path}")
+    print(f"Agent 配置目录：{agent_store.root}")
     server.serve_forever()
 
 
@@ -105,14 +105,14 @@ def make_handler(
                 if len(parts) == 3 and parts[0] == "providers" and parts[2] == "test":
                     provider = provider_store.get(parts[1])
                     if provider is None:
-                        self._json({"error": "provider not found"}, HTTPStatus.NOT_FOUND)
+                        self._json({"error": "提供商未找到"}, HTTPStatus.NOT_FOUND)
                         return
                     payload = self._read_json()
                     result = test_provider_connection(provider, api_key_override=payload.get("api_key"))
                     result.pop("content", None)
                     self._json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
                     return
-                self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                self._json({"error": "未找到"}, HTTPStatus.NOT_FOUND)
             except Exception as exc:
                 self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
@@ -128,9 +128,9 @@ def make_handler(
                 if provider_store.delete(parts[1]):
                     self._json({"deleted": True})
                 else:
-                    self._json({"error": "provider not found"}, HTTPStatus.NOT_FOUND)
+                    self._json({"error": "提供商未找到"}, HTTPStatus.NOT_FOUND)
                 return
-            self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            self._json({"error": "未找到"}, HTTPStatus.NOT_FOUND)
 
         def do_GET(self) -> None:  # noqa: N802
             parts = _parts(self.path)
@@ -155,7 +155,7 @@ def make_handler(
             if len(parts) == 2 and parts[0] == "providers":
                 provider = provider_store.get(parts[1])
                 if provider is None:
-                    self._json({"error": "provider not found"}, HTTPStatus.NOT_FOUND)
+                    self._json({"error": "提供商未找到"}, HTTPStatus.NOT_FOUND)
                     return
                 self._json(provider.public_dict())
                 return
@@ -167,7 +167,7 @@ def make_handler(
                 task = _get_task(tasks, tasks_lock, parts[1])
                 if run is None:
                     if task is None:
-                        self._json({"error": "run not found"}, HTTPStatus.NOT_FOUND)
+                        self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
                         return
                     if len(parts) == 2:
                         self._json(task)
@@ -175,7 +175,7 @@ def make_handler(
                     if len(parts) == 3 and parts[2] == "findings":
                         self._json([])
                         return
-                    self._json({"error": "run is not completed"}, HTTPStatus.BAD_REQUEST)
+                    self._json({"error": "运行尚未完成"}, HTTPStatus.BAD_REQUEST)
                     return
                 if len(parts) == 2:
                     self._json(_run_detail(run))
@@ -188,9 +188,9 @@ def make_handler(
                         if report.get("finding_id") == parts[3]:
                             self._json(report)
                             return
-                    self._json({"error": "finding not found"}, HTTPStatus.NOT_FOUND)
+                    self._json({"error": "发现未找到"}, HTTPStatus.NOT_FOUND)
                     return
-            self._json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            self._json({"error": "未找到"}, HTTPStatus.NOT_FOUND)
 
         def log_message(self, format: str, *args) -> None:  # noqa: A002
             return
@@ -237,7 +237,7 @@ def _config_from_payload(
     skills_path: Optional[Path] = Path(payload["skills_path"]) if payload.get("skills_path") else None
     report_path = payload.get("sarif_path") or payload.get("report_path")
     if not report_path:
-        raise ValueError("report_path or sarif_path is required")
+        raise ValueError("report_path 或 sarif_path 不能为空")
     affirmative_agent = _agent_config_from_payload(payload, "affirmative")
     negative_agent = _agent_config_from_payload(payload, "negative")
     if agent_store is not None:
@@ -404,9 +404,9 @@ def _verdict_counts(run):
 
 
 def app_html() -> str:
-    title = "Vulnerability Judger Records"
+    title = "漏洞研判记录"
     return f"""<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -665,31 +665,31 @@ def app_html() -> str:
 <body>
   <header>
     <div>
-      <h1>Vulnerability Judger Records</h1>
-      <div class="muted" id="subtitle">Static report adjudication run history</div>
+      <h1>漏洞研判记录</h1>
+      <div class="muted" id="subtitle">静态报告漏洞研判历史</div>
     </div>
     <div class="toolbar">
-      <button id="open-run-config" type="button" title="Start a new judgement run">Start Run</button>
-      <button id="open-providers" type="button" title="Configure LLM providers">LLM Providers</button>
-      <button id="open-agent-prompts" type="button" title="Configure Agent prompts">Agent Prompts</button>
-      <button id="refresh" type="button" title="Refresh records">Refresh</button>
-      <button id="clear-selection" type="button" title="Clear current detail">Clear</button>
+      <button id="open-run-config" type="button" title="启动新的研判任务">启动任务</button>
+      <button id="open-providers" type="button" title="配置 LLM 提供商">LLM 提供商</button>
+      <button id="open-agent-prompts" type="button" title="配置 Agent 提示词">Agent 配置</button>
+      <button id="refresh" type="button" title="刷新记录">刷新</button>
+      <button id="clear-selection" type="button" title="清空当前详情">清空</button>
     </div>
   </header>
   <main>
-    <section class="pane" aria-label="Run records">
+    <section class="pane" aria-label="运行记录">
       <div class="pane-title">
-        <h2>Runs</h2>
-        <span class="muted" id="run-count">0 records</span>
+        <h2>任务</h2>
+        <span class="muted" id="run-count">0 条记录</span>
       </div>
       <div class="scroll">
         <div class="run-list" id="run-list"></div>
       </div>
     </section>
-    <section class="pane" aria-label="Run details and provider settings">
+    <section class="pane" aria-label="运行详情和提供商设置">
       <div class="pane-title">
-        <h2 id="detail-title">Run Detail</h2>
-        <span class="muted" id="detail-status">No run selected</span>
+        <h2 id="detail-title">运行详情</h2>
+        <span class="muted" id="detail-status">未选择任务</span>
       </div>
       <div class="scroll">
         <div class="content" id="detail"></div>
@@ -697,130 +697,130 @@ def app_html() -> str:
     </section>
   </main>
   <div class="modal-backdrop" id="providers-modal" role="dialog" aria-modal="true" aria-labelledby="providers-title">
-    <section class="settings-panel" aria-label="LLM Providers settings">
+    <section class="settings-panel" aria-label="LLM 提供商设置">
       <div class="settings-head">
         <div>
-          <h2 id="providers-title">LLM Providers</h2>
-          <div class="muted">Configure OpenAI-compatible APIs for affirmative and negative agents.</div>
+          <h2 id="providers-title">LLM 提供商</h2>
+          <div class="muted">为正方和反方 Agent 配置 OpenAI 兼容 API。</div>
         </div>
-        <button id="close-providers" type="button" title="Close provider settings">Close</button>
+        <button id="close-providers" type="button" title="关闭提供商设置">关闭</button>
       </div>
       <div class="settings-body">
         <div class="detail" id="provider-panel">
-          <h3>Provider Configuration</h3>
+          <h3>提供商配置</h3>
           <div class="detail-body">
-            <div class="muted">Saved API keys are stored locally; prefer environment-variable keys when possible.</div>
+            <div class="muted">保存的 API key 仅存储在本地；优先使用环境变量方式配置密钥。</div>
             <div class="form-grid">
               <label>ID<input id="provider-id" placeholder="openai-main"></label>
-              <label>Name<input id="provider-name" placeholder="OpenAI Main"></label>
-              <label class="wide">Endpoint<input id="provider-endpoint" placeholder="https://api.openai.com/v1/chat/completions"></label>
-              <label>Model<input id="provider-model" placeholder="gpt-4.1"></label>
-              <label>API key env<input id="provider-key-env" placeholder="OPENAI_API_KEY"></label>
-              <label class="wide">API key (optional plaintext)<input id="provider-key" type="password" placeholder="Leave blank to keep current saved key"></label>
-              <label class="wide">Extra JSON<textarea id="provider-extra" placeholder='{{"temperature":0.1,"max_tokens":1200}}'></textarea></label>
-              <label>Affirmative default<select id="default-affirmative"></select></label>
-              <label>Negative default<select id="default-negative"></select></label>
+              <label>名称<input id="provider-name" placeholder="OpenAI 主模型"></label>
+              <label class="wide">Endpoint 地址<input id="provider-endpoint" placeholder="https://api.openai.com/v1/chat/completions"></label>
+              <label>模型<input id="provider-model" placeholder="gpt-4.1"></label>
+              <label>API key 环境变量<input id="provider-key-env" placeholder="OPENAI_API_KEY"></label>
+              <label class="wide">API key（可选明文）<input id="provider-key" type="password" placeholder="留空则保留当前已保存密钥"></label>
+              <label class="wide">额外 JSON<textarea id="provider-extra" placeholder='{{"temperature":0.1,"max_tokens":1200}}'></textarea></label>
+              <label>正方默认提供商<select id="default-affirmative"></select></label>
+              <label>反方默认提供商<select id="default-negative"></select></label>
             </div>
             <div class="toolbar">
-              <button id="save-provider" type="button">Save Provider</button>
-              <button id="test-provider" type="button">Test Selected</button>
-              <button id="delete-provider" type="button">Delete Selected</button>
-              <button id="save-defaults" type="button">Save Defaults</button>
+              <button id="save-provider" type="button">保存提供商</button>
+              <button id="test-provider" type="button">测试当前提供商</button>
+              <button id="delete-provider" type="button">删除当前提供商</button>
+              <button id="save-defaults" type="button">保存默认值</button>
             </div>
             <div class="chips" id="provider-list"></div>
-            <pre id="provider-result">No provider test run yet.</pre>
+            <pre id="provider-result">尚未执行提供商连通性测试。</pre>
           </div>
         </div>
       </div>
     </section>
   </div>
   <div class="modal-backdrop" id="agent-prompts-modal" role="dialog" aria-modal="true" aria-labelledby="agent-prompts-title">
-    <section class="settings-panel" aria-label="Agent prompt settings">
+    <section class="settings-panel" aria-label="Agent 提示词设置">
       <div class="settings-head">
         <div>
-          <h2 id="agent-prompts-title">Agent Prompts</h2>
-          <div class="muted">Configure role profile directories and AGENT.md prompts.</div>
+          <h2 id="agent-prompts-title">Agent 配置</h2>
+          <div class="muted">配置正方/反方配置档案目录和 AGENT.md 提示词。</div>
         </div>
-        <button id="close-agent-prompts" type="button" title="Close Agent prompt settings">Close</button>
+        <button id="close-agent-prompts" type="button" title="关闭 Agent 提示词设置">关闭</button>
       </div>
       <div class="settings-body">
         <div class="detail" id="agent-affirmative-profile-panel">
-          <h3>Affirmative Profiles</h3>
+          <h3>正方配置档案</h3>
           <div class="detail-body">
             <div class="profile-grid" id="agent-affirmative-profile-list"></div>
             <div class="form-grid">
-              <label>Affirmative profile<select id="agent-affirmative-profile"></select></label>
-              <label>Affirmative profile ID<input id="agent-affirmative-profile-id" placeholder="Affirmative_default"></label>
-              <label class="wide">Affirmative AGENT.md<textarea id="agent-affirmative-instructions"></textarea></label>
+              <label>正方配置档案<select id="agent-affirmative-profile"></select></label>
+              <label>正方配置档案 ID<input id="agent-affirmative-profile-id" placeholder="Affirmative_default"></label>
+              <label class="wide">正方 AGENT.md<textarea id="agent-affirmative-instructions"></textarea></label>
             </div>
             <div class="toolbar">
-              <button id="new-affirmative-agent" type="button">New Affirmative</button>
-              <button id="save-affirmative-agent" type="button">Save Affirmative</button>
+              <button id="new-affirmative-agent" type="button">新增正方 Agent</button>
+              <button id="save-affirmative-agent" type="button">保存正方 Agent</button>
             </div>
           </div>
         </div>
         <div class="detail" id="agent-negative-profile-panel">
-          <h3>Negative Profiles</h3>
+          <h3>反方配置档案</h3>
           <div class="detail-body">
             <div class="profile-grid" id="agent-negative-profile-list"></div>
             <div class="form-grid">
-              <label>Negative profile<select id="agent-negative-profile"></select></label>
-              <label>Negative profile ID<input id="agent-negative-profile-id" placeholder="Negative_default"></label>
-              <label class="wide">Negative AGENT.md<textarea id="agent-negative-instructions"></textarea></label>
+              <label>反方配置档案<select id="agent-negative-profile"></select></label>
+              <label>反方配置档案 ID<input id="agent-negative-profile-id" placeholder="Negative_default"></label>
+              <label class="wide">反方 AGENT.md<textarea id="agent-negative-instructions"></textarea></label>
             </div>
             <div class="toolbar">
-              <button id="new-negative-agent" type="button">New Negative</button>
-              <button id="save-negative-agent" type="button">Save Negative</button>
+              <button id="new-negative-agent" type="button">新增反方 Agent</button>
+              <button id="save-negative-agent" type="button">保存反方 Agent</button>
             </div>
           </div>
         </div>
         <div class="detail" id="agent-profile-actions">
-          <h3>Profile Actions</h3>
+          <h3>配置档案操作</h3>
           <div class="detail-body">
             <div class="toolbar">
-              <button id="reset-agent-prompts" type="button">Ensure Defaults</button>
+              <button id="reset-agent-prompts" type="button">确保默认 Agent 存在</button>
             </div>
-            <pre id="agent-prompts-result">No Agent prompt changes yet.</pre>
+            <pre id="agent-prompts-result">尚未修改 Agent 提示词。</pre>
           </div>
         </div>
       </div>
     </section>
   </div>
   <div class="modal-backdrop" id="run-config-modal" role="dialog" aria-modal="true" aria-labelledby="run-config-title">
-    <section class="settings-panel" aria-label="Run configuration">
+    <section class="settings-panel" aria-label="任务启动配置">
       <div class="settings-head">
         <div>
-          <h2 id="run-config-title">Start Run</h2>
-          <div class="muted">Create a static report judgement task from local paths.</div>
+          <h2 id="run-config-title">启动任务</h2>
+          <div class="muted">基于本地路径创建静态报告漏洞研判任务。</div>
         </div>
-        <button id="close-run-config" type="button" title="Close run configuration">Close</button>
+        <button id="close-run-config" type="button" title="关闭任务配置">关闭</button>
       </div>
       <div class="settings-body">
         <div class="detail" id="run-config-panel">
-          <h3>Task Configuration</h3>
+          <h3>任务配置</h3>
           <div class="detail-body">
             <div class="form-grid">
-              <label class="wide">Report path<input id="run-sarif" placeholder="fixtures/demo_sarif/report.sarif or report.md"></label>
-              <label class="wide">Source path<input id="run-source" placeholder="fixtures/demo_sarif/source"></label>
-              <label class="wide">Skills path<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
-              <label>Languages<input id="run-languages" value="java,cpp,python"></label>
-              <label>Max rounds<input id="run-max-rounds" type="number" min="1" value="4"></label>
-              <label>Affirmative provider<select id="run-affirmative-provider"></select></label>
-              <label>Negative provider<select id="run-negative-provider"></select></label>
-              <label>Affirmative agent profile<select id="run-affirmative-agent-profile"></select></label>
-              <label>Negative agent profile<select id="run-negative-agent-profile"></select></label>
+              <label class="wide">报告路径<input id="run-sarif" placeholder="fixtures/demo_sarif/report.sarif 或 report.md"></label>
+              <label class="wide">源码路径<input id="run-source" placeholder="fixtures/demo_sarif/source"></label>
+              <label class="wide">Skills 路径<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
+              <label>语言<input id="run-languages" value="java,cpp,python"></label>
+              <label>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
+              <label>正方提供商<select id="run-affirmative-provider"></select></label>
+              <label>反方提供商<select id="run-negative-provider"></select></label>
+              <label>正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
+              <label>反方 Agent 配置档案<select id="run-negative-agent-profile"></select></label>
             </div>
             <div class="chips">
-              <label><input id="run-external-tools" type="checkbox" checked> External tools</label>
-              <label><input id="run-auto-index" type="checkbox"> Auto-index tools</label>
-              <label><input id="run-llm" type="checkbox"> Use LLM debate</label>
+              <label><input id="run-external-tools" type="checkbox" checked> 启用外部工具</label>
+              <label><input id="run-auto-index" type="checkbox"> 自动索引工具</label>
+              <label><input id="run-llm" type="checkbox"> 使用 LLM 博弈</label>
             </div>
             <div class="toolbar">
-              <button id="start-run" type="button">Start Run</button>
-              <button id="fill-demo-run" type="button">Use Demo Fixture</button>
-              <button id="fill-markdown-demo-run" type="button">Use Markdown Demo</button>
+              <button id="start-run" type="button">启动任务</button>
+              <button id="fill-demo-run" type="button">填入 SARIF 示例</button>
+              <button id="fill-markdown-demo-run" type="button">填入 Markdown 示例</button>
             </div>
-            <pre id="run-result">No run started yet.</pre>
+            <pre id="run-result">尚未启动任务。</pre>
           </div>
         </div>
       </div>
@@ -908,7 +908,7 @@ def app_html() -> str:
       state.selectedRun = null;
       state.selectedFinding = null;
       renderRuns();
-      renderEmpty('Select a run to inspect findings, evidence, and debate turns.');
+      renderEmpty('选择一个任务查看发现、证据和博弈回合。');
     }});
     document.getElementById('save-provider').addEventListener('click', saveProvider);
     document.getElementById('test-provider').addEventListener('click', testProvider);
@@ -933,9 +933,60 @@ def app_html() -> str:
       }}[ch]));
     }}
     function fmtDate(value) {{
-      if (!value) return 'unknown time';
+      if (!value) return '未知时间';
       const date = new Date(value);
       return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+    }}
+    function statusLabel(status) {{
+      const labels = {{
+        running: '运行中',
+        completed: '已完成',
+        failed: '失败',
+        queued: '排队中'
+      }};
+      return labels[status] || status || '未知状态';
+    }}
+    function verdictLabel(verdict) {{
+      const labels = {{
+        TRUE_POSITIVE: '真实漏洞',
+        FALSE_POSITIVE: '误报',
+        INCONCLUSIVE: '证据不足'
+      }};
+      return labels[verdict] || verdict || '未知结论';
+    }}
+    function roleLabel(role) {{
+      const labels = {{
+        AFFIRMATIVE: '正方',
+        NEGATIVE: '反方',
+        MODERATOR: '主持人',
+        affirmative: '正方',
+        negative: '反方',
+        Affirmative: '正方',
+        Negative: '反方'
+      }};
+      return labels[role] || role || '未知角色';
+    }}
+    function evidenceKindLabel(kind) {{
+      const labels = {{
+        SOURCE_LOCATION: '源码位置',
+        SARIF_CODE_FLOW: 'SARIF 代码流',
+        CALL_CHAIN: '调用链',
+        DATA_FLOW: '数据流',
+        PROTECTION: '防护证据',
+        IMPACT: '影响证据',
+        TOOL_DIAGNOSTIC: '工具诊断',
+        PROJECT_CONTEXT: '项目上下文'
+      }};
+      return labels[kind] || kind || '未知证据';
+    }}
+    function evidenceStrengthLabel(strength) {{
+      const labels = {{
+        STRONG: '强',
+        MEDIUM: '中',
+        WEAK: '弱',
+        PARTIAL: '部分'
+      }};
+      return labels[strength] || strength || '未知强度';
     }}
     function verdictClass(verdict) {{
       if (verdict === 'TRUE_POSITIVE') return 'tp';
@@ -1027,7 +1078,7 @@ def app_html() -> str:
     function renderAgentProfileCards(role) {{
       const container = role === 'affirmative' ? el.agentAffirmativeProfileList : el.agentNegativeProfileList;
       const profiles = profilesFor(role);
-      container.innerHTML = profiles.map(profile => profileCard(role, profile)).join('') || '<div class="muted">No profiles found.</div>';
+      container.innerHTML = profiles.map(profile => profileCard(role, profile)).join('') || '<div class="muted">未找到配置档案。</div>';
       for (const button of container.querySelectorAll('button[data-agent-edit]')) {{
         button.addEventListener('click', () => {{
           const select = role === 'affirmative' ? el.agentAffirmativeProfile : el.agentNegativeProfile;
@@ -1048,20 +1099,20 @@ def app_html() -> str:
       if (profile.starred) classes.push('starred');
       if (profile.is_default) classes.push('default');
       const deleteDisabled = profile.deletable ? '' : 'disabled';
-      const deleteTitle = profile.deletable ? 'Delete Agent profile' : 'Default Agent cannot be deleted';
+      const deleteTitle = profile.deletable ? '删除 Agent 配置档案' : '默认 Agent 不能删除';
       return `<div class="${{classes.join(' ')}}">
         <div class="profile-head">
           <div>
             <div class="profile-title">${{profile.starred ? '*' : ''}} ${{esc(profile.profile_id || profile.name || 'Agent')}}</div>
             <div class="profile-path">${{esc(profile.path || 'AGENT.md')}}</div>
           </div>
-          <span class="chip">${{profile.is_default ? 'default' : esc(profile.role || role)}}</span>
+          <span class="chip">${{profile.is_default ? '默认' : esc(roleLabel(profile.role || role))}}</span>
         </div>
         <div class="profile-preview">${{esc(profile.instructions || '')}}</div>
         <div class="profile-actions">
-          <button type="button" data-agent-edit="true" data-profile-id="${{esc(profile.profile_id)}}">Edit</button>
-          <button type="button" data-agent-star="true" data-profile-id="${{esc(profile.profile_id)}}" data-starred="${{profile.starred ? 'true' : 'false'}}">${{profile.starred ? 'Unstar' : 'Star'}}</button>
-          <button type="button" data-agent-delete="true" data-profile-id="${{esc(profile.profile_id)}}" title="${{esc(deleteTitle)}}" ${{deleteDisabled}}>Delete</button>
+          <button type="button" data-agent-edit="true" data-profile-id="${{esc(profile.profile_id)}}">编辑</button>
+          <button type="button" data-agent-star="true" data-profile-id="${{esc(profile.profile_id)}}" data-starred="${{profile.starred ? 'true' : 'false'}}">${{profile.starred ? '取消星标' : '星标'}}</button>
+          <button type="button" data-agent-delete="true" data-profile-id="${{esc(profile.profile_id)}}" title="${{esc(deleteTitle)}}" ${{deleteDisabled}}>删除</button>
         </div>
       </div>`;
     }}
@@ -1083,7 +1134,7 @@ def app_html() -> str:
       const baseProfile = findAgentProfile(role, defaultProfileId(role)) || findAgentProfile(role, '');
       idInput.value = profileId;
       promptInput.value = baseProfile ? baseProfile.instructions : '';
-      el.agentPromptsResult.textContent = `New ${{role}} Agent draft: ${{profileId}}. Edit AGENT.md and save to create it.`;
+      el.agentPromptsResult.textContent = `已创建${{roleLabel(role)}} Agent 草稿：${{profileId}}。编辑 AGENT.md 后保存即可创建。`;
     }}
 
     function nextAgentProfileId(role, prefix) {{
@@ -1130,7 +1181,7 @@ def app_html() -> str:
         const result = await fetchJson(`/agent-prompts/${{encodeURIComponent(role)}}/${{encodeURIComponent(profileId)}}`, {{ method: 'DELETE' }});
         state.agentPrompts = result;
         renderAgentPrompts();
-        el.agentPromptsResult.textContent = `Deleted ${{profileId}}`;
+        el.agentPromptsResult.textContent = `已删除 ${{profileId}}`;
       }} catch (error) {{
         el.agentPromptsResult.textContent = error.message;
       }}
@@ -1149,11 +1200,11 @@ def app_html() -> str:
     function renderProviders() {{
       el.providerList.innerHTML = state.providers.map(provider => `
         <button type="button" class="chip" data-provider-id="${{esc(provider.id)}}">${{esc(provider.name)}} / ${{esc(provider.model)}}</button>
-      `).join('') || '<span class="muted">No providers configured.</span>';
+      `).join('') || '<span class="muted">尚未配置提供商。</span>';
       for (const button of el.providerList.querySelectorAll('button[data-provider-id]')) {{
         button.addEventListener('click', () => fillProvider(button.dataset.providerId));
       }}
-      const options = '<option value="">None</option>' + state.providers.map(provider => (
+      const options = '<option value="">无</option>' + state.providers.map(provider => (
         `<option value="${{esc(provider.id)}}">${{esc(provider.name)}} / ${{esc(provider.model)}}</option>`
       )).join('');
       el.defaultAffirmative.innerHTML = options;
@@ -1208,7 +1259,7 @@ def app_html() -> str:
     async function testProvider() {{
       try {{
         const id = el.providerId.value.trim();
-        if (!id) throw new Error('Select or enter a provider ID first.');
+        if (!id) throw new Error('请先选择或输入提供商 ID。');
         const payload = el.providerKey.value.trim() ? {{ api_key: el.providerKey.value.trim() }} : {{}};
         const result = await fetchJson(`/providers/${{encodeURIComponent(id)}}/test`, jsonPost(payload));
         el.providerResult.textContent = JSON.stringify(result, null, 2);
@@ -1220,9 +1271,9 @@ def app_html() -> str:
     async function deleteProvider() {{
       try {{
         const id = el.providerId.value.trim();
-        if (!id) throw new Error('Select or enter a provider ID first.');
+        if (!id) throw new Error('请先选择或输入提供商 ID。');
         await fetchJson(`/providers/${{encodeURIComponent(id)}}`, {{ method: 'DELETE' }});
-        el.providerResult.textContent = `Deleted ${{id}}`;
+        el.providerResult.textContent = `已删除 ${{id}}`;
         await loadProviders();
       }} catch (error) {{
         el.providerResult.textContent = error.message;
@@ -1251,7 +1302,7 @@ def app_html() -> str:
       el.runExternalTools.checked = false;
       el.runAutoIndex.checked = false;
       enableRunLlmForSelectedProviders();
-      el.runResult.textContent = 'Demo fixture paths filled.';
+      el.runResult.textContent = '已填入 SARIF 示例路径。';
     }}
 
     function fillMarkdownDemoRun() {{
@@ -1263,7 +1314,7 @@ def app_html() -> str:
       el.runExternalTools.checked = false;
       el.runAutoIndex.checked = false;
       enableRunLlmForSelectedProviders();
-      el.runResult.textContent = 'Markdown demo fixture paths filled.';
+      el.runResult.textContent = '已填入 Markdown 示例路径。';
     }}
 
     async function startRun() {{
@@ -1283,9 +1334,9 @@ def app_html() -> str:
           negative_agent_profile: el.runNegativeAgentProfile.value || null
         }};
         if (!payload.report_path || !payload.source_path) {{
-          throw new Error('Report path and source path are required.');
+          throw new Error('报告路径和源码路径不能为空。');
         }}
-        el.runResult.textContent = 'Starting run...';
+        el.runResult.textContent = '正在启动任务...';
         const created = await fetchJson('/runs', jsonPost(payload));
         el.runResult.textContent = JSON.stringify(created, null, 2);
         el.runConfigModal.classList.remove('open');
@@ -1314,15 +1365,15 @@ def app_html() -> str:
     }}
 
     async function loadRuns() {{
-      el.subtitle.textContent = 'Loading records...';
+      el.subtitle.textContent = '正在加载记录...';
       try {{
         state.runs = await fetchJson('/runs');
         renderRuns();
-        el.subtitle.textContent = 'Static report adjudication run history';
+        el.subtitle.textContent = '静态报告漏洞研判历史';
         if (!state.selectedRun && state.runs.length > 0) {{
           await selectRun(state.runs[0].run_id);
         }} else if (!state.runs.length) {{
-          renderEmpty('No records yet. Create a run with POST /runs or the CLI/API workflow.');
+          renderEmpty('暂无记录。可以通过“启动任务”按钮、POST /runs 或 CLI/API 工作流创建任务。');
         }}
       }} catch (error) {{
         renderError(error);
@@ -1330,7 +1381,7 @@ def app_html() -> str:
     }}
 
     function renderRuns() {{
-      el.count.textContent = `${{state.runs.length}} record${{state.runs.length === 1 ? '' : 's'}}`;
+      el.count.textContent = `${{state.runs.length}} 条记录`;
       el.list.innerHTML = state.runs.map(run => {{
         const counts = run.verdict_counts || {{}};
         return `<button class="run-item ${{state.selectedRun === run.run_id ? 'active' : ''}}" type="button" data-run-id="${{esc(run.run_id)}}">
@@ -1338,11 +1389,11 @@ def app_html() -> str:
           <div class="muted">${{esc(fmtDate(run.created_at))}}</div>
           <div class="path">${{esc(run.source_path || '')}}</div>
           <div class="chips">
-            <span class="chip">${{esc(run.status || 'completed')}}</span>
-            <span class="chip">${{esc(run.finding_count)}} findings</span>
-            <span class="chip tp">TP ${{counts.TRUE_POSITIVE || 0}}</span>
-            <span class="chip fp">FP ${{counts.FALSE_POSITIVE || 0}}</span>
-            <span class="chip inc">INC ${{counts.INCONCLUSIVE || 0}}</span>
+            <span class="chip">${{esc(statusLabel(run.status || 'completed'))}}</span>
+            <span class="chip">${{esc(run.finding_count)}} 个发现</span>
+            <span class="chip tp">真实 ${{counts.TRUE_POSITIVE || 0}}</span>
+            <span class="chip fp">误报 ${{counts.FALSE_POSITIVE || 0}}</span>
+            <span class="chip inc">不足 ${{counts.INCONCLUSIVE || 0}}</span>
           </div>
         </button>`;
       }}).join('');
@@ -1356,7 +1407,7 @@ def app_html() -> str:
       state.selectedFinding = null;
       renderRuns();
       el.title.textContent = runId;
-      el.status.textContent = 'Loading detail...';
+      el.status.textContent = '正在加载详情...';
       try {{
         const [run, findings] = await Promise.all([
           fetchJson(`/runs/${{encodeURIComponent(runId)}}`),
@@ -1373,17 +1424,17 @@ def app_html() -> str:
       const providers = run.llm_providers || {{}};
       const agents = run.agent_configs || {{}};
       const status = run.status || 'completed';
-      el.status.textContent = `${{status}} / ${{findings.length}} findings`;
+      el.status.textContent = `${{statusLabel(status)}} / ${{findings.length}} 个发现`;
       if (status !== 'completed') {{
         el.detail.innerHTML = `
           <div class="detail">
-            <h3>Run Status</h3>
+            <h3>运行状态</h3>
             <div class="detail-body">
-              <div class="chips"><span class="chip">${{esc(status)}}</span></div>
-              <div><strong>Report:</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
-              <div><strong>Source:</strong> <span class="path">${{esc(run.source_path)}}</span></div>
-              <div><strong>Languages:</strong> ${{esc((run.languages || []).join(', '))}}</div>
-              ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : '<div class="muted">The task is running in the background. This view refreshes automatically for newly started runs.</div>'}}
+              <div class="chips"><span class="chip">${{esc(statusLabel(status))}}</span></div>
+              <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
+              <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
+              <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
+              ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : '<div class="muted">任务正在后台运行，新启动任务的页面会自动刷新。</div>'}}
               ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
             </div>
           </div>`;
@@ -1391,34 +1442,34 @@ def app_html() -> str:
       }}
       el.detail.innerHTML = `
         <div class="summary-grid">
-          <div class="metric"><div class="label">Findings</div><div class="value">${{esc(run.finding_count)}}</div></div>
-          <div class="metric"><div class="label">True Positive</div><div class="value">${{counts.TRUE_POSITIVE || 0}}</div></div>
-          <div class="metric"><div class="label">False Positive</div><div class="value">${{counts.FALSE_POSITIVE || 0}}</div></div>
-          <div class="metric"><div class="label">Inconclusive</div><div class="value">${{counts.INCONCLUSIVE || 0}}</div></div>
+          <div class="metric"><div class="label">发现数</div><div class="value">${{esc(run.finding_count)}}</div></div>
+          <div class="metric"><div class="label">真实漏洞</div><div class="value">${{counts.TRUE_POSITIVE || 0}}</div></div>
+          <div class="metric"><div class="label">误报</div><div class="value">${{counts.FALSE_POSITIVE || 0}}</div></div>
+          <div class="metric"><div class="label">证据不足</div><div class="value">${{counts.INCONCLUSIVE || 0}}</div></div>
         </div>
         <div class="detail">
-          <h3>Run Metadata</h3>
+          <h3>运行元数据</h3>
           <div class="detail-body">
-            <div><strong>Created:</strong> ${{esc(fmtDate(run.created_at))}}</div>
-            <div><strong>Report:</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
-            <div><strong>Source:</strong> <span class="path">${{esc(run.source_path)}}</span></div>
-            <div><strong>Languages:</strong> ${{esc((run.languages || []).join(', '))}}</div>
-            <div><strong>Affirmative LLM:</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
-            <div><strong>Negative LLM:</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
-            <div><strong>Affirmative Agent:</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
-            <div><strong>Negative Agent:</strong> ${{esc(agentLabel(agents.negative))}}</div>
+            <div><strong>创建时间：</strong> ${{esc(fmtDate(run.created_at))}}</div>
+            <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
+            <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
+            <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
+            <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
+            <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
+            <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
+            <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
             ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}
             ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
           </div>
         </div>
         <div class="detail">
-          <h3>Findings</h3>
+          <h3>漏洞发现</h3>
           <div class="scroll">
             <table>
-              <thead><tr><th>Verdict</th><th>Rule</th><th>Confidence</th><th>Summary</th></tr></thead>
+              <thead><tr><th>结论</th><th>规则</th><th>置信度</th><th>摘要</th></tr></thead>
               <tbody>
                 ${{findings.map(item => `<tr class="clickable" data-finding-id="${{esc(item.finding_id)}}">
-                  <td><span class="chip ${{verdictClass(item.verdict)}}">${{esc(item.verdict)}}</span></td>
+                  <td><span class="chip ${{verdictClass(item.verdict)}}">${{esc(verdictLabel(item.verdict))}}</span></td>
                   <td>${{esc(item.rule_id)}}<div class="path">${{esc(item.finding_id)}}</div></td>
                   <td>${{esc(item.confidence)}}</td>
                   <td>${{esc(item.summary)}}<div class="path">${{esc((item.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div></td>
@@ -1437,9 +1488,9 @@ def app_html() -> str:
 
     function providerLabel(value, llmEnabled) {{
       if (!value || (!value.provider_id && !value.provider_name && !value.model && !value.client_available)) {{
-        return 'not configured';
+        return '未配置';
       }}
-      const label = `${{value.provider_name || value.provider_id || 'provider'}} / ${{value.model || 'model unknown'}}`;
+      const label = `${{value.provider_name || value.provider_id || '提供商'}} / ${{value.model || '模型未知'}}`;
       let status = value.status;
       if (!status) {{
         if (value.client_available) status = 'ready';
@@ -1448,17 +1499,17 @@ def app_html() -> str:
       }}
       if (status === 'ready') return label;
       const statusText = {{
-        llm_disabled: 'LLM disabled',
-        missing_api_key: 'missing API key',
-        client_unavailable: 'client unavailable',
-        not_configured: 'not configured',
+        llm_disabled: 'LLM 未启用',
+        missing_api_key: '缺少 API key',
+        client_unavailable: '客户端不可用',
+        not_configured: '未配置',
       }}[status] || status.replace(/_/g, ' ');
       if (status === 'not_configured') return statusText;
       return `${{label}} (${{statusText}})`;
     }}
 
     function agentLabel(value) {{
-      if (!value) return 'default';
+      if (!value) return '默认';
       if (value.profile_id && value.path) return `${{value.profile_id}} (${{value.path}})`;
       return value.name || value.profile_id || 'Agent';
     }}
@@ -1466,10 +1517,10 @@ def app_html() -> str:
     function agentInstructions(agents) {{
       const lines = [];
       if (agents.affirmative && agents.affirmative.instructions) {{
-        lines.push(`Affirmative / ${{agentLabel(agents.affirmative)}}:\\n${{agents.affirmative.instructions}}`);
+        lines.push(`正方 / ${{agentLabel(agents.affirmative)}}：\\n${{agents.affirmative.instructions}}`);
       }}
       if (agents.negative && agents.negative.instructions) {{
-        lines.push(`Negative / ${{agentLabel(agents.negative)}}:\\n${{agents.negative.instructions}}`);
+        lines.push(`反方 / ${{agentLabel(agents.negative)}}：\\n${{agents.negative.instructions}}`);
       }}
       return lines.join('\\n\\n');
     }}
@@ -1478,7 +1529,7 @@ def app_html() -> str:
       state.selectedFinding = findingId;
       const container = document.getElementById('finding-detail');
       if (!container) return;
-      container.innerHTML = '<div class="empty">Loading finding detail...</div>';
+      container.innerHTML = '<div class="empty">正在加载发现详情...</div>';
       try {{
         const detail = await fetchJson(`/runs/${{encodeURIComponent(state.selectedRun)}}/findings/${{encodeURIComponent(findingId)}}`);
         container.innerHTML = renderFindingDetail(detail);
@@ -1493,53 +1544,53 @@ def app_html() -> str:
       const debate = detail.debate || [];
       return `
         <div class="detail">
-          <h3>Finding Detail</h3>
+          <h3>发现详情</h3>
           <div class="detail-body">
             <div class="chips">
-              <span class="chip ${{verdictClass(detail.verdict)}}">${{esc(detail.verdict)}}</span>
-              <span class="chip">confidence ${{esc(detail.confidence)}}</span>
+              <span class="chip ${{verdictClass(detail.verdict)}}">${{esc(verdictLabel(detail.verdict))}}</span>
+              <span class="chip">置信度 ${{esc(detail.confidence)}}</span>
               <span class="chip">${{esc(detail.rule_id)}}</span>
             </div>
             <div>${{esc(detail.reasoning_summary)}}</div>
-            <div><strong>Protection:</strong> ${{esc(detail.protection_assessment)}}</div>
-            <div><strong>Impact:</strong> ${{esc(detail.impact_assessment)}}</div>
-            ${{(detail.disputed_points || []).length ? `<div><strong>Disputed points:</strong><ul>${{detail.disputed_points.map(point => `<li>${{esc(point)}}</li>`).join('')}}</ul></div>` : ''}}
+            <div><strong>防护研判：</strong> ${{esc(detail.protection_assessment)}}</div>
+            <div><strong>影响研判：</strong> ${{esc(detail.impact_assessment)}}</div>
+            ${{(detail.disputed_points || []).length ? `<div><strong>争议点：</strong><ul>${{detail.disputed_points.map(point => `<li>${{esc(point)}}</li>`).join('')}}</ul></div>` : ''}}
           </div>
         </div>
         <div class="detail">
-          <h3>Debate</h3>
+          <h3>博弈过程</h3>
           <div class="detail-body">
             ${{debate.map(turn => `<div>
-              <strong>${{esc(turn.role)}} round ${{esc(turn.round_index)}}</strong>
+              <strong>${{esc(roleLabel(turn.role))}} 第 ${{esc(turn.round_index)}} 回合</strong>
               <div>${{esc(turn.claim)}}</div>
-              <div class="path">evidence: ${{esc((turn.evidence_ids || []).join(', '))}}</div>
-            </div>`).join('') || '<div class="muted">No debate turns recorded.</div>'}}
+              <div class="path">证据：${{esc((turn.evidence_ids || []).join(', '))}}</div>
+            </div>`).join('') || '<div class="muted">暂无博弈回合记录。</div>'}}
           </div>
         </div>
         <div class="detail">
-          <h3>Evidence</h3>
+          <h3>证据链</h3>
           <div class="detail-body">
             ${{evidence.map(item => `<div>
               <div class="chips">
                 <span class="chip">${{esc(item.evidence_id)}}</span>
-                <span class="chip">${{esc(item.kind)}}</span>
-                <span class="chip">${{esc(item.strength)}}</span>
+                <span class="chip">${{esc(evidenceKindLabel(item.kind))}}</span>
+                <span class="chip">${{esc(evidenceStrengthLabel(item.strength))}}</span>
                 <span class="chip">${{esc(item.source)}}</span>
               </div>
               <div>${{esc(item.summary)}}</div>
               ${{item.snippet ? `<pre>${{esc(item.snippet)}}</pre>` : ''}}
-            </div>`).join('') || '<div class="muted">No evidence recorded.</div>'}}
+            </div>`).join('') || '<div class="muted">暂无证据记录。</div>'}}
           </div>
         </div>`;
     }}
 
     function renderEmpty(message) {{
-      el.title.textContent = 'Run Detail';
-      el.status.textContent = 'No run selected';
+      el.title.textContent = '运行详情';
+      el.status.textContent = '未选择任务';
       el.detail.innerHTML = `<div class="empty">${{esc(message)}}</div>`;
     }}
     function renderError(error) {{
-      el.subtitle.textContent = 'Failed to load records';
+      el.subtitle.textContent = '加载记录失败';
       el.detail.innerHTML = `<div class="empty error">${{esc(error.message)}}</div>`;
     }}
 

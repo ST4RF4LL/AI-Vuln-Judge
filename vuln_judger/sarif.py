@@ -69,7 +69,7 @@ def parse_markdown_report(text: str) -> List[Finding]:
             findings.append(finding)
     if findings:
         return findings
-    fallback = _MarkdownSection(title="Markdown report", lines=text.splitlines(), start_line=1)
+    fallback = _MarkdownSection(title="Markdown 报告", lines=text.splitlines(), start_line=1)
     finding = _finding_from_markdown_section(0, fallback, allow_loose=True)
     return [finding] if finding is not None else []
 
@@ -165,7 +165,7 @@ class _MarkdownSection:
 
 _MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$")
 _MARKDOWN_KEY_VALUE_RE = re.compile(
-    r"^\s*(?:[-*+]\s*)?(?:\*\*)?([A-Za-z][A-Za-z0-9 _/\-]{1,48})(?:\*\*)?\s*[:：]\s*(.*?)\s*$"
+    r"^\s*(?:[-*+]\s*)?(?:\*\*)?([A-Za-z\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff _/\-]{0,48})(?:\*\*)?\s*[:：]\s*(.*?)\s*$"
 )
 _LOCATION_EXTENSIONS = (
     "py",
@@ -188,7 +188,9 @@ _LOCATION_RE = re.compile(
     + r"))"
     r"(?:(?::|#L)(?P<line>\d+)(?::(?P<column>\d+))?"
     r"|(?:\s*,?\s*(?:line|Line)\s+(?P<line_word>\d+))"
-    r"(?:\s*,?\s*(?:column|col|Column|Col)\s+(?P<column_word>\d+))?)?"
+    r"(?:\s*,?\s*(?:column|col|Column|Col)\s+(?P<column_word>\d+))?"
+    r"|(?:\s*,?\s*第\s*(?P<line_cn>\d+)\s*行)"
+    r"(?:\s*,?\s*第?\s*(?P<column_cn>\d+)\s*列)?)?"
 )
 _RULE_KEYS = {"rule", "ruleid", "check", "checkid", "id", "cwe", "cweid", "vulnerabilitytype"}
 _MESSAGE_KEYS = {"message", "description", "summary", "details", "title", "issue"}
@@ -217,6 +219,58 @@ _FLOW_HEADINGS = {
     "call chain",
     "call path",
     "execution path",
+    "代码流",
+    "数据流",
+    "污点流",
+    "调用链",
+    "调用路径",
+    "执行路径",
+    "路径",
+    "轨迹",
+}
+_MARKDOWN_KEY_ALIASES = {
+    "规则": "rule",
+    "规则id": "rule",
+    "检测规则": "rule",
+    "检查项": "rule",
+    "漏洞类型": "vulnerabilitytype",
+    "漏洞": "vulnerabilitytype",
+    "消息": "message",
+    "描述": "description",
+    "摘要": "summary",
+    "详情": "details",
+    "标题": "title",
+    "问题": "issue",
+    "严重性": "severity",
+    "严重等级": "severity",
+    "等级": "level",
+    "级别": "level",
+    "优先级": "priority",
+    "风险": "risk",
+    "风险等级": "risk",
+    "位置": "location",
+    "位置列表": "locations",
+    "文件": "file",
+    "文件路径": "path",
+    "路径": "path",
+    "源码文件": "sourcefile",
+    "源文件": "sourcefile",
+    "源点": "source",
+    "汇点": "sink",
+    "行": "line",
+    "行号": "line",
+    "起始行": "startline",
+    "列": "column",
+    "列号": "column",
+    "起始列": "startcolumn",
+    "代码流": "codeflow",
+    "数据流": "dataflow",
+    "污点流": "dataflow",
+    "流": "flow",
+    "轨迹": "trace",
+    "调用链": "callchain",
+    "调用路径": "callpath",
+    "执行路径": "executionpath",
 }
 
 
@@ -229,7 +283,7 @@ def _markdown_sections(text: str) -> List[_MarkdownSection]:
             level = len(heading.group(1))
             title = _clean_markdown_inline(heading.group(2))
             if current is not None and _is_flow_heading(title):
-                current.lines.append(f"Code Flow: {title}")
+                current.lines.append(f"代码流：{title}")
                 continue
             if _is_finding_heading(level, title):
                 if current is not None:
@@ -242,7 +296,7 @@ def _markdown_sections(text: str) -> List[_MarkdownSection]:
         sections.append(current)
     if sections:
         return sections
-    return [_MarkdownSection(title="Markdown report", lines=text.splitlines(), start_line=1)] if text.strip() else []
+    return [_MarkdownSection(title="Markdown 报告", lines=text.splitlines(), start_line=1)] if text.strip() else []
 
 
 def _is_finding_heading(level: int, title: str) -> bool:
@@ -251,7 +305,10 @@ def _is_finding_heading(level: int, title: str) -> bool:
         return False
     if level <= 2:
         return True
-    return any(term in lowered for term in ("finding", "issue", "vulnerability", "result", "alert", "rule", "cwe-"))
+    return any(
+        term in lowered
+        for term in ("finding", "issue", "vulnerability", "result", "alert", "rule", "cwe-", "发现", "问题", "漏洞", "结果", "告警", "规则")
+    )
 
 
 def _is_flow_heading(title: str) -> bool:
@@ -388,8 +445,8 @@ def _parse_markdown_locations(value: str) -> List[SourceLocation]:
     locations: List[SourceLocation] = []
     for match in _LOCATION_RE.finditer(value):
         raw_file = match.group("file")
-        line = _optional_int(match.group("line") or match.group("line_word"))
-        column = _optional_int(match.group("column") or match.group("column_word"))
+        line = _optional_int(match.group("line") or match.group("line_word") or match.group("line_cn"))
+        column = _optional_int(match.group("column") or match.group("column_word") or match.group("column_cn"))
         locations.append(SourceLocation(file=_normalize_markdown_file(raw_file), line=line, column=column))
     return _dedupe_locations(locations)
 
@@ -436,6 +493,7 @@ def _dedupe_locations(locations: List[SourceLocation]) -> List[SourceLocation]:
 def _rule_id_from_markdown_title(title: str) -> str:
     cleaned = _clean_markdown_inline(title)
     cleaned = re.sub(r"^\s*(?:finding|issue|result|alert)\s*#?\d*\s*[:\-]\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*(?:发现|问题|结果|告警|漏洞)\s*#?\d*\s*[:：\-]\s*", "", cleaned)
     cleaned = re.sub(r"^\s*\[[^\]]+\]\s*", "", cleaned).strip()
     return cleaned or "markdown-finding"
 
@@ -452,7 +510,10 @@ def _first_markdown_sentence(lines: List[str]) -> str:
 
 
 def _normalize_markdown_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", key.lower())
+    compact = re.sub(r"[\s_/\-:：]+", "", key.strip().lower())
+    if compact in _MARKDOWN_KEY_ALIASES:
+        return _MARKDOWN_KEY_ALIASES[compact]
+    return re.sub(r"[^a-z0-9]", "", compact)
 
 
 def _clean_markdown_inline(value: str) -> str:

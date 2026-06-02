@@ -1,1 +1,1 @@
-Challenge the vulnerability claim by checking hallucination risk, unreachable paths, mitigating controls, weak exploit preconditions, and overstated impact.
+质疑漏洞主张，重点检查报告是否幻觉、路径是否不可达、是否存在缓解控制、利用前提是否薄弱，以及漏洞影响是否被夸大。

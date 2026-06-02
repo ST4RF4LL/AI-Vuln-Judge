@@ -1,16 +1,14 @@
 # vuln-judger
 
-`vuln-judger` is an MVP for LLM-assisted static vulnerability adjudication.
-It ingests a SARIF or Markdown static-analysis report, the matching source
-tree, and project knowledge written as Agent skills, then produces an
-analyst-facing verdict with cited evidence.
+`vuln-judger` 是一个 LLM 辅助的静态漏洞研判 MVP。它接收 SARIF 或
+Markdown 静态分析报告、报告对应的源码目录，以及以 Agent skill 形式维护的项目知识库，
+并输出面向分析人员的证据化漏洞研判结论。
 
-The first implementation prioritizes Java, C++, and Python data-flow/call-chain
-evidence. Atlas, CodeGraph, and CodeQL are treated as pluggable analyzers:
-when available they can add stronger evidence, and when unavailable the run
-falls back to local report/source validation with explicit diagnostics.
+当前实现优先支持 Java、C++、Python 的数据流和调用链证据。Atlas、CodeGraph 和
+CodeQL 作为可插拔分析器：可用时补充更强证据，不可用时回退到本地报告/源码校验，并在报告
+中明确记录诊断信息。
 
-## Quick Start
+## 快速开始
 
 ```bash
 uv run vuln-judger run \
@@ -21,7 +19,7 @@ uv run vuln-judger run \
   --out result.json
 ```
 
-Markdown reports are also accepted:
+也支持 Markdown 报告：
 
 ```bash
 uv run vuln-judger run \
@@ -30,32 +28,19 @@ uv run vuln-judger run \
   --skills ./skills
 ```
 
-The command writes a JSON report containing per-finding verdicts, confidence,
-evidence chains, debate turns, disputed points, source locations, and next steps.
+命令会输出 JSON 研判报告，包含每个发现的结论、置信度、证据链、正反方博弈回合、争议点、
+源码位置和建议下一步。默认语言为中文；机器接口字段名和枚举值保持稳定。
 
-By default the debate is deterministic and evidence-bound. To let
-OpenAI-compatible models draft the正方/反方 debate turns while keeping the final
-verdict rule-bound, configure providers and run with `--llm`.
+默认情况下，博弈过程是确定性的、证据约束的。配置 OpenAI 兼容 Provider 并使用 `--llm`
+后，可以让模型生成正方/反方回合，最终结论仍由证据规则约束。
 
-Provider configuration is stored in `.vuln-judger/providers.json` by default.
-Only OpenAI-compatible Chat Completions APIs are supported. Prefer
-`api_key_env` to avoid writing plaintext keys to disk; plaintext keys are
-supported for local-only development and are masked by the API/UI.
+## LLM 提供商
 
-Agent prompts are maintained as role-specific profile directories. Each profile
-stores its prompt in `AGENT.md`, for example:
+提供商配置默认存储在 `.vuln-judger/providers.json`。当前仅支持 OpenAI 兼容的
+Chat Completions API。建议优先使用 `api_key_env`，避免将明文密钥写入磁盘；明文密钥
+仅建议本地开发使用，并会在 API/Web 中被掩码。
 
-```text
-agents/Affirmative/Affirmative_default/AGENT.md
-agents/Negative/Negative_default/AGENT.md
-```
-
-The web UI exposes these profiles through the top-right `Agent Prompts` button.
-New runs choose one affirmative profile and one negative profile. Profiles can
-be starred in the UI, and non-default profiles can be deleted. The built-in
-default profiles `Affirmative_default` and `Negative_default` cannot be deleted.
-
-Example provider file:
+示例配置：
 
 ```json
 {
@@ -67,7 +52,7 @@ Example provider file:
   "providers": [
     {
       "id": "openai-main",
-      "name": "OpenAI Main",
+      "name": "OpenAI 主模型",
       "type": "openai-compatible",
       "endpoint": "https://api.openai.com/v1/chat/completions",
       "model": "gpt-4.1",
@@ -81,7 +66,7 @@ Example provider file:
 }
 ```
 
-Run with default providers:
+使用默认提供商运行：
 
 ```bash
 uv run vuln-judger run \
@@ -92,7 +77,7 @@ uv run vuln-judger run \
   --providers-file .vuln-judger/providers.json
 ```
 
-Run with explicit正方/反方 providers:
+显式指定正方/反方提供商：
 
 ```bash
 uv run vuln-judger run \
@@ -104,8 +89,20 @@ uv run vuln-judger run \
   --negative-provider qwen-fast
 ```
 
-正方/反方 Agent profiles can be selected per run. The selected `AGENT.md`
-content is recorded with the run and injected into LLM debate prompts:
+## Agent 配置
+
+正方和反方 Agent 使用固定角色目录，每个配置档案都以 `AGENT.md` 保存提示词：
+
+```text
+agents/Affirmative/Affirmative_default/AGENT.md
+agents/Negative/Negative_default/AGENT.md
+```
+
+Web 界面右上角的“Agent 配置”按钮可以管理这些配置档案。新任务可以分别选择一个正方
+配置档案和一个反方配置档案。配置档案支持星标，非默认配置档案可以删除；内置默认配置档案
+`Affirmative_default` 和 `Negative_default` 不能删除。
+
+命令行运行时也可以指定 Agent 配置档案：
 
 ```bash
 uv run vuln-judger run \
@@ -116,10 +113,10 @@ uv run vuln-judger run \
   --negative-agent-profile Negative_default
 ```
 
-The older `--llm-model` / `--llm-endpoint` path still works as a shared legacy
-provider when no provider IDs are selected.
+兼容旧路径：未选择提供商 ID 时，`--llm-model` / `--llm-endpoint` 仍可作为共享旧版
+提供商使用。
 
-## API
+## API 和 Web 界面
 
 ```bash
 uv run vuln-judger api \
@@ -130,13 +127,11 @@ uv run vuln-judger api \
   --agents-dir agents
 ```
 
-Open http://127.0.0.1:8765 to view saved judgement records. The page shows
-run history, verdict counts, finding summaries, evidence, debate turns,
-protection analysis, impact analysis, LLM provider settings, default
-正方/反方 provider selection, provider connectivity testing, and default
-正方/反方 Agent prompt configuration.
+打开 http://127.0.0.1:8765 查看保存的研判记录。页面提供运行历史、结论统计、发现摘要、
+证据链、博弈过程、防护分析、影响分析、LLM 提供商配置、正反方默认提供商选择、
+提供商连通性测试，以及正反方 Agent 配置管理。
 
-Create a run:
+创建任务：
 
 ```bash
 curl -X POST http://127.0.0.1:8765/runs \
@@ -153,7 +148,7 @@ curl -X POST http://127.0.0.1:8765/runs \
   }'
 ```
 
-Then inspect:
+查看接口：
 
 ```bash
 curl http://127.0.0.1:8765/runs
@@ -165,7 +160,7 @@ curl http://127.0.0.1:8765/providers/defaults
 curl http://127.0.0.1:8765/agent-prompts
 ```
 
-Test provider connectivity:
+测试提供商连通性：
 
 ```bash
 curl -X POST http://127.0.0.1:8765/providers/openai-main/test \
@@ -173,7 +168,7 @@ curl -X POST http://127.0.0.1:8765/providers/openai-main/test \
   -d '{}'
 ```
 
-CLI runs can also be saved into the same records directory:
+CLI 运行也可以保存到同一个 Web 记录目录：
 
 ```bash
 uv run vuln-judger run \
@@ -184,20 +179,17 @@ uv run vuln-judger run \
   --records-dir .vuln-judger/runs
 ```
 
-## Tool Behavior
+## 工具行为
 
-- Java: CodeQL is preferred for semantic data-flow when installed; Atlas and
-  CodeGraph can add symbol/call-chain context.
-- C++: compile database detection is first-class. Without `compile_commands.json`
-  or a visible build database, C++ findings are marked as partial evidence.
-- Python: source indexing works without a build step and uses SARIF code flows,
-  local source inspection, and optional analyzer evidence.
+- Java：优先使用 CodeQL 获取语义数据流；Atlas 和 CodeGraph 可补充符号/调用链上下文。
+- C++：优先检测编译数据库。缺少 `compile_commands.json` 或可见构建数据库时，C++ 发现
+  会标记为部分证据。
+- Python：无需构建步骤即可进行源码索引，结合 SARIF 代码流、本地源码检查和可选分析器证据。
 
-External tools are optional in the MVP. Their availability and diagnostics are
-included in the final report so analysts can distinguish strong static evidence
-from degraded local checks.
+外部工具在 MVP 中是可选能力。最终报告会记录工具可用性和诊断信息，帮助分析人员区分强静态证据
+和降级的本地校验结果。
 
-## Development
+## 开发
 
 ```bash
 uv run python -m unittest discover -s tests -p 'test_*.py'

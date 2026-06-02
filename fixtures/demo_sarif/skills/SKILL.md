@@ -1,5 +1,4 @@
-# Demo Application Threat Model
+# 示例应用威胁模型
 
-`app.py` exposes an administrative command endpoint. The command handler is a
-high-risk module because it can access host process privileges and customer
-maintenance data.
+`app.py` 暴露了一个管理命令入口。该命令处理函数可以访问宿主机进程权限和客户维护数据，
+因此属于高风险模块。

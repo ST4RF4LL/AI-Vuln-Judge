@@ -10,12 +10,12 @@
           "rules": [
             {
               "id": "PY-CMD-INJECTION",
-              "name": "Python command injection",
+              "name": "Python 命令注入",
               "shortDescription": {
-                "text": "User-controlled input reaches OS command execution."
+                "text": "用户可控输入到达 OS 命令执行点。"
               },
               "fullDescription": {
-                "text": "Unsanitized request input flows into os.system, which can allow command injection."
+                "text": "未经消毒的请求输入流入 os.system，可能导致命令注入。"
               },
               "helpUri": "https://example.local/rules/PY-CMD-INJECTION",
               "properties": {
@@ -35,7 +35,7 @@
           "ruleId": "PY-CMD-INJECTION",
           "level": "error",
           "message": {
-            "text": "Request parameter cmd flows to os.system without validation."
+            "text": "请求参数 cmd 未经校验流入 os.system。"
           },
           "locations": [
             {
@@ -66,7 +66,7 @@
                     {
                       "location": {
                         "message": {
-                          "text": "Attacker-controlled request parameter is read."
+                          "text": "读取攻击者可控的请求参数。"
                         },
                         "physicalLocation": {
                           "artifactLocation": {
@@ -84,7 +84,7 @@
                     {
                       "location": {
                         "message": {
-                          "text": "The value is passed to os.system."
+                          "text": "该值被传递给 os.system。"
                         },
                         "physicalLocation": {
                           "artifactLocation": {

@@ -1,1 +1,1 @@
-Collect evidence that the report is grounded in real source code, validate reachability/data flow, assess missing protections, and state practical impact without exaggeration.
+收集证据证明报告对应真实源码位置和真实代码片段，验证可达性、数据流或调用链，评估是否缺少有效防护，并在不夸大前提下说明实际安全影响。

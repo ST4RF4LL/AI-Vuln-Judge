@@ -60,14 +60,14 @@ class OpenAICompatibleLLM(LLMClient):
         try:
             body = json.loads(body_text)
         except json.JSONDecodeError as exc:
-            return _failure(status, started, f"invalid JSON response: {exc}")
+            return _failure(status, started, f"响应不是合法 JSON：{exc}")
         choices = body.get("choices") or []
         if not choices:
-            return _failure(status, started, "response did not include choices")
+            return _failure(status, started, "响应中没有 choices")
         message = choices[0].get("message") or {}
         content = message.get("content")
         if not content:
-            return _failure(status, started, "response did not include message content")
+            return _failure(status, started, "响应中没有 message.content")
         return {
             "ok": True,
             "status": status,
@@ -77,7 +77,7 @@ class OpenAICompatibleLLM(LLMClient):
         }
 
     def test_connection(self) -> Dict[str, Any]:
-        result = self.request("You are a connectivity test.", "Reply with exactly: OK")
+        result = self.request("你正在进行 connectivity API 连通性测试。", "只回复：OK")
         result.update(
             {
                 "provider_id": self.provider_id,
@@ -148,7 +148,7 @@ def build_legacy_llm_client(model: Optional[str], endpoint: Optional[str]) -> Op
         model=chosen_model,
         endpoint=endpoint or os.environ.get("VULN_JUDGER_LLM_ENDPOINT") or OpenAICompatibleLLM.endpoint,
         provider_id="legacy",
-        provider_name="Legacy environment provider",
+        provider_name="旧版环境变量提供商",
     )
 
 
@@ -162,11 +162,11 @@ def test_provider_connection(provider: ProviderConfig, api_key_override: Optiona
             "model": provider.model,
             "endpoint": provider.endpoint,
             "latency_ms": 0,
-            "error": "API key is not configured or environment variable is not set",
+            "error": "API key 未配置，或环境变量未设置",
         }
     if isinstance(client, OpenAICompatibleLLM):
         return client.test_connection()
-    return {"ok": False, "provider_id": provider.id, "error": "unsupported client type"}
+    return {"ok": False, "provider_id": provider.id, "error": "不支持的客户端类型"}
 
 
 def _failure(status: Optional[int], started: float, error: str) -> Dict[str, Any]:

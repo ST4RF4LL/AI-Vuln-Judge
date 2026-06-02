@@ -25,8 +25,8 @@ DEFAULT_PROFILE_IDS = {
 DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
     name="Affirmative_default",
     instructions=(
-        "Collect evidence that the report is grounded in real source code, "
-        "validate reachability/data flow, assess missing protections, and state practical impact without exaggeration."
+        "收集证据证明报告对应真实源码位置和真实代码片段，验证可达性、数据流或调用链，"
+        "评估是否缺少有效防护，并在不夸大前提下说明实际安全影响。"
     ),
     role="Affirmative",
     profile_id="Affirmative_default",
@@ -37,8 +37,8 @@ DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
 DEFAULT_NEGATIVE_AGENT = AgentConfig(
     name="Negative_default",
     instructions=(
-        "Challenge the vulnerability claim by checking hallucination risk, unreachable paths, mitigating controls, "
-        "weak exploit preconditions, and overstated impact."
+        "质疑漏洞主张，重点检查报告是否幻觉、路径是否不可达、是否存在缓解控制、"
+        "利用前提是否薄弱，以及漏洞影响是否被夸大。"
     ),
     role="Negative",
     profile_id="Negative_default",
@@ -95,7 +95,7 @@ class AgentDirectoryStore:
         chosen_id = _profile_id(profile_id or DEFAULT_PROFILE_IDS[role_key])
         agent_file = self._role_dir(role_key) / chosen_id / AGENT_FILE
         if not agent_file.exists():
-            raise ValueError(f"unknown {ROLE_DIRS[role_key]} agent profile: {chosen_id}")
+            raise ValueError(f"未知 {ROLE_DIRS[role_key]} Agent 配置：{chosen_id}")
         return self._agent_from_file(role_key, chosen_id, agent_file)
 
     def save_profile(self, role: str, profile_id: str, instructions: str) -> AgentConfig:
@@ -103,7 +103,7 @@ class AgentDirectoryStore:
         chosen_id = _profile_id(profile_id)
         text = str(instructions or "").strip()
         if not text:
-            raise ValueError("AGENT.md prompt cannot be empty")
+            raise ValueError("AGENT.md 提示词不能为空")
         agent_file = self._role_dir(role_key) / chosen_id / AGENT_FILE
         agent_file.parent.mkdir(parents=True, exist_ok=True)
         agent_file.write_text(text + "\n", encoding="utf-8")
@@ -114,7 +114,7 @@ class AgentDirectoryStore:
         chosen_id = _profile_id(profile_id)
         agent_file = self._role_dir(role_key) / chosen_id / AGENT_FILE
         if not agent_file.exists():
-            raise ValueError(f"unknown {ROLE_DIRS[role_key]} agent profile: {chosen_id}")
+            raise ValueError(f"未知 {ROLE_DIRS[role_key]} Agent 配置：{chosen_id}")
         metadata = self._metadata(agent_file.parent)
         metadata["starred"] = bool(starred)
         self._write_metadata(agent_file.parent, metadata)
@@ -124,11 +124,11 @@ class AgentDirectoryStore:
         role_key = _role_key(role)
         chosen_id = _profile_id(profile_id)
         if chosen_id == DEFAULT_PROFILE_IDS[role_key]:
-            raise ValueError(f"default {ROLE_DIRS[role_key]} agent profile cannot be deleted")
+            raise ValueError(f"默认 {ROLE_DIRS[role_key]} Agent 配置不能删除")
         profile_dir = self._role_dir(role_key) / chosen_id
         agent_file = profile_dir / AGENT_FILE
         if not agent_file.exists():
-            raise ValueError(f"unknown {ROLE_DIRS[role_key]} agent profile: {chosen_id}")
+            raise ValueError(f"未知 {ROLE_DIRS[role_key]} Agent 配置：{chosen_id}")
         shutil.rmtree(profile_dir)
         return self.summary()
 
@@ -180,15 +180,15 @@ def _role_key(role: str) -> str:
         return "affirmative"
     if normalized in {"negative", "con", "反方"}:
         return "negative"
-    raise ValueError("role must be affirmative or negative")
+    raise ValueError("role 必须是 affirmative/negative 或正方/反方")
 
 
 def _profile_id(value: str) -> str:
     profile_id = str(value or "").strip()
     if not profile_id:
-        raise ValueError("agent profile id is required")
+        raise ValueError("Agent 配置 ID 不能为空")
     if not re.match(r"^[A-Za-z0-9_.-]+$", profile_id):
-        raise ValueError("agent profile id may only contain letters, numbers, dot, underscore, and hyphen")
+        raise ValueError("Agent 配置 ID 只能包含字母、数字、点、下划线和连字符")
     return profile_id
 
 

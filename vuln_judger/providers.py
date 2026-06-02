@@ -109,9 +109,9 @@ class ProviderStore:
     def set_defaults(self, affirmative: Optional[str], negative: Optional[str]) -> Dict[str, Optional[str]]:
         providers = self._providers()
         if affirmative and affirmative not in providers:
-            raise ValueError(f"unknown affirmative provider: {affirmative}")
+            raise ValueError(f"未知正方提供商：{affirmative}")
         if negative and negative not in providers:
-            raise ValueError(f"unknown negative provider: {negative}")
+            raise ValueError(f"未知反方提供商：{negative}")
         data = self._load()
         data["defaults"] = {"affirmative": affirmative, "negative": negative}
         self._save(data)
@@ -158,18 +158,18 @@ class ProviderStore:
 def provider_from_payload(payload: Dict[str, Any], existing: Optional[ProviderConfig] = None) -> ProviderConfig:
     provider_id = str(payload.get("id") or "").strip()
     if not provider_id:
-        raise ValueError("provider id is required")
+        raise ValueError("提供商 ID 不能为空")
     if not re.match(r"^[A-Za-z0-9_.-]+$", provider_id):
-        raise ValueError("provider id may only contain letters, numbers, dot, underscore, and hyphen")
+        raise ValueError("提供商 ID 只能包含字母、数字、点、下划线和连字符")
     provider_type = str(payload.get("type") or PROVIDER_TYPE)
     if provider_type != PROVIDER_TYPE:
-        raise ValueError("only openai-compatible providers are supported")
+        raise ValueError("当前仅支持 openai-compatible 提供商")
     endpoint = str(payload.get("endpoint") or "").strip()
     model = str(payload.get("model") or "").strip()
     if not endpoint:
-        raise ValueError("provider endpoint is required")
+        raise ValueError("提供商 endpoint 不能为空")
     if not model:
-        raise ValueError("provider model is required")
+        raise ValueError("提供商模型名称不能为空")
     api_key_env = str(payload.get("api_key_env") or "").strip() or None
     if "api_key" in payload:
         raw_key = payload.get("api_key")
@@ -199,15 +199,15 @@ def parse_extra_json(value: Any) -> Dict[str, Any]:
         try:
             parsed = json.loads(value)
         except json.JSONDecodeError as exc:
-            raise ValueError(f"extra_json is not valid JSON: {exc}") from exc
+            raise ValueError(f"extra_json 不是合法 JSON：{exc}") from exc
     elif isinstance(value, dict):
         parsed = value
     else:
-        raise ValueError("extra_json must be a JSON object")
+        raise ValueError("extra_json 必须是 JSON 对象")
     if not isinstance(parsed, dict):
-        raise ValueError("extra_json must be a JSON object")
+        raise ValueError("extra_json 必须是 JSON 对象")
     blocked = {"model", "messages"}
     conflicts = sorted(key for key in parsed if key in blocked)
     if conflicts:
-        raise ValueError(f"extra_json cannot override: {', '.join(conflicts)}")
+        raise ValueError(f"extra_json 不能覆盖字段：{', '.join(conflicts)}")
     return parsed

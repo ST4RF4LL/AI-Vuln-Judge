@@ -42,7 +42,7 @@ class AnalyzerSuite:
                         evidence_id=evidence_id(finding.finding_id, analyzer.name, "exception"),
                         kind=EvidenceKind.TOOL_DIAGNOSTIC,
                         strength=EvidenceStrength.WEAK,
-                        summary=f"{analyzer.name} adapter failed: {exc}",
+                        summary=f"{analyzer.name} 适配器执行失败：{exc}",
                         source=analyzer.name,
                     )
                 )
@@ -60,7 +60,7 @@ class AtlasAnalyzer(Analyzer):
         if primary is None:
             return []
         if not self.binary:
-            return [_tool_unavailable(finding, self.name, "atlas command was not found")]
+            return [_tool_unavailable(finding, self.name, "未找到 atlas 命令")]
         resolved = indexer.resolve_location(primary)
         if not resolved.exists or resolved.absolute_path is None:
             return []
@@ -73,7 +73,7 @@ class AtlasAnalyzer(Analyzer):
                         evidence_id=evidence_id(finding.finding_id, self.name, "not-indexed"),
                         kind=EvidenceKind.TOOL_DIAGNOSTIC,
                         strength=EvidenceStrength.PARTIAL,
-                        summary="Atlas is installed but .atlas/atlas.db is absent; rerun with --auto-index-tools for Atlas traces",
+                        summary="Atlas 已安装，但缺少 .atlas/atlas.db；使用 --auto-index-tools 重新运行可采集 Atlas trace",
                         source=self.name,
                     )
                 ]
@@ -111,7 +111,7 @@ class AtlasAnalyzer(Analyzer):
                 evidence_id=evidence_id(finding.finding_id, self.name, "index"),
                 kind=EvidenceKind.TOOL_DIAGNOSTIC,
                 strength=strength,
-                summary="Atlas indexing attempted: " + "; ".join(item for item in outputs if item),
+                summary="已尝试 Atlas 索引：" + "; ".join(item for item in outputs if item),
                 source=self.name,
             )
         ]
@@ -125,7 +125,7 @@ class CodeGraphAnalyzer(Analyzer):
 
     def analyze(self, finding: Finding, indexer: SourceIndexer, settings: AnalyzerSettings) -> List[CodeEvidence]:
         if not self.binary:
-            return [_tool_unavailable(finding, self.name, "codegraph command was not found")]
+            return [_tool_unavailable(finding, self.name, "未找到 codegraph 命令")]
         # CodeGraph command names changed across releases; keep this adapter conservative.
         completed = _run_tool(self.binary, ["status"], cwd=indexer.source_root, timeout=settings.timeout_seconds)
         return [_evidence_from_tool_output(finding, self.name, "status", completed, finding.locations[:1])]
@@ -145,7 +145,7 @@ class CodeQLAnalyzer(Analyzer):
         if language not in {"java", "cpp", "python"}:
             return []
         if not self.binary:
-            return [_tool_unavailable(finding, self.name, "codeql command was not found")]
+            return [_tool_unavailable(finding, self.name, "未找到 codeql 命令")]
         db_candidates = list((indexer.source_root / ".codeql-db").glob(f"*{language}*")) if (indexer.source_root / ".codeql-db").exists() else []
         if db_candidates:
             return [
@@ -153,7 +153,7 @@ class CodeQLAnalyzer(Analyzer):
                     evidence_id=evidence_id(finding.finding_id, self.name, "database-found"),
                     kind=EvidenceKind.TOOL_DIAGNOSTIC,
                     strength=EvidenceStrength.STRONG,
-                    summary=f"CodeQL is installed and an existing {language} database was found",
+                    summary=f"CodeQL 已安装，并发现现有 {language} 数据库",
                     source=self.name,
                     data={"database": str(db_candidates[0])},
                 )
@@ -163,7 +163,7 @@ class CodeQLAnalyzer(Analyzer):
                 evidence_id=evidence_id(finding.finding_id, self.name, "database-missing"),
                 kind=EvidenceKind.TOOL_DIAGNOSTIC,
                 strength=EvidenceStrength.PARTIAL,
-                summary=f"CodeQL is installed but no .codeql-db database was found for {language}; semantic data-flow evidence is unavailable",
+                summary=f"CodeQL 已安装，但未发现 {language} 对应的 .codeql-db 数据库；语义数据流证据不可用",
                 source=self.name,
             )
         ]
@@ -188,7 +188,7 @@ def _run_tool(binary: str, args: Sequence[str], cwd: Path, timeout: int) -> Tool
         )
         return ToolCompleted(completed.returncode, completed.stdout, completed.stderr)
     except subprocess.TimeoutExpired as exc:
-        return ToolCompleted(124, exc.stdout or "", exc.stderr or f"timed out after {timeout}s")
+        return ToolCompleted(124, exc.stdout or "", exc.stderr or f"{timeout}s 后超时")
 
 
 def _evidence_from_tool_output(
@@ -204,15 +204,15 @@ def _evidence_from_tool_output(
     partial = isinstance(parsed, dict) and bool(parsed.get("partial_result"))
     strength = EvidenceStrength.MEDIUM if ok and not partial else EvidenceStrength.PARTIAL if ok else EvidenceStrength.WEAK
     kind = EvidenceKind.DATA_FLOW if operation.startswith("trace") and ok else EvidenceKind.TOOL_DIAGNOSTIC
-    summary = f"{tool_name} {operation} exited with {completed.returncode}"
+    summary = f"{tool_name} {operation} 退出码 {completed.returncode}"
     if isinstance(parsed, dict):
         diagnostics = parsed.get("diagnostics")
         if diagnostics:
-            summary += f"; diagnostics: {str(diagnostics)[:240]}"
+            summary += f"；诊断：{str(diagnostics)[:240]}"
         elif parsed.get("ok") is not None:
             summary += f"; ok={parsed.get('ok')}"
     elif output:
-        summary += f"; output: {output[:240]}"
+        summary += f"；输出：{output[:240]}"
     return CodeEvidence(
         evidence_id=evidence_id(finding.finding_id, tool_name, operation),
         kind=kind,

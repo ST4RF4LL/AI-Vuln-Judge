@@ -117,13 +117,13 @@ class SourceIndexer:
         resolved = self.resolve_location(location)
         strength = EvidenceStrength.STRONG if resolved.exists and resolved.line_exists else EvidenceStrength.WEAK
         if resolved.exists and resolved.line_exists:
-            summary = f"SARIF location exists in source at {resolved.relative_path}"
+            summary = f"SARIF 位置在源码中存在：{resolved.relative_path}"
             if resolved.symbol:
-                summary += f" near symbol `{resolved.symbol}`"
+                summary += f"，邻近符号 `{resolved.symbol}`"
         elif resolved.exists:
-            summary = f"SARIF file exists but line is outside the file: {location.display()}"
+            summary = f"SARIF 文件存在，但报告行号超出文件范围：{location.display()}"
         else:
-            summary = f"SARIF location could not be resolved under source root: {location.display()}"
+            summary = f"SARIF 位置无法在源码根目录下解析：{location.display()}"
         return CodeEvidence(
             evidence_id=evidence_id(finding.finding_id, "loc", location.display()),
             kind=EvidenceKind.SOURCE_LOCATION,
@@ -153,9 +153,9 @@ class SourceIndexer:
                 if len(verified) == len(flow)
                 else EvidenceStrength.PARTIAL
             )
-            summary = f"SARIF code flow has {len(verified)}/{len(flow)} resolvable steps"
+            summary = f"SARIF 代码流中有 {len(verified)}/{len(flow)} 个步骤可解析"
             if verified:
-                summary += f" from {verified[0].relative_path} to {verified[-1].relative_path}"
+                summary += f"，路径从 {verified[0].relative_path} 到 {verified[-1].relative_path}"
             evidence.append(
                 CodeEvidence(
                     evidence_id=evidence_id(finding.finding_id, "flow", str(flow_index)),
@@ -194,7 +194,7 @@ class SourceIndexer:
                     evidence_id=evidence_id(finding.finding_id, "protection", key),
                     kind=EvidenceKind.PROTECTION,
                     strength=EvidenceStrength.MEDIUM,
-                    summary=f"Nearby code contains possible protection terms: {', '.join(hits)}",
+                    summary=f"附近代码包含可能的防护词项：{', '.join(hits)}",
                     source="source-indexer",
                     locations=[_display_location(resolved)],
                     snippet=context,
@@ -218,15 +218,15 @@ class SourceIndexer:
             terms = {"source_terms": source_hits, "sink_terms": sink_hits}
             summary_bits = []
             if source_hits:
-                summary_bits.append(f"source-like terms: {', '.join(source_hits)}")
+                summary_bits.append(f"类似源点的词项：{', '.join(source_hits)}")
             if sink_hits:
-                summary_bits.append(f"sink-like terms: {', '.join(sink_hits)}")
+                summary_bits.append(f"类似汇点的词项：{', '.join(sink_hits)}")
             evidence.append(
                 CodeEvidence(
                     evidence_id=evidence_id(finding.finding_id, "source-sink", location.display()),
                     kind=EvidenceKind.DATA_FLOW,
                     strength=EvidenceStrength.WEAK,
-                    summary="Local code context contains " + "; ".join(summary_bits),
+                    summary="局部代码上下文包含：" + "; ".join(summary_bits),
                     source="source-indexer",
                     locations=[_display_location(resolved)],
                     snippet=context,
@@ -245,10 +245,10 @@ class SourceIndexer:
         ]
         existing = [path for path in candidates if path.exists()]
         if existing:
-            summary = f"C++ compile database found at {existing[0].relative_to(self.source_root)}"
+            summary = f"发现 C++ 编译数据库：{existing[0].relative_to(self.source_root)}"
             strength = EvidenceStrength.STRONG
         else:
-            summary = "No compile_commands.json found; C++ analysis is limited to parse-level evidence"
+            summary = "未找到 compile_commands.json；C++ 分析仅限解析级证据"
             strength = EvidenceStrength.PARTIAL
         return CodeEvidence(
             evidence_id=evidence_id(finding.finding_id, "cpp-compile-db", primary.file),
