@@ -86,6 +86,16 @@ def make_handler(
                     if payload.get("reset"):
                         agent_store.ensure_defaults()
                         self._json(agent_store.summary())
+                    elif payload.get("action") == "star":
+                        self._json(
+                            to_jsonable(
+                                agent_store.set_starred(
+                                    payload.get("role"),
+                                    payload.get("profile_id"),
+                                    bool(payload.get("starred")),
+                                )
+                            )
+                        )
                     else:
                         role = payload.get("role")
                         profile_id = payload.get("profile_id")
@@ -108,6 +118,12 @@ def make_handler(
 
         def do_DELETE(self) -> None:  # noqa: N802
             parts = _parts(self.path)
+            if len(parts) == 3 and parts[0] == "agent-prompts":
+                try:
+                    self._json(agent_store.delete_profile(parts[1], parts[2]))
+                except Exception as exc:
+                    self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
             if len(parts) == 2 and parts[0] == "providers":
                 if provider_store.delete(parts[1]):
                     self._json({"deleted": True})
@@ -586,12 +602,48 @@ def app_html() -> str:
     }}
     .settings-head h2 {{ margin: 0; font-size: 18px; }}
     .settings-body {{ padding: 16px; overflow: auto; display: grid; gap: 16px; }}
+    .profile-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 10px;
+      align-items: stretch;
+    }}
+    .profile-card {{
+      min-width: 0;
+      min-height: 154px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fbfcfe;
+      display: grid;
+      grid-template-rows: auto minmax(52px, 1fr) auto;
+      gap: 8px;
+      overflow: hidden;
+    }}
+    .profile-card.starred {{ border-color: #f0c55a; background: #fffbeb; }}
+    .profile-card.default {{ box-shadow: inset 3px 0 0 var(--accent); }}
+    .profile-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; min-width: 0; }}
+    .profile-title {{ font-weight: 700; overflow-wrap: anywhere; min-width: 0; }}
+    .profile-path {{ color: var(--muted); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; }}
+    .profile-preview {{
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+      overflow: hidden;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+    }}
+    .profile-actions {{ display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }}
+    .profile-actions button {{ padding: 6px 9px; min-height: 30px; }}
+    .profile-actions button:disabled {{ cursor: not-allowed; opacity: 0.52; border-color: var(--line); color: var(--muted); }}
     @media (max-width: 900px) {{
       header {{ align-items: flex-start; flex-direction: column; }}
       main {{ grid-template-columns: 1fr; height: auto; min-height: 0; }}
       .pane {{ min-height: 360px; }}
       .summary-grid {{ grid-template-columns: repeat(2, minmax(120px, 1fr)); }}
       .form-grid {{ grid-template-columns: 1fr; }}
+      .profile-grid {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -680,6 +732,7 @@ def app_html() -> str:
         <div class="detail" id="agent-affirmative-profile-panel">
           <h3>Affirmative Profiles</h3>
           <div class="detail-body">
+            <div class="profile-grid" id="agent-affirmative-profile-list"></div>
             <div class="form-grid">
               <label>Affirmative profile<select id="agent-affirmative-profile"></select></label>
               <label>Affirmative profile ID<input id="agent-affirmative-profile-id" placeholder="Affirmative_1"></label>
@@ -693,6 +746,7 @@ def app_html() -> str:
         <div class="detail" id="agent-negative-profile-panel">
           <h3>Negative Profiles</h3>
           <div class="detail-body">
+            <div class="profile-grid" id="agent-negative-profile-list"></div>
             <div class="form-grid">
               <label>Negative profile<select id="agent-negative-profile"></select></label>
               <label>Negative profile ID<input id="agent-negative-profile-id" placeholder="Negative_web"></label>
@@ -779,6 +833,8 @@ def app_html() -> str:
       providerExtra: document.getElementById('provider-extra'),
       defaultAffirmative: document.getElementById('default-affirmative'),
       defaultNegative: document.getElementById('default-negative'),
+      agentAffirmativeProfileList: document.getElementById('agent-affirmative-profile-list'),
+      agentNegativeProfileList: document.getElementById('agent-negative-profile-list'),
       agentAffirmativeProfile: document.getElementById('agent-affirmative-profile'),
       agentNegativeProfile: document.getElementById('agent-negative-profile'),
       agentAffirmativeProfileId: document.getElementById('agent-affirmative-profile-id'),
@@ -905,16 +961,22 @@ def app_html() -> str:
     }}
 
     function renderAgentPrompts() {{
+      const currentAffirmative = el.agentAffirmativeProfile.value;
+      const currentNegative = el.agentNegativeProfile.value;
+      const currentRunAffirmative = el.runAffirmativeAgentProfile.value;
+      const currentRunNegative = el.runNegativeAgentProfile.value;
       const affirmativeOptions = profileOptions('affirmative');
       const negativeOptions = profileOptions('negative');
       el.agentAffirmativeProfile.innerHTML = affirmativeOptions;
       el.agentNegativeProfile.innerHTML = negativeOptions;
       el.runAffirmativeAgentProfile.innerHTML = affirmativeOptions;
       el.runNegativeAgentProfile.innerHTML = negativeOptions;
-      el.agentAffirmativeProfile.value = defaultProfileId('affirmative');
-      el.agentNegativeProfile.value = defaultProfileId('negative');
-      el.runAffirmativeAgentProfile.value = defaultProfileId('affirmative');
-      el.runNegativeAgentProfile.value = defaultProfileId('negative');
+      el.agentAffirmativeProfile.value = profileExists('affirmative', currentAffirmative) ? currentAffirmative : defaultProfileId('affirmative');
+      el.agentNegativeProfile.value = profileExists('negative', currentNegative) ? currentNegative : defaultProfileId('negative');
+      el.runAffirmativeAgentProfile.value = profileExists('affirmative', currentRunAffirmative) ? currentRunAffirmative : defaultProfileId('affirmative');
+      el.runNegativeAgentProfile.value = profileExists('negative', currentRunNegative) ? currentRunNegative : defaultProfileId('negative');
+      renderAgentProfileCards('affirmative');
+      renderAgentProfileCards('negative');
       fillAgentProfileEditor('affirmative');
       fillAgentProfileEditor('negative');
     }}
@@ -929,6 +991,10 @@ def app_html() -> str:
       return ((state.agentPrompts.roles || {{}})[role] || []);
     }}
 
+    function profileExists(role, profileId) {{
+      return Boolean(profileId && profilesFor(role).some(profile => profile.profile_id === profileId));
+    }}
+
     function defaultProfileId(role) {{
       const defaults = state.agentPrompts.defaults || {{}};
       const profiles = profilesFor(role);
@@ -937,6 +1003,48 @@ def app_html() -> str:
 
     function findAgentProfile(role, profileId) {{
       return profilesFor(role).find(profile => profile.profile_id === profileId) || profilesFor(role)[0] || null;
+    }}
+
+    function renderAgentProfileCards(role) {{
+      const container = role === 'affirmative' ? el.agentAffirmativeProfileList : el.agentNegativeProfileList;
+      const profiles = profilesFor(role);
+      container.innerHTML = profiles.map(profile => profileCard(role, profile)).join('') || '<div class="muted">No profiles found.</div>';
+      for (const button of container.querySelectorAll('button[data-agent-edit]')) {{
+        button.addEventListener('click', () => {{
+          const select = role === 'affirmative' ? el.agentAffirmativeProfile : el.agentNegativeProfile;
+          select.value = button.dataset.profileId;
+          fillAgentProfileEditor(role);
+        }});
+      }}
+      for (const button of container.querySelectorAll('button[data-agent-star]')) {{
+        button.addEventListener('click', () => toggleAgentStar(role, button.dataset.profileId, button.dataset.starred !== 'true'));
+      }}
+      for (const button of container.querySelectorAll('button[data-agent-delete]')) {{
+        button.addEventListener('click', () => deleteAgentProfile(role, button.dataset.profileId));
+      }}
+    }}
+
+    function profileCard(role, profile) {{
+      const classes = ['profile-card'];
+      if (profile.starred) classes.push('starred');
+      if (profile.is_default) classes.push('default');
+      const deleteDisabled = profile.deletable ? '' : 'disabled';
+      const deleteTitle = profile.deletable ? 'Delete Agent profile' : 'Default Agent cannot be deleted';
+      return `<div class="${{classes.join(' ')}}">
+        <div class="profile-head">
+          <div>
+            <div class="profile-title">${{profile.starred ? '*' : ''}} ${{esc(profile.profile_id || profile.name || 'Agent')}}</div>
+            <div class="profile-path">${{esc(profile.path || 'AGENT.md')}}</div>
+          </div>
+          <span class="chip">${{profile.is_default ? 'default' : esc(profile.role || role)}}</span>
+        </div>
+        <div class="profile-preview">${{esc(profile.instructions || '')}}</div>
+        <div class="profile-actions">
+          <button type="button" data-agent-edit="true" data-profile-id="${{esc(profile.profile_id)}}">Edit</button>
+          <button type="button" data-agent-star="true" data-profile-id="${{esc(profile.profile_id)}}" data-starred="${{profile.starred ? 'true' : 'false'}}">${{profile.starred ? 'Unstar' : 'Star'}}</button>
+          <button type="button" data-agent-delete="true" data-profile-id="${{esc(profile.profile_id)}}" title="${{esc(deleteTitle)}}" ${{deleteDisabled}}>Delete</button>
+        </div>
+      </div>`;
     }}
 
     function fillAgentProfileEditor(role) {{
@@ -960,6 +1068,27 @@ def app_html() -> str:
         runSelect.value = saved.profile_id;
         fillAgentProfileEditor(role);
         el.agentPromptsResult.textContent = JSON.stringify(saved, null, 2);
+      }} catch (error) {{
+        el.agentPromptsResult.textContent = error.message;
+      }}
+    }}
+
+    async function toggleAgentStar(role, profileId, starred) {{
+      try {{
+        const profile = await fetchJson('/agent-prompts', jsonPost({{ action: 'star', role, profile_id: profileId, starred }}));
+        await loadAgentPrompts();
+        el.agentPromptsResult.textContent = JSON.stringify(profile, null, 2);
+      }} catch (error) {{
+        el.agentPromptsResult.textContent = error.message;
+      }}
+    }}
+
+    async function deleteAgentProfile(role, profileId) {{
+      try {{
+        const result = await fetchJson(`/agent-prompts/${{encodeURIComponent(role)}}/${{encodeURIComponent(profileId)}}`, {{ method: 'DELETE' }});
+        state.agentPrompts = result;
+        renderAgentPrompts();
+        el.agentPromptsResult.textContent = `Deleted ${{profileId}}`;
       }} catch (error) {{
         el.agentPromptsResult.textContent = error.message;
       }}

@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+import urllib.error
 import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -149,6 +150,8 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('id="agent-prompts-modal"', html)
         self.assertIn('id="agent-affirmative-profile-panel"', html)
         self.assertIn('id="agent-negative-profile-panel"', html)
+        self.assertIn('id="agent-affirmative-profile-list"', html)
+        self.assertIn('id="agent-negative-profile-list"', html)
         self.assertIn('id="agent-profile-actions"', html)
         self.assertIn('id="run-affirmative-agent-profile"', html)
         self.assertIn('id="run-negative-agent-profile"', html)
@@ -255,6 +258,25 @@ class PipelineTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(saved["profile_id"], "Affirmative_1")
+                custom = post_json(
+                    f"{base}/agent-prompts",
+                    {
+                        "role": "affirmative",
+                        "profile_id": "Affirmative_custom",
+                        "instructions": "Custom affirmative profile.",
+                    },
+                )
+                self.assertTrue(custom["deletable"])
+                starred = post_json(
+                    f"{base}/agent-prompts",
+                    {
+                        "action": "star",
+                        "role": "affirmative",
+                        "profile_id": "Affirmative_custom",
+                        "starred": True,
+                    },
+                )
+                self.assertTrue(starred["starred"])
                 post_json(
                     f"{base}/agent-prompts",
                     {
@@ -276,6 +298,22 @@ class PipelineTests(unittest.TestCase):
                 self.assertEqual(run["agent_configs"]["affirmative"]["profile_id"], "Affirmative_1")
                 self.assertEqual(run["agent_configs"]["affirmative"]["instructions"], "Prioritize value asset impact.")
                 self.assertEqual(run["agent_configs"]["negative"]["instructions"], "Challenge reachability and guards.")
+                delete_request = urllib.request.Request(
+                    f"{base}/agent-prompts/affirmative/Affirmative_custom",
+                    method="DELETE",
+                )
+                with urllib.request.urlopen(delete_request, timeout=5) as response:
+                    deleted = json.loads(response.read().decode("utf-8"))
+                self.assertFalse(
+                    any(profile["profile_id"] == "Affirmative_custom" for profile in deleted["roles"]["affirmative"])
+                )
+                default_delete_request = urllib.request.Request(
+                    f"{base}/agent-prompts/affirmative/Affirmative_1",
+                    method="DELETE",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(default_delete_request, timeout=5)
+                self.assertEqual(error.exception.code, 400)
                 reset = post_json(f"{base}/agent-prompts", {"reset": True})
                 self.assertEqual(reset["defaults"]["negative"], "Negative_web")
             finally:

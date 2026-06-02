@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -9,6 +11,7 @@ from .models import AgentConfig, to_jsonable
 
 DEFAULT_AGENTS_DIR = Path("agents")
 AGENT_FILE = "AGENT.md"
+AGENT_META_FILE = "AGENT.json"
 
 ROLE_DIRS = {
     "affirmative": "Affirmative",
@@ -28,6 +31,8 @@ DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
     role="Affirmative",
     profile_id="Affirmative_1",
     path=str(DEFAULT_AGENTS_DIR / "Affirmative" / "Affirmative_1" / AGENT_FILE),
+    deletable=False,
+    is_default=True,
 )
 DEFAULT_NEGATIVE_AGENT = AgentConfig(
     name="Negative_web",
@@ -38,6 +43,8 @@ DEFAULT_NEGATIVE_AGENT = AgentConfig(
     role="Negative",
     profile_id="Negative_web",
     path=str(DEFAULT_AGENTS_DIR / "Negative" / "Negative_web" / AGENT_FILE),
+    deletable=False,
+    is_default=True,
 )
 
 
@@ -79,6 +86,7 @@ class AgentDirectoryStore:
             if not agent_file.exists():
                 continue
             profiles.append(self._agent_from_file(role_key, item.name, agent_file))
+        profiles.sort(key=lambda profile: (not profile.starred, not profile.is_default, (profile.profile_id or "").lower()))
         return profiles
 
     def agent(self, role: str, profile_id: Optional[str] = None) -> AgentConfig:
@@ -101,6 +109,29 @@ class AgentDirectoryStore:
         agent_file.write_text(text + "\n", encoding="utf-8")
         return self._agent_from_file(role_key, chosen_id, agent_file)
 
+    def set_starred(self, role: str, profile_id: str, starred: bool) -> AgentConfig:
+        role_key = _role_key(role)
+        chosen_id = _profile_id(profile_id)
+        agent_file = self._role_dir(role_key) / chosen_id / AGENT_FILE
+        if not agent_file.exists():
+            raise ValueError(f"unknown {ROLE_DIRS[role_key]} agent profile: {chosen_id}")
+        metadata = self._metadata(agent_file.parent)
+        metadata["starred"] = bool(starred)
+        self._write_metadata(agent_file.parent, metadata)
+        return self._agent_from_file(role_key, chosen_id, agent_file)
+
+    def delete_profile(self, role: str, profile_id: str) -> Dict[str, Any]:
+        role_key = _role_key(role)
+        chosen_id = _profile_id(profile_id)
+        if chosen_id == DEFAULT_PROFILE_IDS[role_key]:
+            raise ValueError(f"default {ROLE_DIRS[role_key]} agent profile cannot be deleted")
+        profile_dir = self._role_dir(role_key) / chosen_id
+        agent_file = profile_dir / AGENT_FILE
+        if not agent_file.exists():
+            raise ValueError(f"unknown {ROLE_DIRS[role_key]} agent profile: {chosen_id}")
+        shutil.rmtree(profile_dir)
+        return self.summary()
+
     def ensure_defaults(self) -> None:
         affirmative_file = self._role_dir("affirmative") / DEFAULT_PROFILE_IDS["affirmative"] / AGENT_FILE
         if not affirmative_file.exists():
@@ -115,13 +146,32 @@ class AgentDirectoryStore:
         return self.root / ROLE_DIRS[role_key]
 
     def _agent_from_file(self, role_key: str, profile_id: str, path: Path) -> AgentConfig:
+        metadata = self._metadata(path.parent)
+        is_default = profile_id == DEFAULT_PROFILE_IDS[role_key]
         return AgentConfig(
             name=profile_id,
             instructions=path.read_text(encoding="utf-8", errors="replace").strip(),
             role=ROLE_DIRS[role_key],
             profile_id=profile_id,
             path=str(path.relative_to(Path.cwd())) if _is_under(path, Path.cwd()) else str(path),
+            starred=bool(metadata.get("starred")),
+            deletable=not is_default,
+            is_default=is_default,
         )
+
+    def _metadata(self, profile_dir: Path) -> Dict[str, Any]:
+        path = profile_dir / AGENT_META_FILE
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_metadata(self, profile_dir: Path, metadata: Dict[str, Any]) -> None:
+        path = profile_dir / AGENT_META_FILE
+        path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _role_key(role: str) -> str:

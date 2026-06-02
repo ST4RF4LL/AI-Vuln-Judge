@@ -113,6 +113,9 @@ class AgentConfig:
     role: Optional[str] = None
     profile_id: Optional[str] = None
     path: Optional[str] = None
+    starred: bool = False
+    deletable: bool = True
+    is_default: bool = False
 
 
 @dataclass

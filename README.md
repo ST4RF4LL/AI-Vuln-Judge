@@ -51,7 +51,9 @@ agents/Negative/Negative_web/AGENT.md
 ```
 
 The web UI exposes these profiles through the top-right `Agent Prompts` button.
-New runs choose one affirmative profile and one negative profile.
+New runs choose one affirmative profile and one negative profile. Profiles can
+be starred in the UI, and non-default profiles can be deleted. The built-in
+default profiles `Affirmative_1` and `Negative_web` cannot be deleted.
 
 Example provider file:
 
