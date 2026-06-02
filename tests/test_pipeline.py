@@ -164,6 +164,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('function renderMarkdown(value)', html)
         self.assertIn('class="markdown-body"', html)
         self.assertIn('renderMarkdown(turn.claim)', html)
+        self.assertIn("replace(/\\r\\n?/g, '\\n')", html)
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:

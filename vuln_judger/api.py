@@ -973,7 +973,7 @@ def app_html() -> str:
       }}[ch]));
     }}
     function renderMarkdown(value) {{
-      const text = String(value ?? '').replace(/\r\n?/g, '\\n');
+      const text = String(value ?? '').replace(/\\r\\n?/g, '\\n');
       if (!text.trim()) return '';
       const lines = text.split('\\n');
       const html = [];
