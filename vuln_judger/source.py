@@ -98,6 +98,8 @@ class SourceIndexer:
                 "line_exists": resolved.line_exists,
                 "language": resolved.language,
                 "symbol": resolved.symbol,
+                "requested_file": location.file,
+                "resolved_file": resolved.relative_path,
             },
         )
 
@@ -244,8 +246,18 @@ class SourceIndexer:
         end = min(len(lines), line + after)
         return "\n".join(f"{idx}: {lines[idx - 1]}" for idx in range(start, end + 1))
 
+    def line_text(self, file: Path, line: int) -> str:
+        lines = self._read_lines(file)
+        if line < 1 or line > len(lines):
+            return ""
+        return lines[line - 1]
+
     def symbol_at(self, file: Path, line: int, language: Optional[str]) -> Optional[str]:
         lines = self._read_lines(file)
+        if language == "cpp":
+            symbol = _cpp_symbol_at(lines, line)
+            if symbol:
+                return symbol
         patterns = _symbol_patterns(language)
         for idx in range(min(line, len(lines)), 0, -1):
             text = lines[idx - 1].strip()
@@ -261,20 +273,35 @@ class SourceIndexer:
         return self._file_cache[path]
 
     def _resolve_path(self, raw: str) -> Optional[Path]:
-        candidate = Path(raw)
-        candidates: List[Path]
-        if candidate.is_absolute():
-            candidates = [candidate]
-        else:
-            candidates = [self.source_root / candidate, self.source_root / raw.lstrip("/")]
+        candidates = self._path_candidates(raw)
+        in_root: List[Path] = []
         for item in candidates:
             resolved = item.expanduser().resolve()
             try:
                 resolved.relative_to(self.source_root)
             except ValueError:
                 continue
-            return resolved
-        return None
+            if resolved in in_root:
+                continue
+            in_root.append(resolved)
+            if resolved.exists() and resolved.is_file():
+                return resolved
+        return in_root[0] if in_root else None
+
+    def _path_candidates(self, raw: str) -> List[Path]:
+        normalized = raw.replace("\\", "/").strip()
+        candidate = Path(normalized)
+        candidates: List[Path] = []
+        if candidate.is_absolute():
+            candidates.append(candidate)
+        else:
+            candidates.append(self.source_root / normalized.lstrip("/"))
+
+        parts = [part for part in Path(normalized).parts if part not in {"", "/", "."}]
+        if len(parts) > 1:
+            for start in range(1, len(parts)):
+                candidates.append(self.source_root.joinpath(*parts[start:]))
+        return candidates
 
     def _relative_display(self, path: Optional[Path], fallback: str) -> str:
         if path is None:
@@ -343,3 +370,47 @@ def _symbol_patterns(language: Optional[str]) -> List[re.Pattern[str]]:
         re.compile(r"^(?:def|class)\s+(?P<name>[A-Za-z_][\w]*)\b"),
         re.compile(r"(?P<name>[A-Za-z_][\w]*)\s*\("),
     ]
+
+
+_CPP_CONTROL_KEYWORDS = {
+    "if",
+    "for",
+    "while",
+    "switch",
+    "catch",
+    "return",
+    "else",
+    "do",
+    "case",
+    "sizeof",
+    "static_assert",
+}
+
+
+def _cpp_symbol_at(lines: Sequence[str], line: int) -> Optional[str]:
+    class_pattern = re.compile(r"^(?:class|struct|namespace)\s+(?P<name>[A-Za-z_][\w]*)\b")
+    signature_pattern = re.compile(
+        r"^(?:(?:template\s*<.*>\s*)|(?:[\w:<>,~*&\s]+\s+))*"
+        r"(?P<name>[A-Za-z_~][\w:~]*(?:::[A-Za-z_~][\w:~]*)*)\s*\("
+    )
+    for idx in range(min(line, len(lines)), 0, -1):
+        raw = lines[idx - 1]
+        stripped = raw.strip()
+        if not stripped or stripped.startswith(("//", "/*", "*")):
+            continue
+        class_match = class_pattern.search(stripped)
+        if class_match:
+            return class_match.group("name")
+        if raw[:1].isspace():
+            continue
+        first = stripped.split("(", 1)[0].split(None, 1)[0]
+        if first in _CPP_CONTROL_KEYWORDS:
+            continue
+        match = signature_pattern.search(stripped)
+        if not match:
+            continue
+        name = match.group("name")
+        if name in _CPP_CONTROL_KEYWORDS:
+            continue
+        return name
+    return None

@@ -64,7 +64,7 @@ def _search_rg(
         for glob in file_globs:
             args.extend(["-g", glob])
     args.append(pattern)
-    args.append(str(source_root))
+    args.append(".")
     try:
         result = subprocess.run(
             args,
@@ -102,7 +102,7 @@ def _search_grep(
             args = [a for a in args if a != "--include=*"]
             args.extend(["--include", f"*.{{{include}}}"])
     args.append(pattern)
-    args.append(str(source_root))
+    args.append(".")
     try:
         result = subprocess.run(
             args,
@@ -132,7 +132,7 @@ def _parse_rg_output(stdout: str, max_matches: int) -> List[GrepMatch]:
             continue
         matches.append(
             GrepMatch(
-                file=parts[0],
+                file=_clean_relative_path(parts[0]),
                 line=line_num,
                 column=0,
                 text=parts[2].strip(),
@@ -158,7 +158,7 @@ def _parse_grep_output(stdout: str, max_matches: int) -> List[GrepMatch]:
             continue
         matches.append(
             GrepMatch(
-                file=parts[0],
+                file=_clean_relative_path(parts[0]),
                 line=line_num,
                 column=0,
                 text=parts[2].strip(),
@@ -187,6 +187,13 @@ def grep_count(source_root: Path, pattern: str, timeout: int = 30) -> int:
         except (subprocess.TimeoutExpired, OSError):
             pass
     return 0
+
+
+def _clean_relative_path(value: str) -> str:
+    path = value.replace("\\", "/")
+    if path.startswith("./"):
+        return path[2:]
+    return path
 
 
 SEARCH_PATTERNS = {

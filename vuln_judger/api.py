@@ -2730,10 +2730,20 @@ def app_html() -> str:
                 <span class="chip">${{esc(item.source)}}</span>
               </div>
               <div>${{esc(item.summary)}}</div>
+              ${{item.locations && item.locations.length ? `<div class="path">位置：${{esc(item.locations.map(locationText).join(' -> '))}}</div>` : ''}}
+              ${{item.data && (item.data.requested_file || item.data.resolved_file) ? `<div class="path">路径映射：${{esc(item.data.requested_file || '')}}${{item.data.resolved_file ? ' => ' + esc(item.data.resolved_file) : ''}}</div>` : ''}}
               ${{item.snippet ? `<pre>${{esc(item.snippet)}}</pre>` : ''}}
             </div>`).join('') || '<div class="muted">暂无证据记录。</div>'}}
           </div>
         </div>`;
+    }}
+
+    function locationText(location) {{
+      if (!location) return '';
+      const file = location.file || '';
+      if (location.line === undefined || location.line === null) return file;
+      if (location.column === undefined || location.column === null) return `${{file}}:${{location.line}}`;
+      return `${{file}}:${{location.line}}:${{location.column}}`;
     }}
 
     function renderEmpty(message) {{

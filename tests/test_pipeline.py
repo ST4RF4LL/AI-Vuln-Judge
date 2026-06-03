@@ -115,6 +115,57 @@ class PipelineTests(unittest.TestCase):
             ]
             self.assertTrue(all(item.data["line_exists"] for item in source_evidence))
 
+    def test_sarif_path_with_redundant_project_prefix_resolves_by_suffix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "faiss" / "impl").mkdir(parents=True)
+            (root / "faiss" / "impl" / "index_read.cpp").write_text(
+                "\n".join(["void read_index_up() {", "  int value = 1;", "}"]),
+                encoding="utf-8",
+            )
+            sarif = root / "report.sarif"
+            sarif.write_text(
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "unit"}},
+                                "results": [
+                                    {
+                                        "ruleId": "cpp-demo",
+                                        "message": {"text": "demo"},
+                                        "locations": [
+                                            {
+                                                "physicalLocation": {
+                                                    "artifactLocation": {"uri": "faiss/faiss/impl/index_read.cpp"},
+                                                    "region": {"startLine": 2},
+                                                }
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            )
+            source_evidence = next(
+                item for item in report.reports[0].evidence_chain if item.kind == EvidenceKind.SOURCE_LOCATION
+            )
+            self.assertEqual(report.reports[0].source_locations[0].file, "faiss/impl/index_read.cpp")
+            self.assertTrue(source_evidence.data["line_exists"])
+            self.assertEqual(source_evidence.data["requested_file"], "faiss/faiss/impl/index_read.cpp")
+            self.assertEqual(source_evidence.data["resolved_file"], "faiss/impl/index_read.cpp")
+
     def test_atlas_indexed_files_do_not_report_missing_database(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -183,6 +234,46 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(any(item.kind == EvidenceKind.DATA_FLOW and item.source == "atlas-mcp" for item in evidence))
             self.assertTrue(any(item.kind == EvidenceKind.CALL_CHAIN and item.source == "atlas-mcp" for item in evidence))
             self.assertNotIn("当前 Atlas CLI 未提供 trace 子命令", summaries)
+
+    def test_atlas_mcp_uses_resolved_sarif_suffix_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".atlas").mkdir()
+            (root / ".atlas" / "atlas.db").write_text("fake", encoding="utf-8")
+            (root / "faiss" / "impl").mkdir(parents=True)
+            (root / "faiss" / "impl" / "index_read.cpp").write_text(
+                "\n".join(
+                    [
+                        "std::unique_ptr<int> read_index_up(",
+                        "        int f) {",
+                        "    int value = f;",
+                        "    return {};",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-atlas-suffix",
+                rule_id="cpp-demo",
+                message="demo",
+                level="warning",
+                locations=[SourceLocation("faiss/faiss/impl/index_read.cpp", 3)],
+            )
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["cpp"]),
+                AnalyzerSettings(enabled=True),
+            )
+            summaries = "\n".join(item.summary for item in evidence)
+            indexed = next(item for item in evidence if item.data.get("mcp_tool") == "project/files")
+            self.assertIn("Atlas MCP project/files 确认索引中包含报告源码文件", summaries)
+            self.assertEqual(indexed.data["indexed_files"], ["faiss/impl/index_read.cpp"])
+            self.assertTrue(any(item.data.get("trace_file") == "faiss/impl/index_read.cpp" for item in evidence))
+            self.assertFalse(any("faiss/faiss/impl/index_read.cpp" in location.file for item in evidence for location in item.locations))
 
     def test_debate_outputs_structured_reports_and_final_conclusion(self):
         with tempfile.TemporaryDirectory() as tmp:

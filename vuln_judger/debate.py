@@ -69,7 +69,7 @@ class DebateOrchestrator:
             disputed_points=decision.disputed_points,
             protection_assessment=_protection_assessment(evidence),
             impact_assessment=_impact_assessment(evidence),
-            source_locations=bundle.finding.locations,
+            source_locations=_resolved_source_locations(evidence, bundle.finding.locations),
             recommended_next_steps=decision.recommended_next_steps,
         )
 
@@ -254,7 +254,7 @@ class DebateOrchestrator:
                 disputed_points=decision.disputed_points,
                 protection_assessment=_protection_assessment(bundle.evidence),
                 impact_assessment=_impact_assessment(bundle.evidence),
-                source_locations=bundle.finding.locations,
+                source_locations=_resolved_source_locations(bundle.evidence, bundle.finding.locations),
                 recommended_next_steps=decision.recommended_next_steps,
             )
         )
@@ -536,6 +536,9 @@ def _data_excerpt(item: CodeEvidence) -> str:
         "transport",
         "mcp_tool",
         "trace_kind",
+        "trace_file",
+        "trace_line",
+        "trace_column",
         "ok",
         "partial_result",
         "truncated_json",
@@ -555,6 +558,9 @@ def _data_excerpt(item: CodeEvidence) -> str:
         "files_indexed",
         "language_level",
         "trace_supported",
+        "requested_file",
+        "resolved_file",
+        "result",
     )
     pairs = []
     for key in keys:
@@ -937,6 +943,23 @@ def _impact_assessment(evidence: Sequence[CodeEvidence]) -> str:
     if not impacts:
         return "未收集到影响证据。"
     return "; ".join(dict.fromkeys(impacts))
+
+
+def _resolved_source_locations(evidence: Sequence[CodeEvidence], fallback: Sequence[SourceLocation]) -> List[SourceLocation]:
+    locations: List[SourceLocation] = []
+    seen = set()
+    for item in evidence:
+        if item.kind != EvidenceKind.SOURCE_LOCATION:
+            continue
+        if not item.data.get("line_exists") and not item.data.get("indexed_files"):
+            continue
+        for location in item.locations:
+            marker = (location.file, location.line, location.column)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            locations.append(location)
+    return locations or list(fallback)
 
 
 def _role_label(role: str) -> str:
