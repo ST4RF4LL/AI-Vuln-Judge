@@ -23,3 +23,4 @@ agents/*/*/AGENT.json
 .vuln-judger/providers.json
 .vuln-judger/runs/
 .vuln-judger/skills.json
+vuln_judger.egg-info/
