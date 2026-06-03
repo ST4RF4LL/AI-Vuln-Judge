@@ -56,6 +56,8 @@ class EvidenceCollector:
         if not supported_language_for_finding(finding, self.languages):
             language = detect_language(finding.primary_location.file) if finding.primary_location else "unknown"
             diagnostics.append(f"发现所属语言 {language} 不在当前配置语言范围内：{self.languages}")
+        evidence.append(self._source_root_evidence(finding))
+        evidence.append(self._report_evidence(finding))
         for location in finding.locations:
             evidence.append(self.indexer.evidence_for_location(finding, location))
         evidence.extend(self.indexer.evidence_for_code_flows(finding))
@@ -68,6 +70,61 @@ class EvidenceCollector:
         evidence.extend(self._project_context_evidence(finding))
         evidence.extend(self.analyzers.analyze(finding, self.indexer, self.analyzer_settings))
         return EvidenceBundle(finding=finding, evidence=_dedupe_evidence(evidence), diagnostics=diagnostics)
+
+    def _source_root_evidence(self, finding: Finding) -> CodeEvidence:
+        source_root = self.indexer.source_root
+        exists = source_root.exists()
+        is_dir = source_root.is_dir()
+        atlas_db = source_root / ".atlas" / "atlas.db"
+        summary = f"任务源码根目录已配置：{source_root}"
+        if exists and is_dir:
+            summary += "；目录存在"
+        elif exists:
+            summary += "；路径存在但不是目录"
+        else:
+            summary += "；目录不存在"
+        summary += f"；语言范围：{', '.join(self.languages) or '未指定'}"
+        summary += "；Atlas 数据库" + ("存在" if atlas_db.exists() else "不存在")
+        return CodeEvidence(
+            evidence_id=evidence_id(finding.finding_id, "source-root", str(source_root)),
+            kind=EvidenceKind.SOURCE_ROOT,
+            strength=EvidenceStrength.STRONG if exists and is_dir else EvidenceStrength.WEAK,
+            summary=summary,
+            source="task-config",
+            data={
+                "source_root": str(source_root),
+                "source_root_exists": exists,
+                "source_root_is_dir": is_dir,
+                "languages": list(self.languages),
+                "atlas_database": str(atlas_db),
+                "atlas_database_exists": atlas_db.exists(),
+            },
+        )
+
+    def _report_evidence(self, finding: Finding) -> CodeEvidence:
+        locations = [location.display() for location in finding.locations]
+        summary = f"输入报告发现：{finding.rule_id}（{finding.level}）"
+        if finding.message:
+            summary += f"，消息：{finding.message}"
+        if locations:
+            summary += f"，位置：{'; '.join(locations[:5])}"
+        if finding.code_flows:
+            summary += f"，报告内代码流 {len(finding.code_flows)} 条"
+        return CodeEvidence(
+            evidence_id=evidence_id(finding.finding_id, "input-report"),
+            kind=EvidenceKind.REPORT,
+            strength=EvidenceStrength.STRONG,
+            summary=summary,
+            source="input-report",
+            locations=list(finding.locations),
+            data={
+                "rule_id": finding.rule_id,
+                "level": finding.level,
+                "message": finding.message,
+                "location_count": len(finding.locations),
+                "code_flow_count": len(finding.code_flows),
+            },
+        )
 
     def _impact_evidence(self, finding: Finding) -> List[CodeEvidence]:
         text = f"{finding.rule_id} {finding.message} {' '.join(map(str, finding.properties.values()))}".lower()

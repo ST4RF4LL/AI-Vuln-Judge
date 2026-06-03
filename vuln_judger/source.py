@@ -4,8 +4,9 @@ import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence
 
+from .code_search import SEARCH_PATTERNS, GrepMatch, search_source
 from .models import CodeEvidence, EvidenceKind, EvidenceStrength, Finding, SourceLocation
 
 
@@ -13,57 +14,6 @@ LANGUAGE_EXTENSIONS = {
     "java": {".java"},
     "cpp": {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"},
     "python": {".py", ".pyi", ".pyx"},
-}
-
-PROTECTION_TERMS = {
-    "sanitize",
-    "sanitise",
-    "escape",
-    "validate",
-    "validator",
-    "allowlist",
-    "whitelist",
-    "checkpermission",
-    "haspermission",
-    "isauthorized",
-    "authorise",
-    "authorize",
-    "authz",
-    "csrf",
-    "rate_limit",
-    "ratelimit",
-    "permission",
-    "policy",
-    "guard",
-}
-
-SOURCE_TERMS = {
-    "request",
-    "param",
-    "input",
-    "body",
-    "query",
-    "header",
-    "cookie",
-    "argv",
-    "stdin",
-    "getParameter",
-    "getHeader",
-}
-
-SINK_TERMS = {
-    "execute",
-    "exec",
-    "system",
-    "popen",
-    "eval",
-    "deserialize",
-    "loads",
-    "query",
-    "createStatement",
-    "open",
-    "send_file",
-    "redirect",
 }
 
 
@@ -84,6 +34,17 @@ class SourceIndexer:
         self.source_root = source_root.expanduser().resolve()
         self.languages = [language.lower() for language in languages]
         self._file_cache: Dict[Path, List[str]] = {}
+        self._file_globs: Optional[List[str]] = None
+
+    def _extension_globs(self) -> List[str]:
+        if self._file_globs is not None:
+            return self._file_globs
+        exts: set[str] = set()
+        for lang in self.languages:
+            for ext in LANGUAGE_EXTENSIONS.get(lang, set()):
+                exts.add(ext)
+        self._file_globs = sorted(f"*{ext}" for ext in exts) if exts else ["*"]
+        return self._file_globs
 
     def resolve_location(self, location: SourceLocation) -> ResolvedLocation:
         absolute = self._resolve_path(location.file)
@@ -129,7 +90,7 @@ class SourceIndexer:
             kind=EvidenceKind.SOURCE_LOCATION,
             strength=strength,
             summary=summary,
-            source="source-indexer",
+            source="code-search",
             locations=[_display_location(resolved)],
             snippet=resolved.snippet,
             data={
@@ -174,63 +135,80 @@ class SourceIndexer:
         return evidence
 
     def protection_evidence(self, finding: Finding) -> List[CodeEvidence]:
-        locations = finding.locations + [location for flow in finding.code_flows for location in flow]
-        seen = set()
-        evidence = []
-        for location in locations:
-            key = location.display()
-            if key in seen:
-                continue
-            seen.add(key)
-            resolved = self.resolve_location(location)
-            if not resolved.exists or resolved.absolute_path is None or location.line is None:
-                continue
-            context = self.snippet(resolved.absolute_path, location.line, before=8, after=8)
-            hits = sorted(_term_hits(context, PROTECTION_TERMS))
-            if not hits:
-                continue
+        matches = search_source(
+            self.source_root,
+            SEARCH_PATTERNS["protection"],
+            file_globs=self._extension_globs(),
+            context_lines=5,
+            max_matches=20,
+        )
+        if not matches:
+            return []
+        by_file: Dict[str, List[GrepMatch]] = {}
+        for m in matches:
+            by_file.setdefault(m.file, []).append(m)
+        evidence: List[CodeEvidence] = []
+        for file, file_matches in list(by_file.items())[:5]:
+            terms = sorted(set(_extract_terms(m.text, SEARCH_PATTERNS["protection"]) for m in file_matches))
+            lines = [m.line for m in file_matches[:3]]
+            snippet = self.snippet(
+                self.source_root / file, lines[0], before=5, after=5
+            ) if lines else None
             evidence.append(
                 CodeEvidence(
-                    evidence_id=evidence_id(finding.finding_id, "protection", key),
+                    evidence_id=evidence_id(finding.finding_id, "protection", file),
                     kind=EvidenceKind.PROTECTION,
-                    strength=EvidenceStrength.MEDIUM,
-                    summary=f"附近代码包含可能的防护词项：{', '.join(hits)}",
-                    source="source-indexer",
-                    locations=[_display_location(resolved)],
-                    snippet=context,
-                    data={"terms": hits},
+                    strength=EvidenceStrength.MEDIUM if len(file_matches) >= 2 else EvidenceStrength.WEAK,
+                    summary=f"rg 搜索 {file} 中发现 {len(file_matches)} 处防护词项：{', '.join(terms[:8])}",
+                    source="code-search",
+                    locations=[SourceLocation(file=file, line=lines[0])],
+                    snippet=snippet,
+                    data={"terms": terms, "match_count": len(file_matches), "files_searched": len(by_file)},
                 )
             )
         return evidence
 
     def source_sink_evidence(self, finding: Finding) -> List[CodeEvidence]:
-        locations = finding.locations + [location for flow in finding.code_flows for location in flow]
-        evidence = []
-        for location in locations:
-            resolved = self.resolve_location(location)
-            if not resolved.exists or resolved.absolute_path is None or location.line is None:
-                continue
-            context = self.snippet(resolved.absolute_path, location.line, before=3, after=3)
-            source_hits = sorted(_term_hits(context, SOURCE_TERMS))
-            sink_hits = sorted(_term_hits(context, SINK_TERMS))
-            if not source_hits and not sink_hits:
-                continue
-            terms = {"source_terms": source_hits, "sink_terms": sink_hits}
-            summary_bits = []
-            if source_hits:
-                summary_bits.append(f"类似源点的词项：{', '.join(source_hits)}")
-            if sink_hits:
-                summary_bits.append(f"类似汇点的词项：{', '.join(sink_hits)}")
+        source_matches = search_source(
+            self.source_root,
+            SEARCH_PATTERNS["source"],
+            file_globs=self._extension_globs(),
+            context_lines=3,
+            max_matches=20,
+        )
+        sink_matches = search_source(
+            self.source_root,
+            SEARCH_PATTERNS["sink"],
+            file_globs=self._extension_globs(),
+            context_lines=3,
+            max_matches=20,
+        )
+        evidence: List[CodeEvidence] = []
+        if source_matches:
+            source_terms = sorted(set(_extract_terms(m.text, SEARCH_PATTERNS["source"]) for m in source_matches))[:10]
+            source_file = source_matches[0]
             evidence.append(
                 CodeEvidence(
-                    evidence_id=evidence_id(finding.finding_id, "source-sink", location.display()),
+                    evidence_id=evidence_id(finding.finding_id, "source-sink", "source"),
                     kind=EvidenceKind.DATA_FLOW,
                     strength=EvidenceStrength.WEAK,
-                    summary="局部代码上下文包含：" + "; ".join(summary_bits),
-                    source="source-indexer",
-                    locations=[_display_location(resolved)],
-                    snippet=context,
-                    data=terms,
+                    summary=f"rg 在源码中搜索到 {len(source_matches)} 处源点词项：{', '.join(source_terms)}",
+                    source="code-search",
+                    locations=[SourceLocation(file=m.file, line=m.line) for m in source_matches[:5]],
+                    data={"source_terms": source_terms, "source_match_count": len(source_matches)},
+                )
+            )
+        if sink_matches:
+            sink_terms = sorted(set(_extract_terms(m.text, SEARCH_PATTERNS["sink"]) for m in sink_matches))[:10]
+            evidence.append(
+                CodeEvidence(
+                    evidence_id=evidence_id(finding.finding_id, "source-sink", "sink"),
+                    kind=EvidenceKind.DATA_FLOW,
+                    strength=EvidenceStrength.WEAK,
+                    summary=f"rg 在源码中搜索到 {len(sink_matches)} 处汇点词项：{', '.join(sink_terms)}",
+                    source="code-search",
+                    locations=[SourceLocation(file=m.file, line=m.line) for m in sink_matches[:5]],
+                    data={"sink_terms": sink_terms, "sink_match_count": len(sink_matches)},
                 )
             )
         return evidence
@@ -248,14 +226,14 @@ class SourceIndexer:
             summary = f"发现 C++ 编译数据库：{existing[0].relative_to(self.source_root)}"
             strength = EvidenceStrength.STRONG
         else:
-            summary = "未找到 compile_commands.json；C++ 分析仅限解析级证据"
+            summary = "未找到 compile_commands.json；C++ 语义分析降级，但 grep/rg 和 Atlas MCP 调用图仍可提供证据"
             strength = EvidenceStrength.PARTIAL
         return CodeEvidence(
             evidence_id=evidence_id(finding.finding_id, "cpp-compile-db", primary.file),
             kind=EvidenceKind.TOOL_DIAGNOSTIC,
             strength=strength,
             summary=summary,
-            source="source-indexer",
+            source="code-search",
             locations=[],
             data={"compile_database": str(existing[0]) if existing else None},
         )
@@ -338,9 +316,9 @@ def _display_location(resolved: ResolvedLocation) -> SourceLocation:
     )
 
 
-def _term_hits(text: str, terms: Iterable[str]) -> List[str]:
-    lowered = text.lower()
-    return [term for term in terms if term.lower() in lowered]
+def _extract_terms(text: str, pattern: str) -> str:
+    match = re.search(pattern, text, re.IGNORECASE)
+    return match.group(0) if match else ""
 
 
 def _symbol_patterns(language: Optional[str]) -> List[re.Pattern[str]]:

@@ -13,6 +13,8 @@ class Verdict(str, Enum):
 
 
 class EvidenceKind(str, Enum):
+    REPORT = "REPORT"
+    SOURCE_ROOT = "SOURCE_ROOT"
     SOURCE_LOCATION = "SOURCE_LOCATION"
     SARIF_CODE_FLOW = "SARIF_CODE_FLOW"
     CALL_CHAIN = "CALL_CHAIN"
@@ -134,6 +136,7 @@ class VerdictReport:
     verdict: Verdict
     confidence: float
     reasoning_summary: str
+    final_conclusion: str
     evidence_chain: List[CodeEvidence]
     debate: List[DebateTurn]
     disputed_points: List[str]
@@ -149,6 +152,7 @@ class RunConfig:
     source_path: Path
     skills_path: Optional[Path] = None
     providers_file: Optional[Path] = None
+    mcp_servers_file: Optional[Path] = None
     run_id: Optional[str] = None
     languages: List[str] = field(default_factory=lambda: ["java", "cpp", "python"])
     max_rounds: int = 4
@@ -173,6 +177,7 @@ class RunReport:
     finding_count: int
     project_context_facts: int
     reports: List[VerdictReport]
+    status: str = "completed"
     llm_providers: Dict[str, Any] = field(default_factory=dict)
     agent_configs: Dict[str, Any] = field(default_factory=dict)
     diagnostics: List[str] = field(default_factory=list)

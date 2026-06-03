@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 from uuid import uuid4
 
 from .analyzers import AnalyzerSettings, AnalyzerSuite
@@ -22,9 +22,19 @@ from .source import SourceIndexer
 LOG = logger("pipeline")
 
 
-def run_judgement(config: RunConfig) -> RunReport:
+class RunStopped(Exception):
+    """Raised when a running judgement task is stopped cooperatively."""
+
+
+def run_judgement(
+    config: RunConfig,
+    progress_callback: Optional[Callable[[RunReport], None]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+) -> RunReport:
     source_path = config.source_path.expanduser().resolve()
     sarif_path = config.sarif_path.expanduser().resolve()
+    run_id = config.run_id or _run_id(sarif_path, source_path, config.languages)
+    created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     LOG.info(
         "开始漏洞研判 run_id=%s report=%s source=%s languages=%s llm=%s external_tools=%s",
         config.run_id,
@@ -42,6 +52,7 @@ def run_judgement(config: RunConfig) -> RunReport:
     analyzer_settings = AnalyzerSettings(
         enabled=config.enable_external_tools,
         auto_index=config.auto_index_tools,
+        mcp_servers_file=config.mcp_servers_file,
     )
     collector = EvidenceCollector(
         indexer=indexer,
@@ -63,21 +74,75 @@ def run_judgement(config: RunConfig) -> RunReport:
         legacy_model=config.llm_model,
         legacy_endpoint=config.llm_endpoint,
     )
-    orchestrator = DebateOrchestrator(
+    orchestrator_template = DebateOrchestrator(
         max_rounds=config.max_rounds,
         affirmative_client=affirmative_client,
         negative_client=negative_client,
         affirmative_agent=config.affirmative_agent,
         negative_agent=config.negative_agent,
     )
+    llm_providers = _llm_provider_metadata(
+        config.enable_llm,
+        affirmative_provider,
+        negative_provider,
+        affirmative_client,
+        negative_client,
+    )
+    agent_configs = _agent_config_metadata(orchestrator_template)
     reports = []
     diagnostics = []
+
+    def check_stop() -> None:
+        if should_stop is not None and should_stop():
+            LOG.info("漏洞研判收到停止信号 run_id=%s", run_id)
+            raise RunStopped(f"任务 {run_id} 已停止")
+
+    def emit_progress(partial_reports=None) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(
+            RunReport(
+                run_id=run_id,
+                created_at=created_at,
+                source_path=str(source_path),
+                sarif_path=str(sarif_path),
+                languages=list(config.languages),
+                finding_count=len(findings),
+                project_context_facts=len(project_context.facts),
+                reports=list(partial_reports if partial_reports is not None else reports),
+                status="running",
+                llm_providers=llm_providers,
+                agent_configs=agent_configs,
+                diagnostics=list(diagnostics),
+            )
+        )
+
+    emit_progress()
+    check_stop()
     for finding in findings:
+        check_stop()
         LOG.info("开始处理 finding=%s rule=%s", finding.finding_id, finding.rule_id)
         bundle = collector.collect(finding)
         diagnostics.extend(f"{finding.finding_id}: {item}" for item in bundle.diagnostics)
+        emit_progress(reports)
+        check_stop()
+
+        def on_finding_progress(partial_report):
+            emit_progress([*reports, partial_report])
+            check_stop()
+
+        orchestrator = DebateOrchestrator(
+            max_rounds=config.max_rounds,
+            affirmative_client=affirmative_client,
+            negative_client=negative_client,
+            affirmative_agent=config.affirmative_agent,
+            negative_agent=config.negative_agent,
+            progress_callback=on_finding_progress,
+        )
         verdict = orchestrator.adjudicate(bundle)
         reports.append(verdict)
+        emit_progress(reports)
+        check_stop()
         LOG.info(
             "完成处理 finding=%s verdict=%s confidence=%s evidence=%s diagnostics=%s",
             finding.finding_id,
@@ -87,22 +152,17 @@ def run_judgement(config: RunConfig) -> RunReport:
             len(bundle.diagnostics),
         )
     report = RunReport(
-        run_id=config.run_id or _run_id(sarif_path, source_path, config.languages),
-        created_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        run_id=run_id,
+        created_at=created_at,
         source_path=str(source_path),
         sarif_path=str(sarif_path),
         languages=list(config.languages),
         finding_count=len(findings),
         project_context_facts=len(project_context.facts),
         reports=reports,
-        llm_providers=_llm_provider_metadata(
-            config.enable_llm,
-            affirmative_provider,
-            negative_provider,
-            affirmative_client,
-            negative_client,
-        ),
-        agent_configs=_agent_config_metadata(orchestrator),
+        status="completed",
+        llm_providers=llm_providers,
+        agent_configs=agent_configs,
         diagnostics=diagnostics,
     )
     LOG.info("漏洞研判完成 run_id=%s findings=%s diagnostics=%s", report.run_id, report.finding_count, len(report.diagnostics))

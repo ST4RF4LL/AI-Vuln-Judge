@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "defaults": {
+    "atlas": "atlas-default"
+  },
+  "servers": [
+    {
+      "id": "atlas-default",
+      "name": "Atlas 默认 MCP",
+      "transport": "stdio",
+      "kind": "atlas",
+      "command": "atlas",
+      "args": [
+        "mcp",
+        "--project",
+        "{project}",
+        "--log-format",
+        "json"
+      ],
+      "cwd": "{project}",
+      "env": {},
+      "enabled": true,
+      "description": "使用本地 atlas mcp 启动项目代码图 MCP Server。"
+    }
+  ]
+}

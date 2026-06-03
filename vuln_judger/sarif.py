@@ -168,24 +168,25 @@ _MARKDOWN_KEY_VALUE_RE = re.compile(
     r"^\s*(?:[-*+]\s*)?(?:\*\*)?([A-Za-z\u4e00-\u9fff][A-Za-z0-9\u4e00-\u9fff _/\-]{0,48})(?:\*\*)?\s*[:：]\s*(.*?)\s*$"
 )
 _LOCATION_EXTENSIONS = (
-    "py",
+    "java",
     "pyi",
     "pyx",
-    "java",
-    "c",
-    "cc",
     "cpp",
     "cxx",
-    "h",
-    "hh",
     "hpp",
     "hxx",
+    "py",
+    "cc",
+    "hh",
+    "c",
+    "h",
 )
 _LOCATION_RE = re.compile(
     r"(?P<file>(?:[A-Za-z]:)?(?:[A-Za-z0-9_.@+~\-/]+/)*[A-Za-z0-9_.@+~\-]+"
     r"\.(?:"
     + "|".join(_LOCATION_EXTENSIONS)
     + r"))"
+    r"(?![A-Za-z0-9_])"
     r"(?:(?::|#L)(?P<line>\d+)(?::(?P<column>\d+))?"
     r"|(?:\s*,?\s*(?:line|Line)\s+(?P<line_word>\d+))"
     r"(?:\s*,?\s*(?:column|col|Column|Col)\s+(?P<column_word>\d+))?"

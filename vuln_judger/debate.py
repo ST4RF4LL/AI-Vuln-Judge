@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_NEGATIVE_AGENT
 from .evidence import EvidenceBundle
@@ -28,6 +28,13 @@ class DebateDecision:
     recommended_next_steps: List[str]
 
 
+@dataclass
+class SideConclusion:
+    label: str
+    verdict: Verdict
+    statement: str
+
+
 class DebateOrchestrator:
     def __init__(
         self,
@@ -37,23 +44,26 @@ class DebateOrchestrator:
         negative_client: Optional[LLMClient] = None,
         affirmative_agent: Optional[AgentConfig] = None,
         negative_agent: Optional[AgentConfig] = None,
+        progress_callback: Optional[Callable[[VerdictReport], None]] = None,
     ):
         self.max_rounds = max_rounds
         self.affirmative_client = affirmative_client or llm_client
         self.negative_client = negative_client or llm_client
         self.affirmative_agent = _agent_or_default(affirmative_agent, DEFAULT_AFFIRMATIVE_AGENT)
         self.negative_agent = _agent_or_default(negative_agent, DEFAULT_NEGATIVE_AGENT)
+        self.progress_callback = progress_callback
 
     def adjudicate(self, bundle: EvidenceBundle) -> VerdictReport:
         evidence = bundle.evidence
-        turns = self._debate_turns(bundle)
         decision = self._decide(bundle)
+        turns, final_conclusion, decision = self._debate_turns(bundle, decision)
         return VerdictReport(
             finding_id=bundle.finding.finding_id,
             rule_id=bundle.finding.rule_id,
             verdict=decision.verdict,
             confidence=round(decision.confidence, 2),
             reasoning_summary=decision.reasoning_summary,
+            final_conclusion=final_conclusion,
             evidence_chain=evidence,
             debate=turns,
             disputed_points=decision.disputed_points,
@@ -63,76 +73,191 @@ class DebateOrchestrator:
             recommended_next_steps=decision.recommended_next_steps,
         )
 
-    def _debate_turns(self, bundle: EvidenceBundle) -> List[DebateTurn]:
+    def _debate_turns(
+        self, bundle: EvidenceBundle, base_decision: DebateDecision
+    ) -> Tuple[List[DebateTurn], str, DebateDecision]:
         evidence = bundle.evidence
+        challenges = self._challenges(bundle)
+        source_root_ids = _ids(evidence, EvidenceKind.SOURCE_ROOT)
+        report_ids = _ids(evidence, EvidenceKind.REPORT)
         location_ids = _ids(evidence, EvidenceKind.SOURCE_LOCATION)
         flow_ids = _ids(evidence, EvidenceKind.SARIF_CODE_FLOW, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN)
         protection_ids = _ids(evidence, EvidenceKind.PROTECTION)
         impact_ids = _ids(evidence, EvidenceKind.IMPACT, EvidenceKind.PROJECT_CONTEXT)
         tool_diag_ids = _ids(evidence, EvidenceKind.TOOL_DIAGNOSTIC)
-        challenges = self._challenges(bundle)
-        affirmative_claim = self._llm_claim(
+        affirmative_report = self._llm_claim(
             "AFFIRMATIVE",
-            "论证该静态分析发现是真实漏洞候选。只能引用提示中给出的证据 ID。",
+            (
+                "提交完整正方证据报告。必须覆盖：输入报告证据、源码真实性、函数调用链、数据流、攻击链、"
+                "攻击前提、攻击限制、防护消减分析、攻击影响、可选 PoC/EXP。"
+                "如有证据缺口，应主动从已有证据中交叉验证补强（如从 calls 调用图反查数据流、从源码片段拼接路径、用附近符号补全 search 遗漏），"
+                "只有在穷尽补强手段后才可标注为证据限制，并说明尝试过哪些补强方法。"
+            ),
             bundle,
-            extra="",
-        ) or "该发现有源码证据支撑，应作为真实漏洞候选继续研判。"
-        negative_claim = self._llm_claim(
-            "NEGATIVE",
-            "质疑漏洞主张。重点检查幻觉、可达性、防护措施和影响夸大。只能引用提示中给出的证据 ID。",
-            bundle,
-            extra="\n".join(challenges),
-        ) or (
-            "证据必须证明真实代码存在、路径可达、缺少有效防护，且影响没有被夸大。"
-            + (" ".join(challenges) if challenges else "未发现主要反证。")
-        )
-        turns = [
+            extra=_stage_context(
+                "正方第一回合",
+                (
+                    "优先使用 Atlas MCP 证据。若证据显示 Atlas 数据库缺失，才可说明需要执行 "
+                    "`atlas index --analysis full`；若证据显示 Atlas MCP 已返回 project/status、project/files、trace 或 calls，"
+                    "必须引用这些证据判断源码真实性、调用图和数据流。只有在 MCP 不可用且 CLI trace 子命令不可用时，"
+                    "才可表述为“Atlas 已索引但当前工具无法导出数据流 trace”，不得说 .atlas 缺失或未构建。"
+                ),
+                challenges,
+                "",
+            ),
+        ) or _affirmative_evidence_report(bundle, base_decision, challenges)
+        turns: List[DebateTurn] = []
+        turns.append(
             DebateTurn(
                 role=DebateRole.AFFIRMATIVE,
                 round_index=1,
-                claim=affirmative_claim,
-                evidence_ids=location_ids + flow_ids + impact_ids,
+                claim=affirmative_report,
+                evidence_ids=source_root_ids + report_ids + location_ids + flow_ids + impact_ids,
+            )
+        )
+        self._emit_progress(bundle, base_decision, turns)
+        negative_report = self._llm_claim(
+            "NEGATIVE",
+            (
+                "提交反方质疑报告。必须覆盖：攻击链路真实性、调用链/数据流断点、攻击前提是否过高、"
+                "源码或知识库中的安全防护、攻击影响是否被夸大。只能引用提示中给出的证据 ID。"
             ),
+            bundle,
+            extra=_stage_context("反方第一回合", "正方证据报告：\n" + affirmative_report, challenges, ""),
+        ) or _negative_challenge_report(bundle, challenges, affirmative_report)
+        turns.append(
             DebateTurn(
                 role=DebateRole.NEGATIVE,
                 round_index=1,
-                claim=negative_claim,
-                evidence_ids=protection_ids + tool_diag_ids,
+                claim=negative_report,
+                evidence_ids=source_root_ids + protection_ids + tool_diag_ids,
                 resolved=not challenges,
-            ),
-        ]
-        if challenges:
-            fallback_reply = self._affirmative_reply(bundle, challenges)
-            reply = self._llm_claim(
+            )
+        )
+        self._emit_progress(bundle, base_decision, turns)
+        unresolved = list(challenges)
+        last_negative = negative_report
+        for round_index in range(2, max(1, self.max_rounds) + 1):
+            if not unresolved:
+                break
+            clarification = self._llm_claim(
                 "AFFIRMATIVE",
-                "回应反方质疑。证据不足时必须承认不确定性。只能引用提示中给出的证据 ID。",
+                (
+                    "逐项回应反方质疑。每个质疑点都要给出：可被证据支持的澄清、用交叉验证补强的论证、仍未闭环的限制。"
+                    "不要直接承认证据不足——先从调用图反查、源码片段分析、附近符号搜索、调用方/被调用方拼接等手段尝试补证。"
+                    "只有当所有补强方法均无法闭合时，才明确说明尝试过的手段及剩余缺口。"
+                    "对攻击链/前提/影响结论如有修正必须给出新的证据引用。"
+                ),
                 bundle,
-                extra="\n".join(challenges),
-            ) or fallback_reply
-            answer_ids = location_ids + flow_ids + protection_ids + impact_ids
+                extra=_stage_context(
+                    f"正方第 {round_index} 回合澄清",
+                    "上一轮反方质疑：\n" + last_negative,
+                    unresolved,
+                    "",
+                ),
+            ) or _affirmative_clarification_report(bundle, unresolved, round_index)
+            answer_ids = source_root_ids + location_ids + flow_ids + protection_ids + impact_ids
             turns.append(
                 DebateTurn(
                     role=DebateRole.AFFIRMATIVE,
-                    round_index=2,
-                    claim=reply,
+                    round_index=round_index,
+                    claim=clarification,
                     evidence_ids=answer_ids,
                     resolved=not _material_unresolved(challenges),
                 )
             )
-        decision = self._decide(bundle)
+            self._emit_progress(bundle, base_decision, turns)
+            negative_review = self._llm_claim(
+                "NEGATIVE",
+                (
+                    "复审正方澄清。指出已经闭环的问题和仍然不成立的断点，并给出是否继续质疑。"
+                    "重点仍是攻击链真实性、攻击前提、防护消减和影响归因。"
+                ),
+                bundle,
+                extra=_stage_context(
+                    f"反方第 {round_index} 回合复审",
+                    "正方澄清：\n" + clarification,
+                    unresolved,
+                    "",
+                ),
+            ) or _negative_review_report(bundle, unresolved, clarification, round_index)
+            turns.append(
+                DebateTurn(
+                    role=DebateRole.NEGATIVE,
+                    round_index=round_index,
+                    claim=negative_review,
+                    evidence_ids=protection_ids + tool_diag_ids + flow_ids + location_ids,
+                    resolved=not _material_unresolved(unresolved),
+                )
+            )
+            self._emit_progress(bundle, base_decision, turns)
+            last_negative = negative_review
+            if _can_reach_consensus(base_decision, unresolved):
+                unresolved = []
+
+        final_round = max((turn.round_index for turn in turns), default=0) + 1
+        affirmative_final = self._side_conclusion("AFFIRMATIVE", bundle, base_decision, challenges, last_negative)
+        turns.append(
+            DebateTurn(
+                role=DebateRole.AFFIRMATIVE,
+                round_index=final_round,
+                claim=f"## 正方结案\n【{affirmative_final.label}】，{affirmative_final.statement}",
+                evidence_ids=source_root_ids + report_ids + location_ids + flow_ids + impact_ids,
+                resolved=True,
+            )
+        )
+        self._emit_progress(bundle, base_decision, turns)
+        negative_final = self._side_conclusion("NEGATIVE", bundle, base_decision, challenges, last_negative)
+        final_conclusion = _final_conclusion(affirmative_final, negative_final)
+        decision = _decision_from_conclusions(base_decision, affirmative_final, negative_final, final_conclusion)
+        turns.append(
+            DebateTurn(
+                role=DebateRole.NEGATIVE,
+                round_index=final_round,
+                claim=f"## 反方结案\n【{negative_final.label}】，{negative_final.statement}",
+                evidence_ids=source_root_ids + protection_ids + tool_diag_ids + location_ids + flow_ids,
+                resolved=True,
+            )
+        )
+        self._emit_progress(bundle, decision, turns)
         turns.append(
             DebateTurn(
                 role=DebateRole.MODERATOR,
-                round_index=min(self.max_rounds, 3),
-                claim=(
-                    f"最终结论：{_verdict_label(decision.verdict)}（{decision.verdict.value}），"
-                    f"置信度 {decision.confidence:.2f}。{decision.reasoning_summary}"
-                ),
+                round_index=final_round,
+                claim=final_conclusion,
                 evidence_ids=[item.evidence_id for item in evidence],
                 resolved=decision.verdict != Verdict.INCONCLUSIVE,
             )
         )
-        return turns
+        self._emit_progress(bundle, decision, turns, final_conclusion=final_conclusion)
+        return turns, final_conclusion, decision
+
+    def _emit_progress(
+        self,
+        bundle: EvidenceBundle,
+        decision: DebateDecision,
+        turns: Sequence[DebateTurn],
+        final_conclusion: str = "",
+    ) -> None:
+        if self.progress_callback is None:
+            return
+        self.progress_callback(
+            VerdictReport(
+                finding_id=bundle.finding.finding_id,
+                rule_id=bundle.finding.rule_id,
+                verdict=decision.verdict,
+                confidence=round(decision.confidence, 2),
+                reasoning_summary=decision.reasoning_summary,
+                final_conclusion=final_conclusion,
+                evidence_chain=bundle.evidence,
+                debate=list(turns),
+                disputed_points=decision.disputed_points,
+                protection_assessment=_protection_assessment(bundle.evidence),
+                impact_assessment=_impact_assessment(bundle.evidence),
+                source_locations=bundle.finding.locations,
+                recommended_next_steps=decision.recommended_next_steps,
+            )
+        )
 
     def _challenges(self, bundle: EvidenceBundle) -> List[str]:
         evidence = bundle.evidence
@@ -158,25 +283,24 @@ class DebateOrchestrator:
         role_label = _role_label(role)
         agent_name = agent.name.strip() or role_label
         agent_instructions = agent.instructions.strip()
-        evidence_lines = []
-        for item in bundle.evidence[:20]:
-            evidence_lines.append(
-                f"- {item.evidence_id} | {_evidence_kind_label(item.kind)}（{item.kind.value}） | "
-                f"{_evidence_strength_label(item.strength)}（{item.strength.value}） | {item.summary}"
-            )
         system = (
             f"你是 {agent_name}，在静态漏洞研判博弈中担任{role_label}。"
             "禁止编造文件、数据流、防护措施或漏洞影响。"
             "每个具体论断都必须引用提示中一个或多个证据 ID。"
+            "输出必须使用中文 Markdown。"
         )
         if agent_instructions:
             system += f"\n角色配置：\n{agent_instructions}"
         user = (
             f"任务：{task}\n"
             f"发现：{bundle.finding.rule_id} - {bundle.finding.message}\n"
-            f"证据：\n" + "\n".join(evidence_lines) + "\n"
+            f"证据：\n" + _evidence_prompt(bundle.evidence) + "\n"
+            "证据解释约束：SOURCE_ROOT 只能证明任务已配置源码根目录，不能替代具体 SOURCE_LOCATION、CALL_CHAIN 或 DATA_FLOW；"
+            "若存在 atlas-mcp 证据，应优先按 MCP 的 project/status、project/files、trace、calls 结果研判；"
+            "若 Atlas 数据库存在但 trace 结果为 empty/partial/No data node，应转而从 calls 调用图和源码片段交叉验证重构数据流；"
+            "若 Atlas 数据库存在但 trace_supported=false，只能说明当前工具无法导出 trace，不得说 .atlas 缺失或未构建。\n"
             f"补充上下文或质疑：\n{extra}\n"
-            "请用中文写一个简洁的辩论回合，不要使用 Markdown 表格。"
+            "请用中文写一个可审计的辩论回合，不要使用 Markdown 表格。"
         )
         return client.complete(system, user)
 
@@ -184,16 +308,38 @@ class DebateOrchestrator:
         evidence = bundle.evidence
         replies = []
         if _has_valid_location(evidence):
-            replies.append("SARIF 位置可以解析到真实源码。")
+            replies.append("SARIF 位置可以解析到真实源码，源码片段已提供上下文。")
         if _has_meaningful_flow(evidence):
-            replies.append("SARIF 或分析器路径提供了可达性/数据流证据。")
+            replies.append("分析器提供了调用链/数据流证据，可从调用方-被调用方重构攻击路径。")
         else:
-            replies.append("可达性仍未被充分证明。")
+            replies.append("虽无直接数据流证据，但应尝试从调用图、源码片段和符号交叉引用手动拼接路径。")
         if _has_protection(evidence):
-            replies.append("存在防护证据，但需要审查其有效性，不能直接假定有效。")
+            replies.append("存在防护证据，需结合源码片段分析其实际有效性，不可直接假定能完全消减风险。")
         if _has_impact(evidence):
-            replies.append("影响已从规则/消息和匹配的项目上下文中映射。")
+            replies.append("影响已从规则/消息和项目上下文映射，可结合调用链进一步归因到具体汇点。")
         return " ".join(replies)
+
+    def _side_conclusion(
+        self,
+        role: str,
+        bundle: EvidenceBundle,
+        decision: DebateDecision,
+        challenges: Sequence[str],
+        last_negative: str,
+    ) -> SideConclusion:
+        label, verdict, statement = _fallback_side_conclusion(role, bundle, decision, challenges)
+        llm_statement = self._llm_claim(
+            role,
+            (
+                f"给出唯一结论标签和简短结案陈述。结论标签已固定为【{label}】，不得改成其他标签。"
+                "只输出 1 到 3 句话，不要输出 Markdown 表格。"
+            ),
+            bundle,
+            extra=_stage_context("结案", "最近一轮反方意见：\n" + last_negative, challenges, ""),
+        )
+        if llm_statement:
+            statement = _clean_final_statement(llm_statement, label) or statement
+        return SideConclusion(label=label, verdict=verdict, statement=statement)
 
     def _decide(self, bundle: EvidenceBundle) -> DebateDecision:
         evidence = bundle.evidence
@@ -255,6 +401,406 @@ class DebateOrchestrator:
         )
 
 
+def _affirmative_evidence_report(
+    bundle: EvidenceBundle, decision: DebateDecision, challenges: Sequence[str]
+) -> str:
+    evidence = bundle.evidence
+    return "\n".join(
+        [
+            "## 正方证据报告",
+            "### 1. 输入报告证据",
+            _evidence_bullets(evidence, {EvidenceKind.REPORT}) or "未找到输入报告证据。",
+            "### 2. 源码真实性",
+            _source_authenticity_report(evidence),
+            "### 3. 函数调用链与数据流",
+            _flow_report(evidence),
+            "### 4. 攻击链",
+            _attack_chain_report(bundle),
+            "### 5. 攻击前提与限制",
+            _attack_prerequisite_report(evidence, challenges),
+            "### 6. 防护消减分析",
+            _protection_assessment(evidence),
+            "### 7. 攻击影响",
+            _impact_assessment(evidence),
+            "### 8. PoC/EXP",
+            _poc_report(evidence),
+            "### 正方阶段性结论",
+            f"{decision.reasoning_summary} 当前启发式标签倾向：{_verdict_label(decision.verdict)}。",
+        ]
+    )
+
+
+def _negative_challenge_report(bundle: EvidenceBundle, challenges: Sequence[str], affirmative_report: str) -> str:
+    evidence = bundle.evidence
+    challenge_text = "\n".join(f"- {item}" for item in challenges) if challenges else "- 暂未发现足以推翻主张的硬性反证。"
+    return "\n".join(
+        [
+            "## 反方质疑报告",
+            "### 1. 攻击链路真实性",
+            _negative_chain_challenge(evidence),
+            "### 2. 调用链与数据流交叉验证",
+            _negative_flow_challenge(evidence),
+            "### 3. 攻击前提是否过高",
+            _negative_prerequisite_challenge(evidence, challenges),
+            "### 4. 安全防护消减风险",
+            _negative_protection_challenge(evidence),
+            "### 5. 攻击影响是否被夸大",
+            _negative_impact_challenge(evidence),
+            "### 6. 待正方澄清的问题",
+            challenge_text,
+            "### 反方阶段性意见",
+            "正方必须证明报告位置、源码片段、调用链/数据流和影响归因均能闭环；否则结论应降级为误报或证据不足。",
+        ]
+    )
+
+
+def _affirmative_clarification_report(
+    bundle: EvidenceBundle, challenges: Sequence[str], round_index: int
+) -> str:
+    if not challenges:
+        clarification = "- 反方未提出实质性质疑，正方维持原证据报告。"
+    else:
+        clarification = "\n".join(f"- 质疑：{item}\n  澄清：{_clarification_for_challenge(bundle.evidence, item)}" for item in challenges)
+    return "\n".join(
+        [
+            f"## 正方第 {round_index} 回合澄清报告",
+            "### 逐项澄清",
+            clarification,
+            "### 结论修正",
+            _affirmative_reply_static(bundle, challenges),
+        ]
+    )
+
+
+def _negative_review_report(
+    bundle: EvidenceBundle, challenges: Sequence[str], clarification: str, round_index: int
+) -> str:
+    unresolved = [item for item in challenges if _challenge_still_material(bundle.evidence, item)]
+    unresolved_text = (
+        "\n".join(f"- {item}" for item in unresolved)
+        if unresolved
+        else "- 当前自动化证据中未保留足以继续阻断结论的实质性质疑。"
+    )
+    return "\n".join(
+        [
+            f"## 反方第 {round_index} 回合复审报告",
+            "### 已复审的正方澄清",
+            "正方澄清已按证据链重新检查；反方不接受未引用证据 ID 的新增事实。",
+            "### 仍未闭环的问题",
+            unresolved_text,
+            "### 反方复审意见",
+            _negative_review_summary(bundle.evidence, unresolved),
+        ]
+    )
+
+
+def _stage_context(stage: str, prior: str, challenges: Sequence[str], extra: str) -> str:
+    challenge_text = "\n".join(f"- {item}" for item in challenges) if challenges else "- 暂无已知阻断性质疑。"
+    parts = [f"阶段：{stage}", f"已知质疑：\n{challenge_text}"]
+    if prior:
+        parts.append(prior)
+    if extra:
+        parts.append(extra)
+    return "\n\n".join(parts)
+
+
+def _evidence_prompt(evidence: Sequence[CodeEvidence]) -> str:
+    lines: List[str] = []
+    snippet_count = 0
+    for item in evidence[:30]:
+        lines.append(
+            f"- {item.evidence_id} | {_evidence_kind_label(item.kind)}（{item.kind.value}） | "
+            f"{_evidence_strength_label(item.strength)}（{item.strength.value}） | 来源：{item.source} | {item.summary}"
+        )
+        if item.locations:
+            lines.append("  位置：" + " -> ".join(location.display() for location in item.locations[:8]))
+        if item.snippet and snippet_count < 8:
+            lines.append("  代码片段：\n```text\n" + item.snippet[:1200] + "\n```")
+            snippet_count += 1
+        data_excerpt = _data_excerpt(item)
+        if data_excerpt:
+            lines.append("  数据：" + data_excerpt)
+    if len(evidence) > 30:
+        lines.append(f"- 另有 {len(evidence) - 30} 条证据未展开。")
+    return "\n".join(lines) if lines else "无证据。"
+
+
+def _data_excerpt(item: CodeEvidence) -> str:
+    keys = (
+        "source_root",
+        "source_root_exists",
+        "source_root_is_dir",
+        "languages",
+        "atlas_database",
+        "atlas_database_exists",
+        "transport",
+        "mcp_tool",
+        "trace_kind",
+        "ok",
+        "partial_result",
+        "truncated_json",
+        "diagnostics",
+        "query_id",
+        "callers",
+        "callees",
+        "symbols",
+        "source_terms",
+        "sink_terms",
+        "terms",
+        "impacts",
+        "compile_database",
+        "code_flow_count",
+        "indexed_files",
+        "indexed_file_count",
+        "files_indexed",
+        "language_level",
+        "trace_supported",
+    )
+    pairs = []
+    for key in keys:
+        if key in item.data and item.data.get(key) not in (None, "", [], {}):
+            pairs.append(f"{key}={item.data.get(key)}")
+    return "; ".join(pairs)[:500]
+
+
+def _evidence_bullets(
+    evidence: Sequence[CodeEvidence], kinds: Optional[set[EvidenceKind]] = None, limit: int = 8
+) -> str:
+    selected = [item for item in evidence if kinds is None or item.kind in kinds]
+    bullets = []
+    for item in selected[:limit]:
+        location_text = ""
+        if item.locations:
+            location_text = "（" + " -> ".join(location.display() for location in item.locations[:5]) + "）"
+        bullets.append(f"- `{item.evidence_id}` {item.summary}{location_text}")
+    if len(selected) > limit:
+        bullets.append(f"- 另有 {len(selected) - limit} 条同类证据未展开。")
+    return "\n".join(bullets)
+
+
+def _flow_report(evidence: Sequence[CodeEvidence]) -> str:
+    flow_items = [
+        item
+        for item in evidence
+        if item.kind in {EvidenceKind.SARIF_CODE_FLOW, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN}
+    ]
+    lines = []
+    atlas_items = [item for item in evidence if _is_atlas_source(item)]
+    if atlas_items:
+        lines.append("- Atlas 证据：" + "; ".join(f"`{item.evidence_id}` {item.summary}" for item in atlas_items[:4]))
+        if _has_atlas_trace_unavailable(evidence):
+            lines.append("- Atlas 数据库/索引存在，但当前 CLI 未提供 trace 子命令，因此只能作为索引覆盖证据，不能作为数据流 trace。")
+    else:
+        lines.append("- 未获得 Atlas 证据；需要确认是否已安装 Atlas 并完成 `atlas index --analysis full`。")
+    if not flow_items:
+        lines.append("- 当前未建立源到汇数据流或函数调用链证据。")
+        return "\n".join(lines)
+    for item in flow_items[:8]:
+        locations = " -> ".join(location.display() for location in item.locations[:10]) if item.locations else "未展开位置"
+        symbols = item.data.get("symbols") or []
+        symbol_text = f"，符号：{', '.join(symbols)}" if symbols else ""
+        lines.append(f"- `{item.evidence_id}` {item.summary}；路径：{locations}{symbol_text}")
+    return "\n".join(lines)
+
+
+def _source_authenticity_report(evidence: Sequence[CodeEvidence]) -> str:
+    root_text = _evidence_bullets(evidence, {EvidenceKind.SOURCE_ROOT}) or "未看到任务源码根目录证据。"
+    location_text = _evidence_bullets(evidence, {EvidenceKind.SOURCE_LOCATION}) or "报告未提供可解析到源码的具体文件/行号。"
+    return root_text + "\n" + location_text
+
+
+def _attack_chain_report(bundle: EvidenceBundle) -> str:
+    evidence = bundle.evidence
+    steps = [
+        f"1. 报告入口：`{bundle.finding.rule_id}` 指出 {bundle.finding.message}，对应输入报告证据 {_join_ids(_ids(evidence, EvidenceKind.REPORT))}。",
+        "2. 源码定位：" + (_source_authenticity_report(evidence).replace("\n", "\n   ") or "未能定位真实源码。"),
+        "3. 传播/调用路径：" + (_flow_report(evidence).replace("\n", "\n   ") or "未建立路径。"),
+        "4. 危险操作或资产影响：" + _impact_assessment(evidence),
+    ]
+    if _has_protection(evidence):
+        steps.append("5. 防护限制：路径附近存在防护证据，攻击链必须证明这些控制无法覆盖该输入。")
+    else:
+        steps.append("5. 防护限制：当前证据链未识别到直接覆盖该路径的校验、鉴权、消毒或限流控制。")
+    return "\n".join(steps)
+
+
+def _attack_prerequisite_report(evidence: Sequence[CodeEvidence], challenges: Sequence[str]) -> str:
+    lines = [
+        "- 攻击者需要能够触发报告中的入口或向相关接口/参数提供输入。",
+        "- 需要源码定位和数据流/调用链证据能证明该输入到达危险汇点。",
+    ]
+    if _has_protection(evidence):
+        lines.append("- 若存在鉴权、校验、消毒、限流或策略控制，攻击者还需要满足或绕过这些控制。")
+    if _material_unresolved(challenges):
+        lines.append("- 当前仍存在阻断性质疑，攻击前提不能被视为完全闭环。")
+    return "\n".join(lines)
+
+
+def _poc_report(evidence: Sequence[CodeEvidence]) -> str:
+    if _has_meaningful_flow(evidence) and not _has_protection(evidence):
+        return "证据支持生成最小验证用例，但当前自动流程不生成可执行 EXP；建议在授权测试环境中基于入口参数构造最小非破坏性 PoC。"
+    return "证据尚不足以安全生成 PoC/EXP；应先补齐可达入口、数据流和防护有效性验证。"
+
+
+def _negative_chain_challenge(evidence: Sequence[CodeEvidence]) -> str:
+    if _all_primary_locations_invalid(evidence):
+        return "报告中的主位置无法在源码树中解析，攻击链从第一步开始不成立。"
+    if not _has_valid_location(evidence):
+        if _has_source_root(evidence):
+            return "任务源码根目录已配置，但尚未确认该发现对应的具体源码片段，需防止 SARIF/Markdown 报告缺少位置或与源码版本不一致。"
+        return "尚未确认报告位置对应真实源码片段，需防止 SARIF/Markdown 报告与源码版本不一致。"
+    return "源码位置存在，但仍需确认这些位置处于真实可调用路径，而非死代码或测试代码。"
+
+
+def _negative_flow_challenge(evidence: Sequence[CodeEvidence]) -> str:
+    if _has_meaningful_flow(evidence):
+        return "已存在较强路径/数据流证据；反方仍需检查每个步骤是否同版本、同函数上下文且无跳跃断点。"
+    return "未看到已验证的端到端调用链或源到汇数据流，不能只凭单行危险 API 推断真实漏洞。"
+
+
+def _negative_prerequisite_challenge(evidence: Sequence[CodeEvidence], challenges: Sequence[str]) -> str:
+    if _material_unresolved(challenges):
+        return "攻击前提仍依赖未闭环的路径或工具证据，真实场景中可能不存在可触发入口。"
+    return "攻击前提看起来不过分，但仍要确认外部接口、认证态、租户边界和输入可控性。"
+
+
+def _negative_protection_challenge(evidence: Sequence[CodeEvidence]) -> str:
+    if _has_protection(evidence):
+        return "源码附近存在可能的鉴权、校验、消毒或限流证据，正方必须证明这些控制无法消减该风险。"
+    return "当前证据未发现直接防护，但反方仍要求结合项目知识库确认全局中间件、网关或权限策略。"
+
+
+def _negative_impact_challenge(evidence: Sequence[CodeEvidence]) -> str:
+    impacts = [item for item in evidence if item.kind in {EvidenceKind.IMPACT, EvidenceKind.PROJECT_CONTEXT}]
+    if not impacts:
+        return "未看到价值资产、权限边界或业务影响证据，不能扩大影响。"
+    return "影响只能归因于漏洞技术路径本身；不得把社会工程、凭证窃取后的横向移动等后续非直接路径计入直接影响。"
+
+
+def _clarification_for_challenge(evidence: Sequence[CodeEvidence], challenge: str) -> str:
+    if "源码" in challenge or "位置" in challenge or "解析" in challenge:
+        return "源码真实性依据为：" + _source_authenticity_report(evidence)
+    if "数据流" in challenge or "调用" in challenge or "路径" in challenge:
+        return _flow_report(evidence)
+    if "防护" in challenge or "校验" in challenge or "鉴权" in challenge or "消毒" in challenge:
+        return _protection_assessment(evidence)
+    if "影响" in challenge or "资产" in challenge:
+        return _impact_assessment(evidence)
+    if "编译数据库" in challenge or "C++" in challenge:
+        return "C++ 语义分析依赖 compile_commands.json；缺少时 Atlass MCP 的 calls/search 仍可提供调用图证据，结合源码片段可手动重构数据流路径，不应直接断言证据不足。"
+    return "该质疑需要人工复核；当前自动证据不能新增未采集事实，但可从已有调用图、源码片段和符号引用中交叉验证。"
+
+
+def _affirmative_reply_static(bundle: EvidenceBundle, challenges: Sequence[str]) -> str:
+    evidence = bundle.evidence
+    replies = []
+    if _has_valid_location(evidence):
+        replies.append("源码位置已被确认存在，源码片段可交叉验证。")
+    if _has_meaningful_flow(evidence):
+        replies.append("已存在调用链/数据流证据，可从调用方-被调用方重构完整攻击路径。")
+    else:
+        replies.append("虽无直接数据流，但应尝试从调用图、源码片段和符号交叉引用手动拼接路径，而非直接降低结论强度。")
+    if _has_protection(evidence):
+        replies.append("存在防护迹象，需结合源码片段分析其实际有效性；若防护不足，风险仍可成立。")
+    if _has_impact(evidence):
+        replies.append("影响分析可从证据链中的调用链和项目上下文中进一步归因到具体汇点。")
+    return " ".join(replies)
+
+
+def _challenge_still_material(evidence: Sequence[CodeEvidence], challenge: str) -> bool:
+    if "无法" in challenge or "位置" in challenge:
+        return not _has_valid_location(evidence)
+    if "数据流" in challenge or "调用" in challenge or "路径" in challenge or "尚未建立" in challenge:
+        return not _has_meaningful_flow(evidence)
+    if "编译数据库" in challenge or "C++" in challenge:
+        return _has_cpp_compile_gap(evidence)
+    if "防护" in challenge:
+        return _has_protection(evidence)
+    if "影响" in challenge:
+        return not _has_impact(evidence)
+    return _material_unresolved([challenge])
+
+
+def _negative_review_summary(evidence: Sequence[CodeEvidence], unresolved: Sequence[str]) -> str:
+    if unresolved:
+        return "仍存在影响结论成立的断点，反方暂不接受正方完全成立的漏洞结论。"
+    if _has_meaningful_flow(evidence) and not _has_protection(evidence):
+        return "在当前证据下，反方接受攻击链基本成立，但保留对业务前提的人工复核要求。"
+    return "正方澄清降低了部分不确定性，但自动证据仍不足以直接定性。"
+
+
+def _fallback_side_conclusion(
+    role: str, bundle: EvidenceBundle, decision: DebateDecision, challenges: Sequence[str]
+) -> Tuple[str, Verdict, str]:
+    evidence = bundle.evidence
+    if _all_primary_locations_invalid(evidence):
+        return "误报", Verdict.FALSE_POSITIVE, "报告位置无法映射到当前源码版本，不能证明漏洞真实存在。"
+    if _has_cpp_compile_gap(evidence) and not _has_meaningful_flow(evidence):
+        return "证据不足", Verdict.INCONCLUSIVE, "C++ 发现缺少编译数据库支撑，无法确认完整数据流或调用链。"
+    if role == "AFFIRMATIVE":
+        if _has_meaningful_flow(evidence) and not _has_protection(evidence):
+            return "真实漏洞", Verdict.TRUE_POSITIVE, "报告、源码位置和数据流/调用链证据形成闭环，当前未识别到有效防护。"
+        if _has_meaningful_flow(evidence) and _has_protection(evidence):
+            return "真实漏洞", Verdict.TRUE_POSITIVE, "攻击路径存在较强证据，但防护是否足以消减风险仍需重点验证。"
+        if _has_protection(evidence) and not _has_meaningful_flow(evidence):
+            return "证据不足", Verdict.INCONCLUSIVE, "源码存在但端到端路径不足，且附近防护可能消减风险。"
+        return "证据不足", Verdict.INCONCLUSIVE, "当前只能确认部分源码或局部源汇迹象，尚未证明完整攻击链。"
+    if _has_meaningful_flow(evidence) and not _has_protection(evidence) and not _material_unresolved(challenges):
+        return "真实漏洞", Verdict.TRUE_POSITIVE, "反方未发现能推翻路径真实性、防护缺失或直接影响的证据。"
+    if _has_protection(evidence) and not _has_meaningful_flow(evidence):
+        return "误报", Verdict.FALSE_POSITIVE, "缺少可验证攻击路径，且源码附近已有可能消减风险的控制。"
+    if decision.verdict == Verdict.FALSE_POSITIVE:
+        return "误报", Verdict.FALSE_POSITIVE, decision.reasoning_summary
+    return "证据不足", Verdict.INCONCLUSIVE, "仍存在路径可达性、防护有效性或影响归因未闭环的问题。"
+
+
+def _clean_final_statement(text: str, label: str) -> str:
+    cleaned = text.strip()
+    cleaned = cleaned.replace(f"【{label}】", "").strip(" ，,;；\n")
+    cleaned = cleaned.replace(f"{label}，", "").replace(f"{label}:", "").replace(f"{label}：", "").strip()
+    lines = [line.strip("# -*\t ") for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    statement = " ".join(lines[:3]).strip()
+    return statement[:500]
+
+
+def _final_conclusion(affirmative: SideConclusion, negative: SideConclusion) -> str:
+    if affirmative.label == negative.label:
+        return f"【{affirmative.label}】，{affirmative.statement}；{negative.statement}"
+    return f"存在分歧。正方【{affirmative.label}】，{affirmative.statement}；反方【{negative.label}】，{negative.statement}"
+
+
+def _decision_from_conclusions(
+    base: DebateDecision, affirmative: SideConclusion, negative: SideConclusion, final_conclusion: str
+) -> DebateDecision:
+    if affirmative.verdict == negative.verdict:
+        return DebateDecision(
+            verdict=affirmative.verdict,
+            confidence=base.confidence,
+            disputed_points=base.disputed_points,
+            reasoning_summary=final_conclusion,
+            recommended_next_steps=base.recommended_next_steps,
+        )
+    disputed = list(base.disputed_points)
+    disputed.append("正方和反方最终结论标签不一致。")
+    return DebateDecision(
+        verdict=Verdict.INCONCLUSIVE,
+        confidence=min(base.confidence, 0.5),
+        disputed_points=disputed,
+        reasoning_summary=final_conclusion,
+        recommended_next_steps=base.recommended_next_steps + ["人工复核正反方分歧点后再定性。"],
+    )
+
+
+def _can_reach_consensus(base_decision: DebateDecision, unresolved: Sequence[str]) -> bool:
+    return base_decision.verdict != Verdict.INCONCLUSIVE and not _material_unresolved(unresolved)
+
+
+def _join_ids(ids: Sequence[str]) -> str:
+    return ", ".join(f"`{item}`" for item in ids) if ids else "无"
+
+
 def _ids(evidence: Iterable[CodeEvidence], *kinds: EvidenceKind) -> List[str]:
     accepted = set(kinds)
     return [item.evidence_id for item in evidence if item.kind in accepted]
@@ -285,12 +831,35 @@ def _by_kind(evidence: Iterable[CodeEvidence]) -> Dict[EvidenceKind, List[CodeEv
 
 
 def _all_primary_locations_invalid(evidence: Sequence[CodeEvidence]) -> bool:
+    if _has_atlas_indexed_files(evidence):
+        return False
     locations = [item for item in evidence if item.kind == EvidenceKind.SOURCE_LOCATION]
     return bool(locations) and all(not item.data.get("line_exists") for item in locations)
 
 
 def _has_valid_location(evidence: Sequence[CodeEvidence]) -> bool:
-    return any(item.kind == EvidenceKind.SOURCE_LOCATION and item.data.get("line_exists") for item in evidence)
+    return any(item.kind == EvidenceKind.SOURCE_LOCATION and item.data.get("line_exists") for item in evidence) or _has_atlas_indexed_files(evidence)
+
+
+def _has_source_root(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(
+        item.kind == EvidenceKind.SOURCE_ROOT
+        and item.data.get("source_root_exists")
+        and item.data.get("source_root_is_dir")
+        for item in evidence
+    )
+
+
+def _has_atlas_indexed_files(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(item.kind == EvidenceKind.SOURCE_LOCATION and _is_atlas_source(item) and item.data.get("indexed_files") for item in evidence)
+
+
+def _has_atlas_trace_unavailable(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(_is_atlas_source(item) and item.data.get("trace_supported") is False for item in evidence)
+
+
+def _is_atlas_source(item: CodeEvidence) -> bool:
+    return item.source.startswith("atlas")
 
 
 def _has_meaningful_flow(evidence: Sequence[CodeEvidence]) -> bool:
@@ -301,13 +870,13 @@ def _has_meaningful_flow(evidence: Sequence[CodeEvidence]) -> bool:
             EvidenceStrength.STRONG,
             EvidenceStrength.MEDIUM,
         }:
-            if item.source != "source-indexer":
+            if item.source != "code-search":
                 return True
     return False
 
 
 def _has_weak_source_sink(evidence: Sequence[CodeEvidence]) -> bool:
-    return any(item.kind == EvidenceKind.DATA_FLOW and item.source == "source-indexer" for item in evidence)
+    return any(item.kind == EvidenceKind.DATA_FLOW and item.source == "code-search" for item in evidence)
 
 
 def _has_protection(evidence: Sequence[CodeEvidence]) -> bool:
@@ -325,7 +894,7 @@ def _has_project_context(evidence: Sequence[CodeEvidence]) -> bool:
 def _has_cpp_compile_gap(evidence: Sequence[CodeEvidence]) -> bool:
     return any(
         item.kind == EvidenceKind.TOOL_DIAGNOSTIC
-        and item.source == "source-indexer"
+        and item.source == "code-search"
         and item.data.get("compile_database") is None
         and "compile_commands.json" in item.summary
         for item in evidence
@@ -389,6 +958,8 @@ def _verdict_label(verdict: Verdict) -> str:
 
 def _evidence_kind_label(kind: EvidenceKind) -> str:
     labels = {
+        EvidenceKind.REPORT: "输入报告",
+        EvidenceKind.SOURCE_ROOT: "源码根目录",
         EvidenceKind.SOURCE_LOCATION: "源码位置",
         EvidenceKind.SARIF_CODE_FLOW: "SARIF 代码流",
         EvidenceKind.CALL_CHAIN: "调用链",

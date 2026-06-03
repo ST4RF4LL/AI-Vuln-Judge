@@ -34,6 +34,51 @@ uv run vuln-judger run \
 默认情况下，博弈过程是确定性的、证据约束的。配置 OpenAI 兼容 Provider 并使用 `--llm`
 后，可以让模型生成正方/反方回合，最终结论仍由证据规则约束。
 
+## 博弈流程
+
+每个发现会按固定协议生成多轮中文 Markdown 博弈记录：
+
+1. 正方提交完整证据报告：从 SARIF/Markdown 输入报告开始，引用源码位置、代码片段、
+   Atlas 或本地 rg/grep 检索证据，说明调用链、数据流、攻击链、
+   攻击前提、限制、防护消减和直接攻击影响。证据不足时必须明确降级。
+2. 反方提交质疑报告：复核攻击链真实性、调用链/数据流断点、攻击前提是否过高、
+   源码或知识库中的安全防护，以及攻击影响是否被非技术路径夸大。
+3. 正方逐项澄清，反方继续复审；直到质疑闭环，或达到 `--max-rounds` 上限。
+4. 双方各自输出唯一结论标签：`误报`、`真实漏洞`、`证据不足`。最终结论格式为
+   `【结论标签】，正方结案陈述；反方结案陈述`。如果双方标签不一致，最终结论会标记为
+   `存在分歧`，并将整体结论降级为 `INCONCLUSIVE`。
+
+Atlas 证据优先检查 `.atlas/atlas.db`。缺少数据库时，报告会提示执行
+`atlas index --analysis full`；启用 `--auto-index-tools` 时会自动尝试 full analysis 索引。
+检测到新版 Atlas 的 `mcp` 子命令后，平台会优先通过 `atlas mcp --project <源码目录>`
+调用 `project/status`、`project/files`、`trace`、`search` 和 `calls` 工具，生成
+`atlas-mcp` 来源的源码真实性、数据流和调用图证据。MCP 不可用时才回退到 CLI
+`status/files` 诊断；旧版 `atlas trace` CLI 不再作为主路径。
+
+## MCP 和 Skills 管理
+
+MCP Server 配置默认存储在 `.vuln-judger/mcp.json`，示例文件为
+`.vuln-judger/mcp.json.example`。默认 Atlas 配置如下：
+
+```json
+{
+  "id": "atlas-default",
+  "kind": "atlas",
+  "transport": "stdio",
+  "command": "atlas",
+  "args": ["mcp", "--project", "{project}", "--log-format", "json"],
+  "cwd": "{project}",
+  "enabled": true
+}
+```
+
+Skill Source 配置默认存储在 `.vuln-judger/skills.json`，示例文件为
+`.vuln-judger/skills.json.example`。Skill Source 用于管理项目知识库目录；启动任务时可在
+Web 端选择 Skill Source，或继续手动填写 `skills_path`。
+
+Web 端右上角提供 `MCP / Skills` 配置入口，支持 MCP Server 保存、删除、默认 Atlas MCP
+选择、连通性测试，以及 Skill Source 保存、删除、默认知识库选择和加载测试。
+
 ## LLM 提供商
 
 提供商配置默认存储在 `.vuln-judger/providers.json`。当前仅支持 OpenAI 兼容的
@@ -125,12 +170,14 @@ uv run vuln-judger api \
   --records-dir .vuln-judger/runs \
   --providers-file .vuln-judger/providers.json \
   --agents-dir agents \
+  --mcp-servers-file .vuln-judger/mcp.json \
+  --skills-file .vuln-judger/skills.json \
   --log-file .vuln-judger/logs/vuln-judger.log
 ```
 
 打开 http://127.0.0.1:8765 查看保存的研判记录。页面提供运行历史、结论统计、发现摘要、
 证据链、博弈过程、防护分析、影响分析、LLM 提供商配置、正反方默认提供商选择、
-提供商连通性测试，以及正反方 Agent 配置管理。
+提供商连通性测试、正反方 Agent 配置管理，以及 MCP / Skill Source 配置管理。
 
 默认日志文件为 `.vuln-judger/logs/vuln-judger.log`，会记录 API 启动、任务创建、后台任务
 执行、LLM 请求状态、Provider 连通性测试和异常 traceback。日志文件会自动轮转，且已被

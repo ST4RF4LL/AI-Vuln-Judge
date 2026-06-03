@@ -14,7 +14,10 @@ class RunRecordStore:
 
     def save(self, report: RunReport) -> Dict[str, Any]:
         payload = to_jsonable(report)
-        path = self._path(report.run_id)
+        return self.save_payload(payload)
+
+    def save_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        path = self._path(str(payload.get("run_id") or "run-unknown"))
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return payload
 

@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -9,15 +10,19 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 
+from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
 from vuln_judger.api import app_html, make_handler
 from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
 from vuln_judger.llm import LLMClient
-from vuln_judger.models import AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, RunConfig, Verdict, to_jsonable
+from vuln_judger.mcp_config import MCPServerStore
+from vuln_judger.models import AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, Finding, RunConfig, SourceLocation, Verdict, to_jsonable
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunRecordStore
+from vuln_judger.skills import SkillSourceStore
+from vuln_judger.source import SourceIndexer
 
 
 class PipelineTests(unittest.TestCase):
@@ -75,6 +80,189 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(report.reports[0].rule_id, "python-command-injection")
             self.assertEqual(report.reports[0].source_locations[0].file, "app.py")
             self.assertEqual(report.reports[0].verdict, Verdict.TRUE_POSITIVE)
+
+    def test_markdown_cpp_paths_keep_full_extension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "faiss" / "impl").mkdir(parents=True)
+            (root / "faiss" / "impl" / "index_read.cpp").write_text("void read_index() {}\n", encoding="utf-8")
+            (root / "faiss" / "IndexFastScan.cpp").write_text("void compute_quantized_LUT() {}\n", encoding="utf-8")
+            markdown = root / "report.md"
+            markdown.write_text(
+                "\n".join(
+                    [
+                        "# FAISS report",
+                        "",
+                        "## Affected Code",
+                        "",
+                        "- `faiss/impl/index_read.cpp`: additive fast-scan deserialization branches",
+                        "- `faiss/IndexFastScan.cpp`: `IndexFastScan::compute_quantized_LUT()`",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=markdown,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            )
+            locations = [location.file for location in report.reports[0].source_locations]
+            self.assertEqual(locations, ["faiss/impl/index_read.cpp", "faiss/IndexFastScan.cpp"])
+            source_evidence = [
+                item for item in report.reports[0].evidence_chain if item.kind == EvidenceKind.SOURCE_LOCATION
+            ]
+            self.assertTrue(all(item.data["line_exists"] for item in source_evidence))
+
+    def test_atlas_indexed_files_do_not_report_missing_database(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.py"
+            source.write_text("def handler(): pass\n", encoding="utf-8")
+            (root / ".atlas").mkdir()
+            (root / ".atlas" / "atlas.db").write_text("fake", encoding="utf-8")
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-atlas",
+                rule_id="python-demo",
+                message="demo",
+                level="warning",
+                locations=[SourceLocation("app.py", 1)],
+            )
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["python"]),
+                AnalyzerSettings(enabled=True),
+            )
+            summaries = "\n".join(item.summary for item in evidence)
+            self.assertIn("检测到 Atlas 数据库", summaries)
+            self.assertIn("Atlas MCP project/status 确认索引可用", summaries)
+            self.assertIn("Atlas MCP project/files 确认索引中包含报告源码文件", summaries)
+            self.assertNotIn("缺少 .atlas/atlas.db", summaries)
+            self.assertTrue(any(item.data.get("mcp_success") for item in evidence))
+
+    def test_atlas_mcp_produces_trace_and_call_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".atlas").mkdir()
+            (root / ".atlas" / "atlas.db").write_text("fake", encoding="utf-8")
+            (root / "app.py").write_text(
+                "\n".join(
+                    [
+                        "import os",
+                        "def handler(request):",
+                        "    cmd = request.args['cmd']",
+                        "    os.system(cmd)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-atlas-mcp",
+                rule_id="python-command-injection",
+                message="用户输入可到达命令执行点",
+                level="error",
+                locations=[SourceLocation("app.py", 4, 5)],
+            )
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["python"]),
+                AnalyzerSettings(enabled=True),
+            )
+            summaries = "\n".join(item.summary for item in evidence)
+            self.assertIn("Atlas MCP project/status 确认索引可用", summaries)
+            self.assertIn("Atlas MCP project/files 确认索引中包含报告源码文件", summaries)
+            self.assertIn("Atlas MCP trace variable 返回 ok=True", summaries)
+            self.assertIn("Atlas MCP calls 提取 `handler` 调用图", summaries)
+            self.assertTrue(any(item.kind == EvidenceKind.DATA_FLOW and item.source == "atlas-mcp" for item in evidence))
+            self.assertTrue(any(item.kind == EvidenceKind.CALL_CHAIN and item.source == "atlas-mcp" for item in evidence))
+            self.assertNotIn("当前 Atlas CLI 未提供 trace 子命令", summaries)
+
+    def test_debate_outputs_structured_reports_and_final_conclusion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, skills = write_python_fixture(root)
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    skills_path=skills,
+                    enable_external_tools=False,
+                )
+            )
+            finding = report.reports[0]
+            self.assertTrue(any(item.kind == EvidenceKind.REPORT for item in finding.evidence_chain))
+            self.assertTrue(any(item.kind == EvidenceKind.SOURCE_ROOT for item in finding.evidence_chain))
+            self.assertIn("正方证据报告", finding.debate[0].claim)
+            self.assertIn("攻击链", finding.debate[0].claim)
+            self.assertIn("攻击前提", finding.debate[0].claim)
+            self.assertIn("攻击影响", finding.debate[0].claim)
+            self.assertIn("反方质疑报告", finding.debate[1].claim)
+            self.assertTrue(finding.final_conclusion.startswith("【真实漏洞】"))
+            self.assertEqual(finding.debate[-1].claim, finding.final_conclusion)
+
+    def test_markdown_without_locations_still_passes_source_root_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report_path = root / "summary.md"
+            report_path.write_text(
+                "\n".join(
+                    [
+                        "# 静态分析总结",
+                        "",
+                        "## Summary",
+                        "",
+                        "- 规则：faiss-deserialization-risk",
+                        "- 严重性：warning",
+                        "- 消息：发现 IndexAdditiveQuantizerFastScan 可能存在反序列化风险，但报告未给出源码路径。",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=report_path,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            )
+            finding = report.reports[0]
+            source_root = next(item for item in finding.evidence_chain if item.kind == EvidenceKind.SOURCE_ROOT)
+            self.assertEqual(source_root.data["source_root"], str(root.resolve()))
+            self.assertTrue(source_root.data["source_root_exists"])
+            self.assertIn(source_root.evidence_id, finding.debate[0].evidence_ids)
+            self.assertIn("任务源码根目录已配置", finding.debate[0].claim)
+            self.assertIn("报告未提供可解析到源码的具体文件/行号", finding.debate[0].claim)
+
+    def test_run_judgement_emits_progressive_debate_snapshots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, skills = write_python_fixture(root)
+            snapshots = []
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    skills_path=skills,
+                    enable_external_tools=False,
+                ),
+                progress_callback=lambda item: snapshots.append(to_jsonable(item)),
+            )
+            debate_lengths = [
+                len(snapshot["reports"][0]["debate"])
+                for snapshot in snapshots
+                if snapshot.get("reports") and snapshot["reports"][0].get("debate")
+            ]
+            self.assertGreaterEqual(len(debate_lengths), 3)
+            self.assertEqual(debate_lengths[0], 1)
+            self.assertEqual(debate_lengths[-1], len(report.reports[0].debate))
+            self.assertEqual(snapshots[-1]["reports"][0]["final_conclusion"], report.reports[0].final_conclusion)
 
     def test_record_store_saves_and_lists_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,6 +347,15 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('id="provider-panel"', html)
         self.assertIn('id="open-agent-prompts"', html)
         self.assertIn('id="agent-prompts-modal"', html)
+        self.assertIn('id="open-integrations"', html)
+        self.assertIn('id="integrations-modal"', html)
+        self.assertIn('id="mcp-server-panel"', html)
+        self.assertIn('id="skill-source-panel"', html)
+        self.assertIn('id="mcp-list"', html)
+        self.assertIn('id="skill-list"', html)
+        self.assertIn('id="default-atlas-mcp"', html)
+        self.assertIn('id="default-skill-source"', html)
+        self.assertIn('id="run-skill-source"', html)
         self.assertIn('id="agent-affirmative-profile-panel"', html)
         self.assertIn('id="agent-negative-profile-panel"', html)
         self.assertIn('#agent-affirmative-profile-panel', html)
@@ -174,9 +371,21 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('function renderMarkdown(value)', html)
         self.assertIn('class="markdown-body"', html)
         self.assertIn('renderMarkdown(turn.claim)', html)
+        self.assertIn('final_conclusion', html)
+        self.assertIn("REPORT: '输入报告'", html)
+        self.assertIn('ensurePolling(runId)', html)
+        self.assertIn('renderFindingsSection(findings)', html)
+        self.assertIn('每完成一次 LLM 对话', html)
         self.assertIn("replace(/\\r\\n?/g, '\\n')", html)
         self.assertIn('data-run-delete="true"', html)
         self.assertIn('async function deleteRun(runId)', html)
+        self.assertIn('data-run-stop="true"', html)
+        self.assertIn('async function stopRun(runId)', html)
+        self.assertIn('function isTerminalStatus(status)', html)
+        self.assertIn("stopped: '已停止'", html)
+        self.assertIn("SOURCE_ROOT: '源码根目录'", html)
+        self.assertIn("fetchJson('/mcp-servers')", html)
+        self.assertIn("fetchJson('/skill-sources')", html)
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -358,6 +567,138 @@ class PipelineTests(unittest.TestCase):
                 api_server.shutdown()
                 api_server.server_close()
                 api_thread.join(timeout=5)
+
+    def test_api_mcp_and_skill_management(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, skills = write_python_fixture(root)
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            store = RunRecordStore(root / "records")
+            provider_store = ProviderStore(root / "providers.json")
+            agent_store = AgentDirectoryStore(root / "agents")
+            mcp_store = MCPServerStore(root / "mcp.json")
+            skill_store = SkillSourceStore(root / "skills.json")
+            api_server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                make_handler(store, provider_store, agent_store, mcp_store, skill_store),
+            )
+            api_thread = Thread(target=api_server.serve_forever, daemon=True)
+            api_thread.start()
+            base = f"http://127.0.0.1:{api_server.server_port}"
+            try:
+                mcp = post_json(
+                    f"{base}/mcp-servers",
+                    {
+                        "id": "atlas-test",
+                        "name": "Atlas Test",
+                        "kind": "atlas",
+                        "command": str(atlas),
+                        "args": ["mcp", "--project", "{project}"],
+                        "cwd": "{project}",
+                        "enabled": True,
+                    },
+                )
+                self.assertEqual(mcp["id"], "atlas-test")
+                defaults = post_json(f"{base}/mcp-servers/defaults", {"atlas": "atlas-test"})
+                self.assertEqual(defaults["atlas"], "atlas-test")
+                mcp_test = post_json(f"{base}/mcp-servers/atlas-test/test", {"project_path": str(root)})
+                self.assertTrue(mcp_test["ok"])
+                self.assertIn("trace", mcp_test["tools"])
+                skill = post_json(
+                    f"{base}/skill-sources",
+                    {
+                        "id": "demo-skills",
+                        "name": "Demo Skills",
+                        "path": str(skills),
+                        "description": "demo",
+                        "enabled": True,
+                        "starred": True,
+                    },
+                )
+                self.assertEqual(skill["id"], "demo-skills")
+                skill_defaults = post_json(f"{base}/skill-sources/defaults", {"project": "demo-skills"})
+                self.assertEqual(skill_defaults["project"], "demo-skills")
+                skill_test = post_json(f"{base}/skill-sources/demo-skills/test", {})
+                self.assertTrue(skill_test["ok"])
+                self.assertEqual(skill_test["fact_count"], 1)
+                created = post_json(
+                    f"{base}/runs",
+                    {
+                        "report_path": str(sarif),
+                        "source_path": str(root),
+                        "skill_source_id": "demo-skills",
+                        "enable_external_tools": False,
+                    },
+                )
+                run = wait_for_run_completed(base, created["run_id"])
+                self.assertEqual(run["project_context_facts"], 1)
+                with urllib.request.urlopen(f"{base}/mcp-servers", timeout=5) as response:
+                    mcp_servers = json.loads(response.read().decode("utf-8"))
+                self.assertTrue(any(item["id"] == "atlas-test" for item in mcp_servers))
+                delete_skill = urllib.request.Request(f"{base}/skill-sources/demo-skills", method="DELETE")
+                with urllib.request.urlopen(delete_skill, timeout=5) as response:
+                    deleted = json.loads(response.read().decode("utf-8"))
+                self.assertTrue(deleted["deleted"])
+            finally:
+                api_server.shutdown()
+                api_server.server_close()
+                api_thread.join(timeout=5)
+
+    def test_api_can_stop_running_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, skills = write_python_fixture(root)
+            llm_server = ThreadingHTTPServer(("127.0.0.1", 0), SlowFakeOpenAIHandler)
+            llm_thread = Thread(target=llm_server.serve_forever, daemon=True)
+            llm_thread.start()
+            store = RunRecordStore(root / "records")
+            provider_store = ProviderStore(root / "providers.json")
+            provider_store.upsert(
+                {
+                    "id": "slow",
+                    "name": "Slow",
+                    "endpoint": f"http://127.0.0.1:{llm_server.server_port}/v1/chat/completions",
+                    "model": "fake-model",
+                    "api_key": "secret",
+                }
+            )
+            provider_store.set_defaults("slow", "slow")
+            api_server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(store, provider_store))
+            api_thread = Thread(target=api_server.serve_forever, daemon=True)
+            api_thread.start()
+            base = f"http://127.0.0.1:{api_server.server_port}"
+            try:
+                created = post_json(
+                    f"{base}/runs",
+                    {
+                        "report_path": str(sarif),
+                        "source_path": str(root),
+                        "skills_path": str(skills),
+                        "enable_external_tools": False,
+                        "enable_llm": True,
+                        "max_rounds": 4,
+                    },
+                )
+                stop = post_json(f"{base}/runs/{created['run_id']}/stop", {})
+                self.assertEqual(stop["status"], "stopping")
+                stopped = wait_for_run_status(base, created["run_id"], {"stopped"})
+                self.assertEqual(stopped["status"], "stopped")
+                with urllib.request.urlopen(f"{base}/runs", timeout=5) as response:
+                    runs = json.loads(response.read().decode("utf-8"))
+                saved = next(item for item in runs if item["run_id"] == created["run_id"])
+                self.assertEqual(saved["status"], "stopped")
+                with urllib.request.urlopen(f"{base}/runs/{created['run_id']}/findings", timeout=5) as response:
+                    findings = json.loads(response.read().decode("utf-8"))
+                self.assertIsInstance(findings, list)
+            finally:
+                api_server.shutdown()
+                api_server.server_close()
+                api_thread.join(timeout=5)
+                llm_server.shutdown()
+                llm_server.server_close()
+                llm_thread.join(timeout=5)
 
     def test_affirmative_and_negative_use_independent_clients(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -671,6 +1012,115 @@ def write_python_fixture(root: Path):
     return sarif, skills
 
 
+def fake_atlas_mcp_script():
+    return r'''#!/usr/bin/env python3
+import json
+import sys
+
+if "--help" in sys.argv:
+    print("Commands:")
+    print("  mcp     Start MCP server")
+    sys.exit(0)
+
+if len(sys.argv) < 2 or sys.argv[1] != "mcp":
+    sys.exit(2)
+
+TOOLS = [{"name": name} for name in ("project", "trace", "search", "calls")]
+
+def send(message):
+    print(json.dumps(message, separators=(",", ":")), flush=True)
+
+def tool_response(request_id, payload, is_error=False):
+    send({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(payload, separators=(",", ":"))}],
+            "isError": is_error,
+        },
+    })
+
+for raw in sys.stdin:
+    if not raw.strip():
+        continue
+    message = json.loads(raw)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "atlas-mcp", "version": "fake"},
+            },
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}})
+    elif method == "tools/call":
+        params = message.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if name == "project" and args.get("action") == "status":
+            tool_response(request_id, {
+                "summary": {"files": 1, "symbols": 1, "edges": 2},
+                "project": {"db_path": ".atlas/atlas.db"},
+                "server": {"atlas_version": "fake", "tool_contract_version": 1},
+                "language_capabilities": [{"language": "python", "capability_level": "dataflow_full"}],
+            })
+        elif name == "project" and args.get("action") == "files":
+            path = args.get("path_prefix", "app.py")
+            tool_response(request_id, {"files": [{"path": path, "language": "python", "status": "success"}]})
+        elif name == "trace":
+            tool_response(request_id, {
+                "ok": True,
+                "partial_result": False,
+                "diagnostics": [],
+                "query_id": "q_fake",
+                "kind": "trace_" + args.get("kind", "unknown"),
+                "capability": {"language": "python", "capability_level": "dataflow_full"},
+                "result": {"path": [{"file": "app.py", "line": 3}, {"file": "app.py", "line": 4}]},
+            })
+        elif name == "search":
+            tool_response(request_id, {
+                "results": [{
+                    "name": "handler",
+                    "qualified_name": "handler",
+                    "kind": "function",
+                    "file": "app.py",
+                    "line": 2,
+                }]
+            })
+        elif name == "calls":
+            tool_response(request_id, {
+                "hops": [{
+                    "depth": 1,
+                    "callers": [{
+                        "qualified_name": "route",
+                        "name": "route",
+                        "kind": "function",
+                        "file": "app.py",
+                        "line": 1,
+                        "edge": "calls",
+                    }],
+                    "callees": [{
+                        "qualified_name": "os.system",
+                        "name": "system",
+                        "kind": "function",
+                        "file": "app.py",
+                        "line": 4,
+                        "edge": "calls",
+                    }],
+                }]
+            })
+        else:
+            tool_response(request_id, {"error": "unknown tool"}, True)
+'''
+
+
 def post_json(url, payload):
     request = urllib.request.Request(
         url,
@@ -693,6 +1143,18 @@ def wait_for_run_completed(base, run_id):
     raise AssertionError(f"run did not complete: {run_id}")
 
 
+def wait_for_run_status(base, run_id, statuses):
+    for _ in range(80):
+        with urllib.request.urlopen(f"{base}/runs/{run_id}", timeout=5) as response:
+            run = json.loads(response.read().decode("utf-8"))
+        if run.get("status") in statuses:
+            return run
+        if run.get("status") == "failed":
+            raise AssertionError(run.get("error"))
+        time.sleep(0.1)
+    raise AssertionError(f"run did not reach {statuses}: {run_id}")
+
+
 class FakeOpenAIHandler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("content-length") or 0)
@@ -711,6 +1173,12 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):  # noqa: A002
         return
+
+
+class SlowFakeOpenAIHandler(FakeOpenAIHandler):
+    def do_POST(self):  # noqa: N802
+        time.sleep(0.25)
+        super().do_POST()
 
 
 class FakeLLM(LLMClient):

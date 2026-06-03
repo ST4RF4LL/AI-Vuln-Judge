@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -29,7 +30,7 @@ class OpenAICompatibleLLM(LLMClient):
     api_key: str
     model: str
     endpoint: str = "https://api.openai.com/v1/chat/completions"
-    timeout_seconds: int = 45
+    timeout_seconds: int = 120
     extra_json: Dict[str, Any] = field(default_factory=dict)
     provider_id: Optional[str] = None
     provider_name: Optional[str] = None
@@ -72,9 +73,17 @@ class OpenAICompatibleLLM(LLMClient):
                 body[:500],
             )
             return _failure(exc.code, started, f"HTTP {exc.code}: {body[:500]}")
-        except (urllib.error.URLError, TimeoutError) as exc:
+        except urllib.error.URLError as exc:
             LOG.warning(
                 "LLM 网络错误 provider=%s latency_ms=%s error=%s",
+                self.provider_id or self.provider_name or "unknown",
+                _latency_ms(started),
+                exc,
+            )
+            return _failure(None, started, str(exc))
+        except (socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+            LOG.warning(
+                "LLM 连接错误 provider=%s latency_ms=%s error=%s",
                 self.provider_id or self.provider_name or "unknown",
                 _latency_ms(started),
                 exc,

@@ -6,7 +6,7 @@ from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Optional
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
@@ -14,10 +14,12 @@ from uuid import uuid4
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
 from .llm import test_provider_connection
 from .logging_config import DEFAULT_LOG_FILE, configure_logging, logger
+from .mcp_config import DEFAULT_MCP_SERVERS_FILE, MCPServerStore
 from .models import AgentConfig, RunConfig, to_jsonable
-from .pipeline import run_judgement
+from .pipeline import RunStopped, run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderStore
 from .records import RunRecordStore
+from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore
 
 
 DEFAULT_RECORDS_DIR = Path(".vuln-judger") / "runs"
@@ -31,18 +33,34 @@ def serve(
     providers_file: Path = DEFAULT_PROVIDERS_FILE,
     agents_dir: Path = DEFAULT_AGENTS_DIR,
     log_file: Path = DEFAULT_LOG_FILE,
+    mcp_servers_file: Path = DEFAULT_MCP_SERVERS_FILE,
+    skills_file: Path = DEFAULT_SKILLS_FILE,
 ) -> None:
     configured_log = configure_logging(log_file)
     store = RunRecordStore(records_dir)
     provider_store = ProviderStore(providers_file)
     agent_store = AgentDirectoryStore(agents_dir)
-    server = ThreadingHTTPServer((host, port), make_handler(store, provider_store, agent_store))
+    mcp_store = MCPServerStore(mcp_servers_file)
+    mcp_store.ensure_default_atlas()
+    skill_store = SkillSourceStore(skills_file)
+    server = ThreadingHTTPServer((host, port), make_handler(store, provider_store, agent_store, mcp_store, skill_store))
     print(f"vuln-judger Web 界面监听：http://{host}:{port}")
     print(f"运行记录目录：{store.root}")
     print(f"提供商配置文件：{provider_store.path}")
     print(f"Agent 配置目录：{agent_store.root}")
+    print(f"MCP Server 配置文件：{mcp_store.path}")
+    print(f"Skill Source 配置文件：{skill_store.path}")
     print(f"日志文件：{configured_log}")
-    LOG.info("API 服务启动 host=%s port=%s records=%s providers=%s agents=%s", host, port, store.root, provider_store.path, agent_store.root)
+    LOG.info(
+        "API 服务启动 host=%s port=%s records=%s providers=%s agents=%s mcp=%s skills=%s",
+        host,
+        port,
+        store.root,
+        provider_store.path,
+        agent_store.root,
+        mcp_store.path,
+        skill_store.path,
+    )
     server.serve_forever()
 
 
@@ -50,10 +68,16 @@ def make_handler(
     store: RunRecordStore,
     provider_store: Optional[ProviderStore] = None,
     agent_store: Optional[AgentDirectoryStore] = None,
+    mcp_store: Optional[MCPServerStore] = None,
+    skill_store: Optional[SkillSourceStore] = None,
 ):
     provider_store = provider_store or ProviderStore(store.root.parent / "providers.json")
     agent_store = agent_store or AgentDirectoryStore(DEFAULT_AGENTS_DIR)
+    mcp_store = mcp_store or MCPServerStore(store.root.parent / "mcp.json")
+    mcp_store.ensure_default_atlas()
+    skill_store = skill_store or SkillSourceStore(store.root.parent / "skills.json")
     tasks = {}
+    stop_events = {}
     tasks_lock = Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -66,11 +90,13 @@ def make_handler(
                     payload = self._read_json()
                     run_id = _new_run_id()
                     LOG.info("收到创建任务请求 run_id=%s payload=%s", run_id, _safe_payload(payload))
-                    config = _config_from_payload(payload, provider_store.path, run_id, agent_store)
+                    config = _config_from_payload(payload, provider_store.path, run_id, agent_store, mcp_store.path, skill_store)
                     task = _task_from_config(config, run_id, "running")
+                    stop_event = Event()
                     with tasks_lock:
                         tasks[run_id] = task
-                    Thread(target=_run_task, args=(config, store, tasks, tasks_lock), daemon=True).start()
+                        stop_events[run_id] = stop_event
+                    Thread(target=_run_task, args=(config, store, tasks, stop_events, tasks_lock, stop_event), daemon=True).start()
                     self._json(
                         {
                             "run_id": run_id,
@@ -80,6 +106,14 @@ def make_handler(
                         },
                         HTTPStatus.CREATED,
                     )
+                    return
+                if len(parts) == 3 and parts[0] == "runs" and parts[2] == "stop":
+                    result = _request_stop(tasks, stop_events, tasks_lock, parts[1])
+                    if result is None:
+                        self._json({"error": "运行任务未找到或已结束"}, HTTPStatus.NOT_FOUND)
+                    else:
+                        LOG.info("收到停止任务请求 run_id=%s status=%s", parts[1], result.get("status"))
+                        self._json(result)
                     return
                 if parts == ["providers"]:
                     self._json(provider_store.upsert(self._read_json()), HTTPStatus.CREATED)
@@ -108,6 +142,30 @@ def make_handler(
                         profile_id = payload.get("profile_id")
                         instructions = payload.get("instructions")
                         self._json(to_jsonable(agent_store.save_profile(role, profile_id, instructions)), HTTPStatus.CREATED)
+                    return
+                if parts == ["mcp-servers"]:
+                    self._json(mcp_store.upsert(self._read_json()), HTTPStatus.CREATED)
+                    return
+                if parts == ["mcp-servers", "defaults"]:
+                    payload = self._read_json()
+                    self._json(mcp_store.set_defaults(payload.get("atlas")))
+                    return
+                if len(parts) == 3 and parts[0] == "mcp-servers" and parts[2] == "test":
+                    payload = self._read_json()
+                    project_path = Path(payload["project_path"]) if payload.get("project_path") else None
+                    result = mcp_store.test(parts[1], project_path)
+                    self._json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
+                    return
+                if parts == ["skill-sources"]:
+                    self._json(skill_store.upsert(self._read_json()), HTTPStatus.CREATED)
+                    return
+                if parts == ["skill-sources", "defaults"]:
+                    payload = self._read_json()
+                    self._json(skill_store.set_defaults(payload.get("project")))
+                    return
+                if len(parts) == 3 and parts[0] == "skill-sources" and parts[2] == "test":
+                    result = skill_store.test(parts[1])
+                    self._json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
                     return
                 if len(parts) == 3 and parts[0] == "providers" and parts[2] == "test":
                     provider = provider_store.get(parts[1])
@@ -149,6 +207,18 @@ def make_handler(
                 else:
                     self._json({"error": "提供商未找到"}, HTTPStatus.NOT_FOUND)
                 return
+            if len(parts) == 2 and parts[0] == "mcp-servers":
+                if mcp_store.delete(parts[1]):
+                    self._json({"deleted": True})
+                else:
+                    self._json({"error": "MCP Server 未找到"}, HTTPStatus.NOT_FOUND)
+                return
+            if len(parts) == 2 and parts[0] == "skill-sources":
+                if skill_store.delete(parts[1]):
+                    self._json({"deleted": True})
+                else:
+                    self._json({"error": "Skill Source 未找到"}, HTTPStatus.NOT_FOUND)
+                return
             self._json({"error": "未找到"}, HTTPStatus.NOT_FOUND)
 
         def do_GET(self) -> None:  # noqa: N802
@@ -171,6 +241,32 @@ def make_handler(
             if parts == ["agent-prompts", "defaults"]:
                 self._json(agent_store.defaults())
                 return
+            if parts == ["mcp-servers"]:
+                self._json(mcp_store.list())
+                return
+            if parts == ["mcp-servers", "defaults"]:
+                self._json(mcp_store.defaults())
+                return
+            if len(parts) == 2 and parts[0] == "mcp-servers":
+                server = mcp_store.get(parts[1])
+                if server is None:
+                    self._json({"error": "MCP Server 未找到"}, HTTPStatus.NOT_FOUND)
+                    return
+                self._json(server.public_dict())
+                return
+            if parts == ["skill-sources"]:
+                self._json(skill_store.list())
+                return
+            if parts == ["skill-sources", "defaults"]:
+                self._json(skill_store.defaults())
+                return
+            if len(parts) == 2 and parts[0] == "skill-sources":
+                source = skill_store.get(parts[1])
+                if source is None:
+                    self._json({"error": "Skill Source 未找到"}, HTTPStatus.NOT_FOUND)
+                    return
+                self._json(source.public_dict())
+                return
             if len(parts) == 2 and parts[0] == "providers":
                 provider = provider_store.get(parts[1])
                 if provider is None:
@@ -192,7 +288,14 @@ def make_handler(
                         self._json(task)
                         return
                     if len(parts) == 3 and parts[2] == "findings":
-                        self._json([])
+                        self._json([_finding_summary(report) for report in task.get("reports", [])])
+                        return
+                    if len(parts) == 4 and parts[2] == "findings":
+                        for report in task.get("reports", []):
+                            if report.get("finding_id") == parts[3]:
+                                self._json(report)
+                                return
+                        self._json({"error": "发现尚未生成或未找到"}, HTTPStatus.NOT_FOUND)
                         return
                     self._json({"error": "运行尚未完成"}, HTTPStatus.BAD_REQUEST)
                     return
@@ -249,11 +352,19 @@ def _config_from_payload(
     providers_file: Path,
     run_id: Optional[str] = None,
     agent_store: Optional[AgentDirectoryStore] = None,
+    mcp_servers_file: Optional[Path] = None,
+    skill_store: Optional[SkillSourceStore] = None,
 ) -> RunConfig:
     languages = payload.get("languages") or ["java", "cpp", "python"]
     if isinstance(languages, str):
         languages = [item.strip().lower() for item in languages.split(",") if item.strip()]
     skills_path: Optional[Path] = Path(payload["skills_path"]) if payload.get("skills_path") else None
+    skill_source_id = payload.get("skill_source_id")
+    if skills_path is None and skill_source_id and skill_store is not None:
+        skill_source = skill_store.get(skill_source_id)
+        if skill_source is None:
+            raise ValueError(f"未知 Skill Source：{skill_source_id}")
+        skills_path = Path(skill_source.path)
     report_path = payload.get("sarif_path") or payload.get("report_path")
     if not report_path:
         raise ValueError("report_path 或 sarif_path 不能为空")
@@ -269,6 +380,7 @@ def _config_from_payload(
         source_path=Path(payload["source_path"]),
         skills_path=skills_path,
         providers_file=providers_file,
+        mcp_servers_file=mcp_servers_file,
         run_id=run_id,
         languages=languages,
         max_rounds=int(payload.get("max_rounds") or 4),
@@ -287,7 +399,7 @@ def _config_from_payload(
 def _run_detail(run):
     return {
         "run_id": run.get("run_id"),
-        "status": "completed",
+        "status": run.get("status", "completed"),
         "created_at": run.get("created_at"),
         "source_path": run.get("source_path"),
         "sarif_path": run.get("sarif_path"),
@@ -349,32 +461,55 @@ def _task_from_config(config: RunConfig, run_id: str, status: str, error: Option
         "llm_providers": {},
         "agent_configs": _agent_task_metadata(config),
         "verdict_counts": {},
+        "reports": [],
         "error": error,
     }
 
 
-def _run_task(config: RunConfig, store: RunRecordStore, tasks: dict, tasks_lock: Lock) -> None:
+def _run_task(
+    config: RunConfig,
+    store: RunRecordStore,
+    tasks: dict,
+    stop_events: dict,
+    tasks_lock: Lock,
+    stop_event: Event,
+) -> None:
+    last_payload = None
     try:
         LOG.info("后台任务开始 run_id=%s report=%s source=%s", config.run_id, config.sarif_path, config.source_path)
-        report = run_judgement(config)
+        def on_progress(progress_report):
+            nonlocal last_payload
+            payload = to_jsonable(progress_report)
+            last_payload = payload
+            status = "stopping" if stop_event.is_set() else "running"
+            with tasks_lock:
+                tasks[payload["run_id"]] = _task_from_report_payload(payload, status)
+            LOG.info(
+                "后台任务进度 run_id=%s reports=%s debate_turns=%s",
+                payload["run_id"],
+                len(payload.get("reports", [])),
+                sum(len(item.get("debate", [])) for item in payload.get("reports", [])),
+            )
+
+        report = run_judgement(config, progress_callback=on_progress, should_stop=stop_event.is_set)
         store.save(report)
+        payload = to_jsonable(report)
         with tasks_lock:
-            tasks[report.run_id] = {
-                "run_id": report.run_id,
-                "status": "completed",
-                "created_at": report.created_at,
-                "source_path": report.source_path,
-                "sarif_path": report.sarif_path,
-                "languages": report.languages,
-                "finding_count": report.finding_count,
-                "project_context_facts": report.project_context_facts,
-                "diagnostic_count": len(report.diagnostics),
-                "diagnostics": report.diagnostics,
-                "llm_providers": report.llm_providers,
-                "agent_configs": report.agent_configs,
-                "verdict_counts": _verdict_counts(to_jsonable(report)),
-            }
+            tasks[report.run_id] = _task_from_report_payload(payload, "completed")
         LOG.info("后台任务完成 run_id=%s findings=%s", report.run_id, report.finding_count)
+    except RunStopped as exc:
+        LOG.info("后台任务已停止 run_id=%s", config.run_id)
+        stopped_payload = dict(last_payload or _task_from_config(config, config.run_id or _new_run_id(), "stopped"))
+        stopped_payload["status"] = "stopped"
+        stopped_payload["error"] = None
+        diagnostics = list(stopped_payload.get("diagnostics", []))
+        diagnostics.append(str(exc))
+        stopped_payload["diagnostics"] = diagnostics
+        if "reports" not in stopped_payload:
+            stopped_payload["reports"] = []
+        store.save_payload(stopped_payload)
+        with tasks_lock:
+            tasks[stopped_payload["run_id"]] = _task_from_report_payload(stopped_payload, "stopped")
     except Exception as exc:
         LOG.exception("后台任务失败 run_id=%s", config.run_id)
         with tasks_lock:
@@ -384,6 +519,45 @@ def _run_task(config: RunConfig, store: RunRecordStore, tasks: dict, tasks_lock:
             failed["error"] = str(exc)
             failed["diagnostics"] = [str(exc)]
             tasks[failed["run_id"]] = failed
+    finally:
+        with tasks_lock:
+            stop_events.pop(config.run_id, None)
+
+
+def _task_from_report_payload(payload: dict, status: str) -> dict:
+    return {
+        "run_id": payload.get("run_id"),
+        "status": status,
+        "created_at": payload.get("created_at"),
+        "source_path": payload.get("source_path"),
+        "sarif_path": payload.get("sarif_path"),
+        "languages": payload.get("languages", []),
+        "finding_count": payload.get("finding_count", 0),
+        "project_context_facts": payload.get("project_context_facts", 0),
+        "diagnostic_count": len(payload.get("diagnostics", [])),
+        "diagnostics": payload.get("diagnostics", []),
+        "llm_providers": payload.get("llm_providers", {}),
+        "agent_configs": payload.get("agent_configs", {}),
+        "verdict_counts": _verdict_counts(payload),
+        "reports": payload.get("reports", []),
+        "error": None,
+    }
+
+
+def _request_stop(tasks: dict, stop_events: dict, tasks_lock: Lock, run_id: str) -> Optional[dict]:
+    with tasks_lock:
+        task = tasks.get(run_id)
+        stop_event = stop_events.get(run_id)
+        if task is None or stop_event is None:
+            return None
+        if task.get("status") in {"completed", "failed", "stopped"}:
+            return dict(task)
+        stop_event.set()
+        updated = dict(task)
+        updated["status"] = "stopping"
+        updated["stop_requested"] = True
+        tasks[run_id] = updated
+        return dict(updated)
 
 
 def _safe_payload(payload) -> dict:
@@ -404,6 +578,7 @@ def _finding_summary(report):
         "verdict": report.get("verdict"),
         "confidence": report.get("confidence"),
         "summary": report.get("reasoning_summary"),
+        "final_conclusion": report.get("final_conclusion"),
         "source_locations": report.get("source_locations", []),
         "evidence_count": len(report.get("evidence_chain", [])),
         "debate_turn_count": len(report.get("debate", [])),
@@ -561,6 +736,8 @@ def app_html() -> str:
     .chip.inc {{ color: var(--inc); border-color: #c9c1ef; background: #f6f3ff; }}
     .chip.run-delete {{ cursor: pointer; color: var(--bad); }}
     .chip.run-delete:hover {{ border-color: var(--bad); background: #fff1f0; }}
+    .chip.run-stop {{ cursor: pointer; color: var(--accent); }}
+    .chip.run-stop:hover {{ border-color: var(--accent); background: #edf7fb; }}
     .content {{ padding: 16px; display: grid; gap: 16px; }}
     .summary-grid {{
       display: grid;
@@ -599,6 +776,10 @@ def app_html() -> str:
     #agent-negative-profile-panel {{
       min-height: 560px;
       height: auto;
+      overflow: visible;
+    }}
+    #mcp-server-panel,
+    #skill-source-panel {{
       overflow: visible;
     }}
     #agent-affirmative-profile-panel .detail-body,
@@ -752,6 +933,7 @@ def app_html() -> str:
       <button id="open-run-config" type="button" title="启动新的研判任务">启动任务</button>
       <button id="open-providers" type="button" title="配置 LLM 提供商">LLM 提供商</button>
       <button id="open-agent-prompts" type="button" title="配置 Agent 提示词">Agent 配置</button>
+      <button id="open-integrations" type="button" title="配置 MCP Server 和项目 Skills">MCP / Skills</button>
       <button id="refresh" type="button" title="刷新记录">刷新</button>
       <button id="clear-selection" type="button" title="清空当前详情">清空</button>
     </div>
@@ -866,6 +1048,71 @@ def app_html() -> str:
       </div>
     </section>
   </div>
+  <div class="modal-backdrop" id="integrations-modal" role="dialog" aria-modal="true" aria-labelledby="integrations-title">
+    <section class="settings-panel" aria-label="MCP 和 Skill 设置">
+      <div class="settings-head">
+        <div>
+          <h2 id="integrations-title">MCP / Skills</h2>
+          <div class="muted">配置本地 MCP Server 启动参数和项目知识库 Skill Source。</div>
+        </div>
+        <button id="close-integrations" type="button" title="关闭 MCP 和 Skill 设置">关闭</button>
+      </div>
+      <div class="settings-body">
+        <div class="detail" id="mcp-server-panel">
+          <h3>MCP Server</h3>
+          <div class="detail-body">
+            <div class="form-grid">
+              <label>ID<input id="mcp-id" placeholder="atlas-default"></label>
+              <label>名称<input id="mcp-name" placeholder="Atlas 默认 MCP"></label>
+              <label>类型<input id="mcp-kind" value="atlas"></label>
+              <label>命令<input id="mcp-command" placeholder="atlas"></label>
+              <label class="wide">参数 JSON<textarea id="mcp-args" placeholder='["mcp","--project","{{project}}","--log-format","json"]'></textarea></label>
+              <label class="wide">工作目录<input id="mcp-cwd" placeholder="{{project}}"></label>
+              <label class="wide">环境变量 JSON<textarea id="mcp-env" placeholder='{{"HTTP_PROXY":"http://127.0.0.1:7890"}}'></textarea></label>
+              <label class="wide">说明<textarea id="mcp-description" placeholder="本地 Atlas MCP Server"></textarea></label>
+              <label>默认 Atlas MCP<select id="default-atlas-mcp"></select></label>
+              <label>测试项目路径<input id="mcp-test-project" placeholder="/path/to/project"></label>
+            </div>
+            <div class="chips">
+              <label><input id="mcp-enabled" type="checkbox" checked> 启用 MCP Server</label>
+            </div>
+            <div class="toolbar">
+              <button id="save-mcp" type="button">保存 MCP</button>
+              <button id="test-mcp" type="button">测试 MCP</button>
+              <button id="delete-mcp" type="button">删除 MCP</button>
+              <button id="save-mcp-defaults" type="button">保存默认 MCP</button>
+            </div>
+            <div class="chips" id="mcp-list"></div>
+            <pre id="mcp-result">尚未测试 MCP Server。</pre>
+          </div>
+        </div>
+        <div class="detail" id="skill-source-panel">
+          <h3>Skill Source</h3>
+          <div class="detail-body">
+            <div class="form-grid">
+              <label>ID<input id="skill-id" placeholder="faiss-kb"></label>
+              <label>名称<input id="skill-name" placeholder="Faiss 项目知识库"></label>
+              <label class="wide">路径<input id="skill-path" placeholder="/path/to/project/skills"></label>
+              <label class="wide">说明<textarea id="skill-description" placeholder="项目架构、威胁建模、接口、资产等知识库。"></textarea></label>
+              <label>默认 Skill Source<select id="default-skill-source"></select></label>
+            </div>
+            <div class="chips">
+              <label><input id="skill-enabled" type="checkbox" checked> 启用</label>
+              <label><input id="skill-starred" type="checkbox"> 星标</label>
+            </div>
+            <div class="toolbar">
+              <button id="save-skill" type="button">保存 Skill Source</button>
+              <button id="test-skill" type="button">测试加载</button>
+              <button id="delete-skill" type="button">删除 Skill Source</button>
+              <button id="save-skill-defaults" type="button">保存默认 Skill</button>
+            </div>
+            <div class="chips" id="skill-list"></div>
+            <pre id="skill-result">尚未测试 Skill Source。</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
   <div class="modal-backdrop" id="run-config-modal" role="dialog" aria-modal="true" aria-labelledby="run-config-title">
     <section class="settings-panel" aria-label="任务启动配置">
       <div class="settings-head">
@@ -882,6 +1129,7 @@ def app_html() -> str:
             <div class="form-grid">
               <label class="wide">报告路径<input id="run-sarif" placeholder="fixtures/demo_sarif/report.sarif 或 report.md"></label>
               <label class="wide">源码路径<input id="run-source" placeholder="fixtures/demo_sarif/source"></label>
+              <label>Skill Source<select id="run-skill-source"></select></label>
               <label class="wide">Skills 路径<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
               <label>语言<input id="run-languages" value="java,cpp,python"></label>
               <label>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
@@ -907,7 +1155,7 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, providers: [], defaults: {{}}, agentPrompts: {{}} }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}} }};
     const el = {{
       list: document.getElementById('run-list'),
       count: document.getElementById('run-count'),
@@ -918,9 +1166,12 @@ def app_html() -> str:
       providerList: document.getElementById('provider-list'),
       providersModal: document.getElementById('providers-modal'),
       agentPromptsModal: document.getElementById('agent-prompts-modal'),
+      integrationsModal: document.getElementById('integrations-modal'),
       runConfigModal: document.getElementById('run-config-modal'),
       providerResult: document.getElementById('provider-result'),
       agentPromptsResult: document.getElementById('agent-prompts-result'),
+      mcpResult: document.getElementById('mcp-result'),
+      skillResult: document.getElementById('skill-result'),
       providerId: document.getElementById('provider-id'),
       providerName: document.getElementById('provider-name'),
       providerEndpoint: document.getElementById('provider-endpoint'),
@@ -930,6 +1181,26 @@ def app_html() -> str:
       providerExtra: document.getElementById('provider-extra'),
       defaultAffirmative: document.getElementById('default-affirmative'),
       defaultNegative: document.getElementById('default-negative'),
+      mcpList: document.getElementById('mcp-list'),
+      mcpId: document.getElementById('mcp-id'),
+      mcpName: document.getElementById('mcp-name'),
+      mcpKind: document.getElementById('mcp-kind'),
+      mcpCommand: document.getElementById('mcp-command'),
+      mcpArgs: document.getElementById('mcp-args'),
+      mcpCwd: document.getElementById('mcp-cwd'),
+      mcpEnv: document.getElementById('mcp-env'),
+      mcpDescription: document.getElementById('mcp-description'),
+      mcpEnabled: document.getElementById('mcp-enabled'),
+      defaultAtlasMcp: document.getElementById('default-atlas-mcp'),
+      mcpTestProject: document.getElementById('mcp-test-project'),
+      skillList: document.getElementById('skill-list'),
+      skillId: document.getElementById('skill-id'),
+      skillName: document.getElementById('skill-name'),
+      skillPath: document.getElementById('skill-path'),
+      skillDescription: document.getElementById('skill-description'),
+      skillEnabled: document.getElementById('skill-enabled'),
+      skillStarred: document.getElementById('skill-starred'),
+      defaultSkillSource: document.getElementById('default-skill-source'),
       agentAffirmativeProfileList: document.getElementById('agent-affirmative-profile-list'),
       agentNegativeProfileList: document.getElementById('agent-negative-profile-list'),
       agentAffirmativeProfile: document.getElementById('agent-affirmative-profile'),
@@ -940,6 +1211,7 @@ def app_html() -> str:
       agentNegativeInstructions: document.getElementById('agent-negative-instructions'),
       runSarif: document.getElementById('run-sarif'),
       runSource: document.getElementById('run-source'),
+      runSkillSource: document.getElementById('run-skill-source'),
       runSkills: document.getElementById('run-skills'),
       runLanguages: document.getElementById('run-languages'),
       runMaxRounds: document.getElementById('run-max-rounds'),
@@ -955,7 +1227,7 @@ def app_html() -> str:
 
     document.getElementById('open-run-config').addEventListener('click', async () => {{
       el.runConfigModal.classList.add('open');
-      await Promise.all([loadProviders(), loadAgentPrompts()]);
+      await Promise.all([loadProviders(), loadAgentPrompts(), loadIntegrations()]);
     }});
     document.getElementById('close-run-config').addEventListener('click', () => {{
       el.runConfigModal.classList.remove('open');
@@ -983,6 +1255,16 @@ def app_html() -> str:
     el.agentPromptsModal.addEventListener('click', (event) => {{
       if (event.target === el.agentPromptsModal) el.agentPromptsModal.classList.remove('open');
     }});
+    document.getElementById('open-integrations').addEventListener('click', async () => {{
+      el.integrationsModal.classList.add('open');
+      await loadIntegrations();
+    }});
+    document.getElementById('close-integrations').addEventListener('click', () => {{
+      el.integrationsModal.classList.remove('open');
+    }});
+    el.integrationsModal.addEventListener('click', (event) => {{
+      if (event.target === el.integrationsModal) el.integrationsModal.classList.remove('open');
+    }});
     document.getElementById('refresh').addEventListener('click', refreshAll);
     document.getElementById('clear-selection').addEventListener('click', () => {{
       state.selectedRun = null;
@@ -999,11 +1281,20 @@ def app_html() -> str:
     document.getElementById('save-affirmative-agent').addEventListener('click', () => saveAgentProfile('affirmative'));
     document.getElementById('save-negative-agent').addEventListener('click', () => saveAgentProfile('negative'));
     document.getElementById('reset-agent-prompts').addEventListener('click', resetAgentPrompts);
+    document.getElementById('save-mcp').addEventListener('click', saveMcpServer);
+    document.getElementById('test-mcp').addEventListener('click', testMcpServer);
+    document.getElementById('delete-mcp').addEventListener('click', deleteMcpServer);
+    document.getElementById('save-mcp-defaults').addEventListener('click', saveMcpDefaults);
+    document.getElementById('save-skill').addEventListener('click', saveSkillSource);
+    document.getElementById('test-skill').addEventListener('click', testSkillSource);
+    document.getElementById('delete-skill').addEventListener('click', deleteSkillSource);
+    document.getElementById('save-skill-defaults').addEventListener('click', saveSkillDefaults);
     document.getElementById('start-run').addEventListener('click', startRun);
     document.getElementById('fill-demo-run').addEventListener('click', fillDemoRun);
     document.getElementById('fill-markdown-demo-run').addEventListener('click', fillMarkdownDemoRun);
     el.runAffirmativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
     el.runNegativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
+    el.runSkillSource.addEventListener('change', fillRunSkillSource);
     el.agentAffirmativeProfile.addEventListener('change', () => fillAgentProfileEditor('affirmative'));
     el.agentNegativeProfile.addEventListener('change', () => fillAgentProfileEditor('negative'));
 
@@ -1110,6 +1401,8 @@ def app_html() -> str:
     function statusLabel(status) {{
       const labels = {{
         running: '运行中',
+        stopping: '正在停止',
+        stopped: '已停止',
         completed: '已完成',
         failed: '失败',
         queued: '排队中'
@@ -1138,6 +1431,8 @@ def app_html() -> str:
     }}
     function evidenceKindLabel(kind) {{
       const labels = {{
+        REPORT: '输入报告',
+        SOURCE_ROOT: '源码根目录',
         SOURCE_LOCATION: '源码位置',
         SARIF_CODE_FLOW: 'SARIF 代码流',
         CALL_CHAIN: '调用链',
@@ -1177,7 +1472,7 @@ def app_html() -> str:
     }}
 
     async function refreshAll() {{
-      await Promise.all([loadProviders(), loadAgentPrompts(), loadRuns()]);
+      await Promise.all([loadProviders(), loadAgentPrompts(), loadIntegrations(), loadRuns()]);
     }}
 
     async function loadProviders() {{
@@ -1197,6 +1492,203 @@ def app_html() -> str:
         renderAgentPrompts();
       }} catch (error) {{
         el.agentPromptsResult.textContent = error.message;
+      }}
+    }}
+
+    async function loadIntegrations() {{
+      try {{
+        const [mcpServers, mcpDefaults, skillSources, skillDefaults] = await Promise.all([
+          fetchJson('/mcp-servers'),
+          fetchJson('/mcp-servers/defaults'),
+          fetchJson('/skill-sources'),
+          fetchJson('/skill-sources/defaults')
+        ]);
+        state.mcpServers = mcpServers;
+        state.mcpDefaults = mcpDefaults;
+        state.skillSources = skillSources;
+        state.skillDefaults = skillDefaults;
+        renderIntegrations();
+      }} catch (error) {{
+        el.mcpResult.textContent = error.message;
+      }}
+    }}
+
+    function renderIntegrations() {{
+      renderMcpServers();
+      renderSkillSources();
+    }}
+
+    function renderMcpServers() {{
+      el.mcpList.innerHTML = state.mcpServers.map(server => `
+        <button type="button" class="chip" data-mcp-id="${{esc(server.id)}}">${{esc(server.name)}} / ${{esc(server.kind || 'mcp')}}</button>
+      `).join('') || '<span class="muted">尚未配置 MCP Server。</span>';
+      for (const button of el.mcpList.querySelectorAll('button[data-mcp-id]')) {{
+        button.addEventListener('click', () => fillMcpServer(button.dataset.mcpId));
+      }}
+      const options = '<option value="">无</option>' + state.mcpServers.map(server => (
+        `<option value="${{esc(server.id)}}">${{esc(server.name)}} / ${{esc(server.command)}}</option>`
+      )).join('');
+      el.defaultAtlasMcp.innerHTML = options;
+      el.defaultAtlasMcp.value = state.mcpDefaults.atlas || '';
+      if (!el.mcpId.value && state.mcpServers.length) fillMcpServer(state.mcpDefaults.atlas || state.mcpServers[0].id);
+    }}
+
+    function fillMcpServer(serverId) {{
+      const server = state.mcpServers.find(item => item.id === serverId);
+      if (!server) return;
+      el.mcpId.value = server.id;
+      el.mcpName.value = server.name || server.id;
+      el.mcpKind.value = server.kind || 'atlas';
+      el.mcpCommand.value = server.command || '';
+      el.mcpArgs.value = JSON.stringify(server.args || [], null, 2);
+      el.mcpCwd.value = server.cwd || '{{project}}';
+      el.mcpEnv.value = JSON.stringify(server.env || {{}}, null, 2);
+      el.mcpDescription.value = server.description || '';
+      el.mcpEnabled.checked = server.enabled !== false;
+    }}
+
+    async function saveMcpServer() {{
+      try {{
+        const payload = {{
+          id: el.mcpId.value.trim(),
+          name: el.mcpName.value.trim(),
+          kind: el.mcpKind.value.trim() || 'atlas',
+          command: el.mcpCommand.value.trim(),
+          args: el.mcpArgs.value.trim(),
+          cwd: el.mcpCwd.value.trim() || '{{project}}',
+          env: el.mcpEnv.value.trim() || {{}},
+          enabled: el.mcpEnabled.checked,
+          description: el.mcpDescription.value.trim()
+        }};
+        const saved = await fetchJson('/mcp-servers', jsonPost(payload));
+        el.mcpResult.textContent = JSON.stringify(saved, null, 2);
+        await loadIntegrations();
+      }} catch (error) {{
+        el.mcpResult.textContent = error.message;
+      }}
+    }}
+
+    async function testMcpServer() {{
+      try {{
+        const id = el.mcpId.value.trim();
+        if (!id) throw new Error('请先选择或输入 MCP Server ID。');
+        const result = await fetchJson(`/mcp-servers/${{encodeURIComponent(id)}}/test`, jsonPost({{
+          project_path: el.mcpTestProject.value.trim() || el.runSource.value.trim() || null
+        }}));
+        el.mcpResult.textContent = JSON.stringify(result, null, 2);
+      }} catch (error) {{
+        el.mcpResult.textContent = error.message;
+      }}
+    }}
+
+    async function deleteMcpServer() {{
+      try {{
+        const id = el.mcpId.value.trim();
+        if (!id) throw new Error('请先选择或输入 MCP Server ID。');
+        await fetchJson(`/mcp-servers/${{encodeURIComponent(id)}}`, {{ method: 'DELETE' }});
+        el.mcpResult.textContent = `已删除 ${{id}}`;
+        el.mcpId.value = '';
+        await loadIntegrations();
+      }} catch (error) {{
+        el.mcpResult.textContent = error.message;
+      }}
+    }}
+
+    async function saveMcpDefaults() {{
+      try {{
+        const defaults = await fetchJson('/mcp-servers/defaults', jsonPost({{ atlas: el.defaultAtlasMcp.value || null }}));
+        state.mcpDefaults = defaults;
+        el.mcpResult.textContent = JSON.stringify(defaults, null, 2);
+      }} catch (error) {{
+        el.mcpResult.textContent = error.message;
+      }}
+    }}
+
+    function renderSkillSources() {{
+      el.skillList.innerHTML = state.skillSources.map(source => `
+        <button type="button" class="chip" data-skill-id="${{esc(source.id)}}">${{source.starred ? '* ' : ''}}${{esc(source.name)}} / ${{esc(source.path)}}</button>
+      `).join('') || '<span class="muted">尚未配置 Skill Source。</span>';
+      for (const button of el.skillList.querySelectorAll('button[data-skill-id]')) {{
+        button.addEventListener('click', () => fillSkillSource(button.dataset.skillId));
+      }}
+      const options = '<option value="">手动输入路径</option>' + state.skillSources.map(source => (
+        `<option value="${{esc(source.id)}}">${{esc(source.name)}} / ${{esc(source.path)}}</option>`
+      )).join('');
+      el.defaultSkillSource.innerHTML = '<option value="">无</option>' + state.skillSources.map(source => (
+        `<option value="${{esc(source.id)}}">${{esc(source.name)}} / ${{esc(source.path)}}</option>`
+      )).join('');
+      el.runSkillSource.innerHTML = options;
+      el.defaultSkillSource.value = state.skillDefaults.project || '';
+      el.runSkillSource.value = state.skillDefaults.project || '';
+      fillRunSkillSource();
+      if (!el.skillId.value && state.skillSources.length) fillSkillSource(state.skillDefaults.project || state.skillSources[0].id);
+    }}
+
+    function fillSkillSource(sourceId) {{
+      const source = state.skillSources.find(item => item.id === sourceId);
+      if (!source) return;
+      el.skillId.value = source.id;
+      el.skillName.value = source.name || source.id;
+      el.skillPath.value = source.path || '';
+      el.skillDescription.value = source.description || '';
+      el.skillEnabled.checked = source.enabled !== false;
+      el.skillStarred.checked = Boolean(source.starred);
+    }}
+
+    function fillRunSkillSource() {{
+      const source = state.skillSources.find(item => item.id === el.runSkillSource.value);
+      if (source) el.runSkills.value = source.path || '';
+    }}
+
+    async function saveSkillSource() {{
+      try {{
+        const payload = {{
+          id: el.skillId.value.trim(),
+          name: el.skillName.value.trim(),
+          path: el.skillPath.value.trim(),
+          description: el.skillDescription.value.trim(),
+          enabled: el.skillEnabled.checked,
+          starred: el.skillStarred.checked
+        }};
+        const saved = await fetchJson('/skill-sources', jsonPost(payload));
+        el.skillResult.textContent = JSON.stringify(saved, null, 2);
+        await loadIntegrations();
+      }} catch (error) {{
+        el.skillResult.textContent = error.message;
+      }}
+    }}
+
+    async function testSkillSource() {{
+      try {{
+        const id = el.skillId.value.trim();
+        if (!id) throw new Error('请先选择或输入 Skill Source ID。');
+        const result = await fetchJson(`/skill-sources/${{encodeURIComponent(id)}}/test`, jsonPost({{}}));
+        el.skillResult.textContent = JSON.stringify(result, null, 2);
+      }} catch (error) {{
+        el.skillResult.textContent = error.message;
+      }}
+    }}
+
+    async function deleteSkillSource() {{
+      try {{
+        const id = el.skillId.value.trim();
+        if (!id) throw new Error('请先选择或输入 Skill Source ID。');
+        await fetchJson(`/skill-sources/${{encodeURIComponent(id)}}`, {{ method: 'DELETE' }});
+        el.skillResult.textContent = `已删除 ${{id}}`;
+        el.skillId.value = '';
+        await loadIntegrations();
+      }} catch (error) {{
+        el.skillResult.textContent = error.message;
+      }}
+    }}
+
+    async function saveSkillDefaults() {{
+      try {{
+        const defaults = await fetchJson('/skill-sources/defaults', jsonPost({{ project: el.defaultSkillSource.value || null }}));
+        state.skillDefaults = defaults;
+        el.skillResult.textContent = JSON.stringify(defaults, null, 2);
+      }} catch (error) {{
+        el.skillResult.textContent = error.message;
       }}
     }}
 
@@ -1467,6 +1959,7 @@ def app_html() -> str:
       el.runSarif.value = 'fixtures/demo_sarif/report.sarif';
       el.runSource.value = 'fixtures/demo_sarif/source';
       el.runSkills.value = 'fixtures/demo_sarif/skills';
+      el.runSkillSource.value = '';
       el.runLanguages.value = 'java,cpp,python';
       el.runMaxRounds.value = '4';
       el.runExternalTools.checked = false;
@@ -1479,6 +1972,7 @@ def app_html() -> str:
       el.runSarif.value = 'fixtures/demo_markdown/report.md';
       el.runSource.value = 'fixtures/demo_sarif/source';
       el.runSkills.value = 'fixtures/demo_sarif/skills';
+      el.runSkillSource.value = '';
       el.runLanguages.value = 'java,cpp,python';
       el.runMaxRounds.value = '4';
       el.runExternalTools.checked = false;
@@ -1492,6 +1986,7 @@ def app_html() -> str:
         const payload = {{
           report_path: el.runSarif.value.trim(),
           source_path: el.runSource.value.trim(),
+          skill_source_id: el.runSkillSource.value || null,
           skills_path: el.runSkills.value.trim() || null,
           languages: el.runLanguages.value.trim(),
           max_rounds: Number(el.runMaxRounds.value || 4),
@@ -1513,7 +2008,7 @@ def app_html() -> str:
         await loadRuns();
         if (created.run_id) {{
           await selectRun(created.run_id);
-          pollRun(created.run_id);
+          ensurePolling(created.run_id);
         }}
       }} catch (error) {{
         el.runResult.textContent = error.message;
@@ -1521,17 +2016,27 @@ def app_html() -> str:
     }}
 
     async function pollRun(runId) {{
-      for (let attempt = 0; attempt < 60; attempt += 1) {{
+      for (let attempt = 0; attempt < 1800; attempt += 1) {{
         await new Promise(resolve => setTimeout(resolve, 1000));
         try {{
           const run = await fetchJson(`/runs/${{encodeURIComponent(runId)}}`);
           await loadRuns();
-          await selectRun(runId);
-          if (run.status === 'completed' || run.status === 'failed') return;
+          if (state.selectedRun === runId) {{
+            await selectRun(runId, false);
+          }}
+          if (isTerminalStatus(run.status)) return;
         }} catch (_error) {{
           return;
         }}
       }}
+    }}
+
+    function ensurePolling(runId) {{
+      if (!runId || state.polling[runId]) return;
+      state.polling[runId] = true;
+      pollRun(runId).finally(() => {{
+        delete state.polling[runId];
+      }});
     }}
 
     async function loadRuns() {{
@@ -1539,6 +2044,9 @@ def app_html() -> str:
       try {{
         state.runs = await fetchJson('/runs');
         renderRuns();
+        for (const run of state.runs) {{
+          if (!isTerminalStatus(run.status)) ensurePolling(run.run_id);
+        }}
         el.subtitle.textContent = '静态报告漏洞研判历史';
         if (!state.selectedRun && state.runs.length > 0) {{
           await selectRun(state.runs[0].run_id);
@@ -1554,16 +2062,21 @@ def app_html() -> str:
       el.count.textContent = `${{state.runs.length}} 条记录`;
       el.list.innerHTML = state.runs.map(run => {{
         const counts = run.verdict_counts || {{}};
+        const status = run.status || 'completed';
+        const stopButton = status === 'running' || status === 'stopping'
+          ? `<span class="chip run-stop" data-run-stop="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="停止该任务">停止</span>`
+          : '';
         return `<button class="run-item ${{state.selectedRun === run.run_id ? 'active' : ''}}" type="button" data-run-id="${{esc(run.run_id)}}">
           <div class="run-id">${{esc(run.run_id)}}</div>
           <div class="muted">${{esc(fmtDate(run.created_at))}}</div>
           <div class="path">${{esc(run.source_path || '')}}</div>
           <div class="chips">
-            <span class="chip">${{esc(statusLabel(run.status || 'completed'))}}</span>
+            <span class="chip">${{esc(statusLabel(status))}}</span>
             <span class="chip">${{esc(run.finding_count)}} 个发现</span>
             <span class="chip tp">真实 ${{counts.TRUE_POSITIVE || 0}}</span>
             <span class="chip fp">误报 ${{counts.FALSE_POSITIVE || 0}}</span>
             <span class="chip inc">不足 ${{counts.INCONCLUSIVE || 0}}</span>
+            ${{stopButton}}
             <span class="chip run-delete" data-run-delete="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="删除该任务记录">删除</span>
           </div>
         </button>`;
@@ -1583,6 +2096,32 @@ def app_html() -> str:
             deleteRun(button.dataset.runId);
           }}
         }});
+      }}
+      for (const button of el.list.querySelectorAll('[data-run-stop]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          stopRun(button.dataset.runId);
+        }});
+        button.addEventListener('keydown', event => {{
+          if (event.key === 'Enter' || event.key === ' ') {{
+            event.preventDefault();
+            event.stopPropagation();
+            stopRun(button.dataset.runId);
+          }}
+        }});
+      }}
+    }}
+
+    async function stopRun(runId) {{
+      if (!runId) return;
+      try {{
+        await fetchJson(`/runs/${{encodeURIComponent(runId)}}/stop`, jsonPost({{}}));
+        await loadRuns();
+        if (state.selectedRun === runId) {{
+          await selectRun(runId, false);
+        }}
+      }} catch (error) {{
+        renderError(error);
       }}
     }}
 
@@ -1605,9 +2144,9 @@ def app_html() -> str:
       }}
     }}
 
-    async function selectRun(runId) {{
+    async function selectRun(runId, resetFinding = true) {{
       state.selectedRun = runId;
-      state.selectedFinding = null;
+      if (resetFinding) state.selectedFinding = null;
       renderRuns();
       el.title.textContent = runId;
       el.status.textContent = '正在加载详情...';
@@ -1627,20 +2166,32 @@ def app_html() -> str:
       const providers = run.llm_providers || {{}};
       const agents = run.agent_configs || {{}};
       const status = run.status || 'completed';
+      const runningMessage = status === 'stopping'
+        ? '已请求停止。当前 LLM 请求结束后会停止后续回合。'
+        : status === 'stopped'
+          ? '任务已停止，下面显示停止前已经生成的部分结果。'
+          : '任务正在后台运行。每完成一次 LLM 对话，本页面会自动加载当前信息。';
       el.status.textContent = `${{statusLabel(status)}} / ${{findings.length}} 个发现`;
+      const statusCard = `
+        <div class="detail">
+          <h3>运行状态</h3>
+          <div class="detail-body">
+            <div class="chips"><span class="chip">${{esc(statusLabel(status))}}</span></div>
+            <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
+            <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
+            <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
+            <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
+            <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
+            <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
+            <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
+            ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}
+            ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : `<div class="muted">${{esc(runningMessage)}}</div>`}}
+            ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
+          </div>
+        </div>`;
       if (status !== 'completed') {{
-        el.detail.innerHTML = `
-          <div class="detail">
-            <h3>运行状态</h3>
-            <div class="detail-body">
-              <div class="chips"><span class="chip">${{esc(statusLabel(status))}}</span></div>
-              <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
-              <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
-              <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
-              ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : '<div class="muted">任务正在后台运行，新启动任务的页面会自动刷新。</div>'}}
-              ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
-            </div>
-          </div>`;
+        el.detail.innerHTML = statusCard + (findings.length ? renderFindingsSection(findings) : '');
+        bindFindingRows(findings);
         return;
       }}
       el.detail.innerHTML = `
@@ -1665,6 +2216,13 @@ def app_html() -> str:
             ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
           </div>
         </div>
+        ${{renderFindingsSection(findings)}}
+      `;
+      bindFindingRows(findings);
+    }}
+
+    function renderFindingsSection(findings) {{
+      return `
         <div class="detail">
           <h3>漏洞发现</h3>
           <div class="scroll">
@@ -1681,12 +2239,18 @@ def app_html() -> str:
             </table>
           </div>
         </div>
-        <div id="finding-detail"></div>
-      `;
+        <div id="finding-detail"></div>`;
+    }}
+
+    function bindFindingRows(findings) {{
       for (const row of el.detail.querySelectorAll('tr[data-finding-id]')) {{
         row.addEventListener('click', () => selectFinding(row.dataset.findingId));
       }}
-      if (findings.length) selectFinding(findings[0].finding_id);
+      if (!findings.length) return;
+      const selected = state.selectedFinding && findings.some(item => item.finding_id === state.selectedFinding)
+        ? state.selectedFinding
+        : findings[0].finding_id;
+      selectFinding(selected);
     }}
 
     function providerLabel(value, llmEnabled) {{
@@ -1728,6 +2292,10 @@ def app_html() -> str:
       return lines.join('\\n\\n');
     }}
 
+    function isTerminalStatus(status) {{
+      return status === 'completed' || status === 'failed' || status === 'stopped';
+    }}
+
     async function selectFinding(findingId) {{
       state.selectedFinding = findingId;
       const container = document.getElementById('finding-detail');
@@ -1754,6 +2322,7 @@ def app_html() -> str:
               <span class="chip">置信度 ${{esc(detail.confidence)}}</span>
               <span class="chip">${{esc(detail.rule_id)}}</span>
             </div>
+            ${{detail.final_conclusion ? `<div><strong>最终结论：</strong> ${{esc(detail.final_conclusion)}}</div>` : ''}}
             <div>${{esc(detail.reasoning_summary)}}</div>
             <div><strong>防护研判：</strong> ${{esc(detail.protection_assessment)}}</div>
             <div><strong>影响研判：</strong> ${{esc(detail.impact_assessment)}}</div>

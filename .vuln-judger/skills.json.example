@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "defaults": {
+    "project": "demo-skills"
+  },
+  "sources": [
+    {
+      "id": "demo-skills",
+      "name": "示例项目知识库",
+      "path": "fixtures/demo_sarif/skills",
+      "description": "项目架构、威胁建模、外部接口、高风险模块和价值资产等知识库目录。",
+      "enabled": true,
+      "starred": false
+    }
+  ]
+}
