@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
@@ -280,6 +280,19 @@ def make_handler(
             if len(parts) >= 2 and parts[0] == "runs":
                 run = store.get(parts[1])
                 task = _get_task(tasks, tasks_lock, parts[1])
+                if len(parts) == 3 and parts[2] == "export":
+                    payload = run if run is not None else task
+                    if payload is None:
+                        self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
+                        return
+                    fmt = _query_value(self.path, "format", "markdown").lower()
+                    if fmt in {"json", "JSON"}:
+                        raw = json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2).encode("utf-8")
+                        self._download(raw, "application/json; charset=utf-8", f"{parts[1]}.json")
+                    else:
+                        raw = _export_run_markdown(payload).encode("utf-8")
+                        self._download(raw, "text/markdown; charset=utf-8", f"{parts[1]}.md")
+                    return
                 if run is None:
                     if task is None:
                         self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
@@ -340,11 +353,25 @@ def make_handler(
             self.end_headers()
             self.wfile.write(raw)
 
+        def _download(self, raw: bytes, content_type: str, filename: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+            self.send_response(status)
+            self.send_header("content-type", content_type)
+            self.send_header("cache-control", "no-store")
+            self.send_header("content-disposition", f'attachment; filename="{filename}"')
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
     return Handler
 
 
 def _parts(path: str) -> list[str]:
     return [unquote(part) for part in urlparse(path).path.strip("/").split("/") if part]
+
+
+def _query_value(path: str, key: str, default: str = "") -> str:
+    values = parse_qs(urlparse(path).query).get(key)
+    return values[0] if values else default
 
 
 def _config_from_payload(
@@ -616,6 +643,128 @@ def _verdict_counts(run):
     return counts
 
 
+def _export_run_markdown(run: dict) -> str:
+    lines = [
+        "# 漏洞研判报告",
+        "",
+        f"- 任务 ID：{run.get('run_id') or ''}",
+        f"- 状态：{run.get('status', 'completed')}",
+        f"- 创建时间：{run.get('created_at') or ''}",
+        f"- 输入报告：{run.get('sarif_path') or ''}",
+        f"- 源码目录：{run.get('source_path') or ''}",
+        f"- 语言：{', '.join(run.get('languages') or [])}",
+        f"- 发现数：{run.get('finding_count', 0)}",
+        f"- 项目知识库事实数：{run.get('project_context_facts', 0)}",
+        "",
+    ]
+    diagnostics = run.get("diagnostics") or []
+    if diagnostics:
+        lines.extend(["## 运行诊断", ""])
+        lines.extend(f"- {item}" for item in diagnostics)
+        lines.append("")
+    reports = run.get("reports") or []
+    if not reports:
+        lines.extend(["## 漏洞发现", "", "暂无漏洞发现记录。", ""])
+        return "\n".join(lines).rstrip() + "\n"
+    for index, report in enumerate(reports, start=1):
+        lines.extend(
+            [
+                f"## 发现 {index}: {report.get('rule_id') or report.get('finding_id') or ''}",
+                "",
+                f"- 发现 ID：{report.get('finding_id') or ''}",
+                f"- 结论：{report.get('verdict') or ''}",
+                f"- 置信度：{report.get('confidence')}",
+                f"- 最终结论：{report.get('final_conclusion') or ''}",
+                "",
+                "### 摘要",
+                "",
+                str(report.get("reasoning_summary") or "无"),
+                "",
+                "### 源码位置",
+                "",
+            ]
+        )
+        source_locations = report.get("source_locations") or []
+        if source_locations:
+            for location in source_locations:
+                lines.append(f"- {_location_text(location)}")
+        else:
+            lines.append("- 无")
+        lines.extend(
+            [
+                "",
+                "### 防护研判",
+                "",
+                str(report.get("protection_assessment") or "无"),
+                "",
+                "### 影响研判",
+                "",
+                str(report.get("impact_assessment") or "无"),
+                "",
+            ]
+        )
+        disputed = report.get("disputed_points") or []
+        if disputed:
+            lines.extend(["### 争议点", ""])
+            lines.extend(f"- {item}" for item in disputed)
+            lines.append("")
+        lines.extend(["### 博弈过程", ""])
+        debate = report.get("debate") or []
+        if debate:
+            for turn in debate:
+                lines.extend(
+                    [
+                        f"#### {_role_text(turn.get('role'))} 第 {turn.get('round_index')} 回合",
+                        "",
+                        str(turn.get("claim") or "").strip() or "无",
+                        "",
+                    ]
+                )
+                evidence_ids = turn.get("evidence_ids") or []
+                if evidence_ids:
+                    lines.extend(["引用证据：" + ", ".join(evidence_ids), ""])
+        else:
+            lines.extend(["无博弈过程记录。", ""])
+        lines.extend(["### 证据链", ""])
+        evidence_chain = report.get("evidence_chain") or []
+        if evidence_chain:
+            for item in evidence_chain:
+                lines.append(
+                    f"- `{item.get('evidence_id')}` {item.get('kind')} / {item.get('strength')} / {item.get('source')}：{item.get('summary')}"
+                )
+                locations = item.get("locations") or []
+                if locations:
+                    lines.append("  - 位置：" + " -> ".join(_location_text(location) for location in locations))
+                snippet = item.get("snippet")
+                if snippet:
+                    lines.extend(["", "```text", str(snippet).rstrip(), "```", ""])
+        else:
+            lines.append("- 无")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _location_text(location) -> str:
+    if not isinstance(location, dict):
+        return str(location)
+    file = str(location.get("file") or "")
+    line = location.get("line")
+    column = location.get("column")
+    if line is None:
+        return file
+    if column is None:
+        return f"{file}:{line}"
+    return f"{file}:{line}:{column}"
+
+
+def _role_text(role) -> str:
+    return {
+        "AFFIRMATIVE": "正方",
+        "NEGATIVE": "反方",
+        "MODERATOR": "主持人",
+    }.get(str(role), str(role or "未知角色"))
+
+
 def app_html() -> str:
     title = "漏洞研判记录"
     return f"""<!doctype html>
@@ -670,6 +819,8 @@ def app_html() -> str:
       cursor: pointer;
     }}
     button:hover {{ border-color: var(--accent); color: #0d4f6f; }}
+    button:disabled {{ cursor: not-allowed; opacity: 0.52; border-color: var(--line); color: var(--muted); }}
+    button.toggle-active {{ border-color: var(--accent); background: #edf7fb; color: #0d4f6f; }}
     input, select, textarea {{
       width: 100%;
       border: 1px solid var(--line);
@@ -706,19 +857,37 @@ def app_html() -> str:
     .run-list {{ display: grid; gap: 0; }}
     .run-item {{
       display: grid;
+      position: relative;
       gap: 8px;
       width: 100%;
       text-align: left;
       border: 0;
       border-bottom: 1px solid var(--line);
       border-radius: 0;
-      padding: 13px 15px;
+      padding: 15px;
       background: #ffffff;
     }}
     .run-item.active {{ box-shadow: inset 4px 0 0 var(--accent); background: #edf7fb; }}
+    .run-item-headline {{
+      display: grid;
+      gap: 8px;
+      padding-right: 92px;
+    }}
+    .run-item-actions {{
+      position: absolute;
+      top: 10px;
+      right: 12px;
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      justify-content: flex-end;
+      z-index: 1;
+    }}
     .run-id {{ font-weight: 700; overflow-wrap: anywhere; }}
     .path {{ color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }}
     .chips {{ display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }}
+    .run-verdict-chips {{ flex-wrap: nowrap; overflow-x: auto; padding-bottom: 1px; }}
+    .run-verdict-chips .chip {{ flex: 0 0 auto; }}
     .chip {{
       display: inline-flex;
       align-items: center;
@@ -788,6 +957,22 @@ def app_html() -> str:
       align-content: start;
       grid-auto-rows: max-content;
     }}
+    #mcp-server-panel {{
+      min-height: 720px;
+      height: auto;
+      overflow: visible;
+    }}
+    #skill-source-panel {{
+      min-height: 520px;
+      height: auto;
+      overflow: visible;
+    }}
+    #mcp-server-panel .detail-body,
+    #skill-source-panel .detail-body {{
+      min-height: 460px;
+      align-content: start;
+      grid-auto-rows: max-content;
+    }}
     .form-grid {{ display: grid; grid-template-columns: repeat(2, minmax(160px, 1fr)); gap: 12px; }}
     .form-grid .wide {{ grid-column: 1 / -1; }}
     pre {{
@@ -813,12 +998,19 @@ def app_html() -> str:
     .markdown-body ul,
     .markdown-body ol {{ margin: 0; padding-left: 22px; }}
     .markdown-body li {{ margin: 3px 0; }}
+    .markdown-body li.task-item {{ list-style: none; margin-left: -18px; }}
     .markdown-body h1,
     .markdown-body h2,
     .markdown-body h3,
     .markdown-body h4 {{
       margin: 2px 0 0;
       font-size: 14px;
+      line-height: 1.4;
+    }}
+    .markdown-body h5,
+    .markdown-body h6 {{
+      margin: 2px 0 0;
+      font-size: 13px;
       line-height: 1.4;
     }}
     .markdown-body blockquote {{
@@ -828,6 +1020,26 @@ def app_html() -> str:
       background: #f8fafc;
       color: var(--muted);
     }}
+    .markdown-body table {{
+      width: 100%;
+      border-collapse: collapse;
+      display: block;
+      overflow-x: auto;
+      white-space: normal;
+      font-size: 12px;
+    }}
+    .markdown-body th,
+    .markdown-body td {{
+      border: 1px solid var(--line);
+      padding: 6px 8px;
+      text-align: left;
+      vertical-align: top;
+      position: static;
+    }}
+    .markdown-body th {{ background: #f8fafc; color: var(--text); }}
+    .markdown-body hr {{ width: 100%; border: 0; border-top: 1px solid var(--line); margin: 4px 0; }}
+    .markdown-body a {{ color: var(--accent); text-decoration: none; }}
+    .markdown-body a:hover {{ text-decoration: underline; }}
     .markdown-body code {{
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 12px;
@@ -839,6 +1051,7 @@ def app_html() -> str:
       max-height: none;
       white-space: pre-wrap;
     }}
+    .markdown-body pre code {{ background: transparent; padding: 0; color: inherit; }}
     .debate-turn {{
       display: grid;
       gap: 8px;
@@ -935,6 +1148,7 @@ def app_html() -> str:
       <button id="open-agent-prompts" type="button" title="配置 Agent 提示词">Agent 配置</button>
       <button id="open-integrations" type="button" title="配置 MCP Server 和项目 Skills">MCP / Skills</button>
       <button id="refresh" type="button" title="刷新记录">刷新</button>
+      <button id="auto-refresh" type="button" title="没有运行中任务" aria-pressed="false" disabled>自动刷新：关</button>
       <button id="clear-selection" type="button" title="清空当前详情">清空</button>
     </div>
   </header>
@@ -1155,7 +1369,7 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}} }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false }};
     const el = {{
       list: document.getElementById('run-list'),
       count: document.getElementById('run-count'),
@@ -1168,6 +1382,7 @@ def app_html() -> str:
       agentPromptsModal: document.getElementById('agent-prompts-modal'),
       integrationsModal: document.getElementById('integrations-modal'),
       runConfigModal: document.getElementById('run-config-modal'),
+      autoRefresh: document.getElementById('auto-refresh'),
       providerResult: document.getElementById('provider-result'),
       agentPromptsResult: document.getElementById('agent-prompts-result'),
       mcpResult: document.getElementById('mcp-result'),
@@ -1266,6 +1481,7 @@ def app_html() -> str:
       if (event.target === el.integrationsModal) el.integrationsModal.classList.remove('open');
     }});
     document.getElementById('refresh').addEventListener('click', refreshAll);
+    el.autoRefresh.addEventListener('click', toggleAutoRefresh);
     document.getElementById('clear-selection').addEventListener('click', () => {{
       state.selectedRun = null;
       state.selectedFinding = null;
@@ -1308,39 +1524,122 @@ def app_html() -> str:
       if (!text.trim()) return '';
       const lines = text.split('\\n');
       const html = [];
-      let list = null;
+      const listStack = [];
       let inCode = false;
+      let codeLang = '';
       let codeLines = [];
+      let paragraph = [];
 
-      function closeList() {{
-        if (list) {{
-          html.push(`</${{list}}>`);
-          list = null;
+      function closeLists(targetIndent = -1) {{
+        while (listStack.length && listStack[listStack.length - 1].indent >= targetIndent) {{
+          const item = listStack.pop();
+          html.push(`</${{item.type}}>`);
         }}
       }}
+      function ensureList(type, indent) {{
+        while (listStack.length && listStack[listStack.length - 1].indent > indent) {{
+          const item = listStack.pop();
+          html.push(`</${{item.type}}>`);
+        }}
+        let current = listStack[listStack.length - 1];
+        if (current && current.indent === indent && current.type !== type) {{
+          const item = listStack.pop();
+          html.push(`</${{item.type}}>`);
+          current = listStack[listStack.length - 1];
+        }}
+        if (!current || current.indent < indent || current.type !== type) {{
+          html.push(`<${{type}}>`);
+          listStack.push({{ type, indent }});
+        }}
+      }}
+      function flushParagraph() {{
+        if (!paragraph.length) return;
+        html.push(`<p>${{paragraph.map(inlineMarkdown).join('<br>')}}</p>`);
+        paragraph = [];
+      }}
       function flushCode() {{
-        html.push(`<pre><code>${{esc(codeLines.join('\\n'))}}</code></pre>`);
+        const langClass = codeLang ? ` class="language-${{esc(codeLang)}}"` : '';
+        html.push(`<pre><code${{langClass}}>${{esc(codeLines.join('\\n'))}}</code></pre>`);
         codeLines = [];
+        codeLang = '';
+      }}
+      function safeUrl(raw) {{
+        const url = String(raw || '').trim();
+        if (/^(https?:|mailto:|#|\\/)/i.test(url)) return esc(url);
+        return '#';
       }}
       function inlineMarkdown(raw) {{
-        let output = esc(raw);
-        output = output.replace(/`([^`]+)`/g, '<code>$1</code>');
+        const codes = [];
+        let prepared = String(raw ?? '').replace(/`([^`]+)`/g, (_match, code) => {{
+          const token = `@@CODE${{codes.length}}@@`;
+          codes.push(`<code>${{esc(code)}}</code>`);
+          return token;
+        }});
+        let output = esc(prepared);
+        output = output.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)(?:\\s+&quot;[^&]*&quot;)?\\)/g, (_match, label, href) => (
+          `<a href="${{safeUrl(href)}}" target="_blank" rel="noreferrer noopener">${{label}}</a>`
+        ));
         output = output.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
         output = output.replace(/__([^_]+)__/g, '<strong>$1</strong>');
-        output = output.replace(/(^|\\s)\\*([^*]+)\\*/g, '$1<em>$2</em>');
-        output = output.replace(/(^|\\s)_([^_]+)_/g, '$1<em>$2</em>');
+        output = output.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+        output = output.replace(/(^|\\s)\\*([^*\\s][^*]*?)\\*/g, '$1<em>$2</em>');
+        output = output.replace(/(^|\\s)_([^_\\s][^_]*?)_/g, '$1<em>$2</em>');
+        codes.forEach((code, index) => {{
+          output = output.replaceAll(`@@CODE${{index}}@@`, code);
+        }});
         return output;
       }}
+      function isTableSeparator(line) {{
+        return /^\\s*\\|?\\s*:?-{{3,}}:?(\\s*\\|\\s*:?-{{3,}}:?)*\\s*\\|?\\s*$/.test(line);
+      }}
+      function looksLikeTable(index) {{
+        return index + 1 < lines.length && lines[index].includes('|') && isTableSeparator(lines[index + 1]);
+      }}
+      function splitTableRow(row) {{
+        let trimmed = row.trim();
+        if (trimmed.startsWith('|')) trimmed = trimmed.slice(1);
+        if (trimmed.endsWith('|')) trimmed = trimmed.slice(0, -1);
+        return trimmed.split('|').map(cell => cell.trim());
+      }}
+      function renderTable(start) {{
+        const headers = splitTableRow(lines[start]);
+        let index = start + 2;
+        const rows = [];
+        while (index < lines.length && lines[index].includes('|') && lines[index].trim()) {{
+          rows.push(splitTableRow(lines[index]));
+          index += 1;
+        }}
+        html.push('<table><thead><tr>' + headers.map(cell => `<th>${{inlineMarkdown(cell)}}</th>`).join('') + '</tr></thead><tbody>');
+        for (const row of rows) {{
+          html.push('<tr>' + headers.map((_header, column) => `<td>${{inlineMarkdown(row[column] || '')}}</td>`).join('') + '</tr>');
+        }}
+        html.push('</tbody></table>');
+        return index;
+      }}
+      function renderListItem(type, indent, content) {{
+        flushParagraph();
+        ensureList(type, indent);
+        const task = content.match(/^\\[([ xX])\\]\\s+(.+)$/);
+        if (task) {{
+          const checked = task[1].toLowerCase() === 'x' ? ' checked' : '';
+          html.push(`<li class="task-item"><input type="checkbox" disabled${{checked}}> ${{inlineMarkdown(task[2])}}</li>`);
+        }} else {{
+          html.push(`<li>${{inlineMarkdown(content)}}</li>`);
+        }}
+      }}
 
-      for (const line of lines) {{
-        const fence = line.match(/^```/);
+      for (let index = 0; index < lines.length; index += 1) {{
+        const line = lines[index];
+        const fence = line.match(/^```\\s*([^`]*)\\s*$/);
         if (fence) {{
           if (inCode) {{
             flushCode();
             inCode = false;
           }} else {{
-            closeList();
+            flushParagraph();
+            closeLists();
             inCode = true;
+            codeLang = (fence[1] || '').trim().split(/\\s+/)[0] || '';
             codeLines = [];
           }}
           continue;
@@ -1350,47 +1649,53 @@ def app_html() -> str:
           continue;
         }}
         if (!line.trim()) {{
-          closeList();
+          flushParagraph();
+          closeLists();
           continue;
         }}
-        const heading = line.match(/^(#{1,4})\\s+(.+)$/);
+        if (looksLikeTable(index)) {{
+          flushParagraph();
+          closeLists();
+          index = renderTable(index) - 1;
+          continue;
+        }}
+        const heading = line.match(/^(#{1,6})\\s+(.+)$/);
         if (heading) {{
-          closeList();
+          flushParagraph();
+          closeLists();
           const level = heading[1].length;
           html.push(`<h${{level}}>${{inlineMarkdown(heading[2])}}</h${{level}}>`);
           continue;
         }}
+        if (/^\\s*(-{{3,}}|_{{3,}}|\\*{{3,}})\\s*$/.test(line)) {{
+          flushParagraph();
+          closeLists();
+          html.push('<hr>');
+          continue;
+        }}
         const quote = line.match(/^>\\s?(.+)$/);
         if (quote) {{
-          closeList();
+          flushParagraph();
+          closeLists();
           html.push(`<blockquote>${{inlineMarkdown(quote[1])}}</blockquote>`);
           continue;
         }}
-        const unordered = line.match(/^\\s*[-*+]\\s+(.+)$/);
+        const unordered = line.match(/^(\\s*)[-*+]\\s+(.+)$/);
         if (unordered) {{
-          if (list !== 'ul') {{
-            closeList();
-            list = 'ul';
-            html.push('<ul>');
-          }}
-          html.push(`<li>${{inlineMarkdown(unordered[1])}}</li>`);
+          renderListItem('ul', unordered[1].length, unordered[2]);
           continue;
         }}
-        const ordered = line.match(/^\\s*\\d+[.)]\\s+(.+)$/);
+        const ordered = line.match(/^(\\s*)\\d+[.)]\\s+(.+)$/);
         if (ordered) {{
-          if (list !== 'ol') {{
-            closeList();
-            list = 'ol';
-            html.push('<ol>');
-          }}
-          html.push(`<li>${{inlineMarkdown(ordered[1])}}</li>`);
+          renderListItem('ol', ordered[1].length, ordered[2]);
           continue;
         }}
-        closeList();
-        html.push(`<p>${{inlineMarkdown(line)}}</p>`);
+        closeLists();
+        paragraph.push(line.trim());
       }}
       if (inCode) flushCode();
-      closeList();
+      flushParagraph();
+      closeLists();
       return html.join('');
     }}
     function fmtDate(value) {{
@@ -2005,6 +2310,7 @@ def app_html() -> str:
         const created = await fetchJson('/runs', jsonPost(payload));
         el.runResult.textContent = JSON.stringify(created, null, 2);
         el.runConfigModal.classList.remove('open');
+        state.autoRefreshEnabled = true;
         await loadRuns();
         if (created.run_id) {{
           await selectRun(created.run_id);
@@ -2018,6 +2324,7 @@ def app_html() -> str:
     async function pollRun(runId) {{
       for (let attempt = 0; attempt < 1800; attempt += 1) {{
         await new Promise(resolve => setTimeout(resolve, 1000));
+        if (!state.autoRefreshEnabled || !state.polling[runId]) return;
         try {{
           const run = await fetchJson(`/runs/${{encodeURIComponent(runId)}}`);
           await loadRuns();
@@ -2025,6 +2332,7 @@ def app_html() -> str:
             await selectRun(runId, false);
           }}
           if (isTerminalStatus(run.status)) return;
+          if (!state.autoRefreshEnabled || !state.polling[runId]) return;
         }} catch (_error) {{
           return;
         }}
@@ -2032,11 +2340,45 @@ def app_html() -> str:
     }}
 
     function ensurePolling(runId) {{
-      if (!runId || state.polling[runId]) return;
+      if (!runId || !state.autoRefreshEnabled || state.polling[runId]) return;
       state.polling[runId] = true;
       pollRun(runId).finally(() => {{
         delete state.polling[runId];
+        updateAutoRefreshControl();
       }});
+    }}
+
+    function runningRuns() {{
+      return state.runs.filter(run => !isTerminalStatus(run.status));
+    }}
+
+    function updateAutoRefreshControl() {{
+      const running = runningRuns();
+      if (!running.length) {{
+        state.autoRefreshEnabled = false;
+        state.polling = {{}};
+      }}
+      el.autoRefresh.disabled = !running.length;
+      el.autoRefresh.textContent = state.autoRefreshEnabled ? '自动刷新：开' : '自动刷新：关';
+      el.autoRefresh.title = running.length
+        ? (state.autoRefreshEnabled ? '点击关闭自动刷新，便于选择和复制文本' : '点击开启运行中任务自动刷新')
+        : '没有运行中任务';
+      el.autoRefresh.setAttribute('aria-pressed', state.autoRefreshEnabled ? 'true' : 'false');
+      el.autoRefresh.classList.toggle('toggle-active', state.autoRefreshEnabled && Boolean(running.length));
+    }}
+
+    function toggleAutoRefresh() {{
+      if (el.autoRefresh.disabled) return;
+      state.autoRefreshEnabled = !state.autoRefreshEnabled;
+      if (!state.autoRefreshEnabled) {{
+        state.polling = {{}};
+        updateAutoRefreshControl();
+        return;
+      }}
+      updateAutoRefreshControl();
+      for (const run of runningRuns()) {{
+        ensurePolling(run.run_id);
+      }}
     }}
 
     async function loadRuns() {{
@@ -2044,8 +2386,11 @@ def app_html() -> str:
       try {{
         state.runs = await fetchJson('/runs');
         renderRuns();
-        for (const run of state.runs) {{
-          if (!isTerminalStatus(run.status)) ensurePolling(run.run_id);
+        updateAutoRefreshControl();
+        if (state.autoRefreshEnabled) {{
+          for (const run of runningRuns()) {{
+            ensurePolling(run.run_id);
+          }}
         }}
         el.subtitle.textContent = '静态报告漏洞研判历史';
         if (!state.selectedRun && state.runs.length > 0) {{
@@ -2067,17 +2412,23 @@ def app_html() -> str:
           ? `<span class="chip run-stop" data-run-stop="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="停止该任务">停止</span>`
           : '';
         return `<button class="run-item ${{state.selectedRun === run.run_id ? 'active' : ''}}" type="button" data-run-id="${{esc(run.run_id)}}">
-          <div class="run-id">${{esc(run.run_id)}}</div>
-          <div class="muted">${{esc(fmtDate(run.created_at))}}</div>
-          <div class="path">${{esc(run.source_path || '')}}</div>
+          <div class="run-item-actions">
+            ${{stopButton}}
+            <span class="chip run-delete" data-run-delete="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="删除该任务记录">删除</span>
+          </div>
+          <div class="run-item-headline">
+            <div class="run-id">${{esc(run.run_id)}}</div>
+            <div class="muted">${{esc(fmtDate(run.created_at))}}</div>
+            <div class="path">${{esc(run.source_path || '')}}</div>
+          </div>
           <div class="chips">
             <span class="chip">${{esc(statusLabel(status))}}</span>
             <span class="chip">${{esc(run.finding_count)}} 个发现</span>
+          </div>
+          <div class="chips run-verdict-chips">
             <span class="chip tp">真实 ${{counts.TRUE_POSITIVE || 0}}</span>
             <span class="chip fp">误报 ${{counts.FALSE_POSITIVE || 0}}</span>
             <span class="chip inc">不足 ${{counts.INCONCLUSIVE || 0}}</span>
-            ${{stopButton}}
-            <span class="chip run-delete" data-run-delete="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="删除该任务记录">删除</span>
           </div>
         </button>`;
       }}).join('');
@@ -2170,13 +2521,19 @@ def app_html() -> str:
         ? '已请求停止。当前 LLM 请求结束后会停止后续回合。'
         : status === 'stopped'
           ? '任务已停止，下面显示停止前已经生成的部分结果。'
-          : '任务正在后台运行。每完成一次 LLM 对话，本页面会自动加载当前信息。';
+          : state.autoRefreshEnabled
+            ? '任务正在后台运行。自动刷新开启，每完成一次 LLM 对话，本页面会自动加载当前信息。'
+            : '任务正在后台运行。自动刷新已关闭，可手动点击“刷新”加载当前信息。';
       el.status.textContent = `${{statusLabel(status)}} / ${{findings.length}} 个发现`;
       const statusCard = `
         <div class="detail">
           <h3>运行状态</h3>
           <div class="detail-body">
             <div class="chips"><span class="chip">${{esc(statusLabel(status))}}</span></div>
+            <div class="toolbar">
+              <button type="button" data-run-export="markdown" data-run-id="${{esc(run.run_id)}}">导出 Markdown</button>
+              <button type="button" data-run-export="json" data-run-id="${{esc(run.run_id)}}">导出 JSON</button>
+            </div>
             <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
             <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
             <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
@@ -2191,6 +2548,7 @@ def app_html() -> str:
         </div>`;
       if (status !== 'completed') {{
         el.detail.innerHTML = statusCard + (findings.length ? renderFindingsSection(findings) : '');
+        bindRunExportButtons();
         bindFindingRows(findings);
         return;
       }}
@@ -2204,6 +2562,10 @@ def app_html() -> str:
         <div class="detail">
           <h3>运行元数据</h3>
           <div class="detail-body">
+            <div class="toolbar">
+              <button type="button" data-run-export="markdown" data-run-id="${{esc(run.run_id)}}">导出 Markdown</button>
+              <button type="button" data-run-export="json" data-run-id="${{esc(run.run_id)}}">导出 JSON</button>
+            </div>
             <div><strong>创建时间：</strong> ${{esc(fmtDate(run.created_at))}}</div>
             <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
             <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
@@ -2218,7 +2580,25 @@ def app_html() -> str:
         </div>
         ${{renderFindingsSection(findings)}}
       `;
+      bindRunExportButtons();
       bindFindingRows(findings);
+    }}
+
+    function bindRunExportButtons() {{
+      for (const button of el.detail.querySelectorAll('[data-run-export]')) {{
+        button.addEventListener('click', () => exportRun(button.dataset.runId, button.dataset.runExport));
+      }}
+    }}
+
+    function exportRun(runId, format) {{
+      if (!runId) return;
+      const chosen = format === 'json' ? 'json' : 'markdown';
+      const link = document.createElement('a');
+      link.href = `/runs/${{encodeURIComponent(runId)}}/export?format=${{encodeURIComponent(chosen)}}`;
+      link.download = `${{runId}}.${{chosen === 'json' ? 'json' : 'md'}}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
     }}
 
     function renderFindingsSection(findings) {{
