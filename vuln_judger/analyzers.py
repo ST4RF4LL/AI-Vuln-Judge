@@ -553,6 +553,8 @@ def _run_tool(binary: str, args: Sequence[str], cwd: Path, timeout: int) -> Tool
             [binary, *args],
             cwd=str(cwd),
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             check=False,

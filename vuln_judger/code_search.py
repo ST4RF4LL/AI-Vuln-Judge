@@ -70,6 +70,8 @@ def _search_rg(
             args,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
             cwd=str(source_root),
@@ -108,6 +110,8 @@ def _search_grep(
             args,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
             cwd=str(source_root),
@@ -174,7 +178,15 @@ def grep_count(source_root: Path, pattern: str, timeout: int = 30) -> int:
     if rg is not None:
         args = [rg, "--count", pattern, str(source_root)]
         try:
-            result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
             total = 0
             for line in result.stdout.splitlines():
                 parts = line.split(":", 1)

@@ -316,6 +316,51 @@ class PipelineTests(unittest.TestCase):
             self.assertNotIn("缺少 .atlas/atlas.db", summaries)
             self.assertTrue(any(item.data.get("mcp_success") for item in evidence))
 
+    def test_mcp_stdio_client_reads_utf8_tool_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = root / "utf8_mcp.py"
+            server.write_text(
+                r'''
+import json
+import sys
+
+def send(message):
+    raw = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    sys.stdout.buffer.write(raw + b"\n")
+    sys.stdout.buffer.flush()
+
+for raw in sys.stdin.buffer:
+    if not raw.strip():
+        continue
+    message = json.loads(raw.decode("utf-8"))
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "utf8-mcp", "version": "test"},
+            },
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {"tools": [{"name": "trace", "description": "Atlas — 数据流"}]},
+        })
+''',
+                encoding="utf-8",
+            )
+            with MCPStdioClient([sys.executable, str(server)], cwd=root, timeout=10) as client:
+                tools = client.list_tools()
+            self.assertEqual(tools[0]["description"], "Atlas — 数据流")
+
     def test_atlas_mcp_produces_trace_and_call_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
