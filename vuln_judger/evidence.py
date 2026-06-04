@@ -83,7 +83,14 @@ class EvidenceCollector:
             summary += "；路径存在但不是目录"
         else:
             summary += "；目录不存在"
-        summary += f"；语言范围：{', '.join(self.languages) or '未指定'}"
+        profile = self.indexer.language_profile
+        counts_text = ", ".join(f"{language}={count}" for language, count in profile.file_counts.items() if count)
+        if counts_text:
+            summary += f"；自动检测语言：{', '.join(self.languages)}（{counts_text}）"
+        elif profile.fallback_used:
+            summary += f"；未检测到支持语言，使用支持语言兜底：{', '.join(self.languages)}"
+        else:
+            summary += f"；自动检测语言：{', '.join(self.languages) or '未指定'}"
         summary += "；Atlas 数据库" + ("存在" if atlas_db.exists() else "不存在")
         return CodeEvidence(
             evidence_id=evidence_id(finding.finding_id, "source-root", str(source_root)),
@@ -96,6 +103,9 @@ class EvidenceCollector:
                 "source_root_exists": exists,
                 "source_root_is_dir": is_dir,
                 "languages": list(self.languages),
+                "language_file_counts": dict(profile.file_counts),
+                "language_total_supported_files": profile.total_supported_files,
+                "language_detection_fallback": profile.fallback_used,
                 "atlas_database": str(atlas_db),
                 "atlas_database_exists": atlas_db.exists(),
             },

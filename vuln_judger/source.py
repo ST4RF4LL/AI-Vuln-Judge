@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,68 @@ LANGUAGE_EXTENSIONS = {
     "cpp": {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"},
     "python": {".py", ".pyi", ".pyx"},
 }
+SUPPORTED_LANGUAGES = tuple(LANGUAGE_EXTENSIONS.keys())
+_SOURCE_SCAN_EXCLUDED_DIRS = {
+    ".atlas",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
+    ".venv",
+    "__pycache__",
+    "build",
+    "cmake-build-debug",
+    "cmake-build-release",
+    "dist",
+    "node_modules",
+    "out",
+    "target",
+    "venv",
+}
+
+
+@dataclass
+class ProjectLanguageProfile:
+    languages: List[str]
+    file_counts: Dict[str, int]
+    total_supported_files: int
+    fallback_used: bool = False
+
+
+def detect_project_languages(source_root: Path) -> ProjectLanguageProfile:
+    root = source_root.expanduser().resolve()
+    counts = {language: 0 for language in SUPPORTED_LANGUAGES}
+    if root.exists() and root.is_dir():
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if name not in _SOURCE_SCAN_EXCLUDED_DIRS and not (name.startswith(".") and name not in {".github"})
+            ]
+            for filename in filenames:
+                if filename.startswith("."):
+                    continue
+                language = detect_language(filename)
+                if language in counts:
+                    counts[language] += 1
+    total = sum(counts.values())
+    languages = [language for language in SUPPORTED_LANGUAGES if counts[language] > 0]
+    languages.sort(key=lambda language: (-counts[language], SUPPORTED_LANGUAGES.index(language)))
+    if not languages:
+        return ProjectLanguageProfile(
+            languages=list(SUPPORTED_LANGUAGES),
+            file_counts=counts,
+            total_supported_files=0,
+            fallback_used=True,
+        )
+    return ProjectLanguageProfile(
+        languages=languages,
+        file_counts={language: counts[language] for language in languages},
+        total_supported_files=total,
+        fallback_used=False,
+    )
 
 
 @dataclass
@@ -30,9 +93,10 @@ class ResolvedLocation:
 
 
 class SourceIndexer:
-    def __init__(self, source_root: Path, languages: Sequence[str]):
+    def __init__(self, source_root: Path, languages: Optional[Sequence[str]] = None):
         self.source_root = source_root.expanduser().resolve()
-        self.languages = [language.lower() for language in languages]
+        self.language_profile = detect_project_languages(self.source_root)
+        self.languages = [language.lower() for language in (languages or self.language_profile.languages)]
         self._file_cache: Dict[Path, List[str]] = {}
         self._file_globs: Optional[List[str]] = None
 
@@ -52,19 +116,36 @@ class SourceIndexer:
         line_exists = False
         snippet = None
         symbol = None
+        requested = location
         language = detect_language(location.file)
         relative = self._relative_display(absolute, location.file)
         if exists and absolute is not None:
             lines = self._read_lines(absolute)
-            if location.line is None:
+            inferred_line = None
+            if location.line is None and location.symbol:
+                inferred_line = self.find_symbol_line(absolute, location.symbol, language)
+            if location.line is None and inferred_line is not None:
+                requested = SourceLocation(
+                    file=location.file,
+                    line=inferred_line,
+                    column=location.column,
+                    end_line=location.end_line,
+                    end_column=location.end_column,
+                    symbol=location.symbol,
+                )
+                line_exists = True
+                snippet = self.snippet(absolute, inferred_line)
+                symbol = self.symbol_at(absolute, inferred_line, language) or location.symbol
+            elif location.line is None:
                 line_exists = True
                 snippet = "\n".join(lines[: min(5, len(lines))])
+                symbol = location.symbol
             elif 1 <= location.line <= len(lines):
                 line_exists = True
                 snippet = self.snippet(absolute, location.line)
-                symbol = self.symbol_at(absolute, location.line, language)
+                symbol = self.symbol_at(absolute, location.line, language) or location.symbol
         return ResolvedLocation(
-            requested=location,
+            requested=requested,
             absolute_path=absolute,
             relative_path=relative,
             exists=exists,
@@ -267,6 +348,19 @@ class SourceIndexer:
                     return match.group("name")
         return None
 
+    def find_symbol_line(self, file: Path, symbol: str, language: Optional[str]) -> Optional[int]:
+        lines = self._read_lines(file)
+        candidates = _symbol_lookup_candidates(symbol)
+        if not candidates:
+            return None
+        for definition_only in (True, False):
+            for idx, raw in enumerate(lines, start=1):
+                if definition_only and language == "cpp" and raw[:1].isspace():
+                    continue
+                if _line_matches_symbol(raw, candidates, language, definition_only):
+                    return idx
+        return None
+
     def _read_lines(self, path: Path) -> List[str]:
         if path not in self._file_cache:
             self._file_cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -340,6 +434,7 @@ def _display_location(resolved: ResolvedLocation) -> SourceLocation:
         column=resolved.requested.column,
         end_line=resolved.requested.end_line,
         end_column=resolved.requested.end_column,
+        symbol=resolved.symbol or resolved.requested.symbol,
     )
 
 
@@ -385,6 +480,38 @@ _CPP_CONTROL_KEYWORDS = {
     "sizeof",
     "static_assert",
 }
+
+
+def _symbol_lookup_candidates(symbol: str) -> List[str]:
+    cleaned = symbol.strip()
+    if not cleaned:
+        return []
+    candidates = [cleaned]
+    if "::" in cleaned:
+        candidates.append(cleaned.split("::")[-1])
+    return list(dict.fromkeys(candidates))
+
+
+def _line_matches_symbol(raw: str, candidates: Sequence[str], language: Optional[str], definition_only: bool) -> bool:
+    stripped = raw.strip()
+    if not stripped or stripped.startswith(("//", "/*", "*")):
+        return False
+    for candidate in candidates:
+        pattern = re.compile(r"(?<![\w:~])" + re.escape(candidate) + r"\s*\(")
+        match = pattern.search(stripped)
+        if not match:
+            continue
+        prefix = stripped[: match.start()]
+        first = stripped.split("(", 1)[0].split(None, 1)[0]
+        if first in _CPP_CONTROL_KEYWORDS:
+            continue
+        if definition_only and language == "cpp":
+            if "=" in prefix or "." in prefix.rstrip()[-1:]:
+                continue
+            if stripped.endswith(";") and "{" not in stripped:
+                continue
+        return True
+    return False
 
 
 def _cpp_symbol_at(lines: Sequence[str], line: int) -> Optional[str]:

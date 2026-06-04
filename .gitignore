@@ -18,6 +18,7 @@ agents/*/*/AGENT.json
 
 # Local vuln-judger runtime state and secrets
 .vuln-judger/agent_prompts.json
+.vuln-judger/exports/
 .vuln-judger/logs/
 .vuln-judger/mcp.json
 .vuln-judger/providers.json

@@ -33,14 +33,16 @@ def run_judgement(
 ) -> RunReport:
     source_path = config.source_path.expanduser().resolve()
     sarif_path = config.sarif_path.expanduser().resolve()
-    run_id = config.run_id or _run_id(sarif_path, source_path, config.languages)
+    indexer = SourceIndexer(source_path)
+    languages = list(indexer.languages)
+    run_id = config.run_id or _run_id(sarif_path, source_path, languages)
     created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     LOG.info(
         "开始漏洞研判 run_id=%s report=%s source=%s languages=%s llm=%s external_tools=%s",
         config.run_id,
         sarif_path,
         source_path,
-        ",".join(config.languages),
+        ",".join(languages),
         config.enable_llm,
         config.enable_external_tools,
     )
@@ -48,7 +50,6 @@ def run_judgement(
     LOG.info("报告解析完成 findings=%s report=%s", len(findings), sarif_path)
     project_context = load_project_context(config.skills_path)
     LOG.info("项目知识库加载完成 facts=%s skills=%s", len(project_context.facts), config.skills_path)
-    indexer = SourceIndexer(source_path, config.languages)
     analyzer_settings = AnalyzerSettings(
         enabled=config.enable_external_tools,
         auto_index=config.auto_index_tools,
@@ -59,7 +60,7 @@ def run_judgement(
         project_context=project_context,
         analyzers=AnalyzerSuite(),
         analyzer_settings=analyzer_settings,
-        languages=config.languages,
+        languages=languages,
     )
     affirmative_provider, negative_provider = _resolve_providers(config)
     LOG.info(
@@ -106,7 +107,7 @@ def run_judgement(
                 created_at=created_at,
                 source_path=str(source_path),
                 sarif_path=str(sarif_path),
-                languages=list(config.languages),
+                languages=list(languages),
                 finding_count=len(findings),
                 project_context_facts=len(project_context.facts),
                 reports=list(partial_reports if partial_reports is not None else reports),
@@ -156,7 +157,7 @@ def run_judgement(
         created_at=created_at,
         source_path=str(source_path),
         sarif_path=str(sarif_path),
-        languages=list(config.languages),
+        languages=list(languages),
         finding_count=len(findings),
         project_context_facts=len(project_context.facts),
         reports=reports,

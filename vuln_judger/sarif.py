@@ -63,6 +63,10 @@ def parse_sarif(data: Dict[str, Any]) -> List[Finding]:
 def parse_markdown_report(text: str) -> List[Finding]:
     findings: List[Finding] = []
     sections = _markdown_sections(text)
+    if _should_parse_markdown_as_single_report(text, sections):
+        document = _single_markdown_section(text)
+        finding = _finding_from_markdown_section(0, document, allow_loose=True)
+        return [finding] if finding is not None else []
     for result_index, section in enumerate(sections):
         finding = _finding_from_markdown_section(result_index, section)
         if finding is not None:
@@ -193,6 +197,9 @@ _LOCATION_RE = re.compile(
     r"|(?:\s*,?\s*第\s*(?P<line_cn>\d+)\s*行)"
     r"(?:\s*,?\s*第?\s*(?P<column_cn>\d+)\s*列)?)?"
 )
+_MARKDOWN_SYMBOL_RE = re.compile(
+    r"`(?P<symbol>[A-Za-z_~][\w:~]*(?:::[A-Za-z_~][\w:~]*)*)\s*\([^`]*\)`"
+)
 _RULE_KEYS = {"rule", "ruleid", "check", "checkid", "id", "cwe", "cweid", "vulnerabilitytype"}
 _MESSAGE_KEYS = {"message", "description", "summary", "details", "title", "issue"}
 _LEVEL_KEYS = {"severity", "level", "priority", "risk"}
@@ -228,6 +235,65 @@ _FLOW_HEADINGS = {
     "执行路径",
     "路径",
     "轨迹",
+}
+_REPORT_SECTION_HEADINGS = {
+    "summary",
+    "overview",
+    "description",
+    "details",
+    "affected code",
+    "affected files",
+    "affected components",
+    "root cause",
+    "cause",
+    "impact",
+    "confirmed impact",
+    "evidence",
+    "proof of concept",
+    "poc",
+    "reproduction",
+    "recommended fix",
+    "recommendation",
+    "recommendations",
+    "remediation",
+    "fix",
+    "fixes",
+    "mitigation",
+    "exploitability",
+    "rce status",
+    "摘要",
+    "概述",
+    "描述",
+    "详情",
+    "受影响代码",
+    "受影响文件",
+    "影响",
+    "确认影响",
+    "根因",
+    "根本原因",
+    "证据",
+    "复现",
+    "修复建议",
+    "建议修复",
+    "缓解措施",
+    "利用条件",
+}
+_REFERENCE_SECTION_HEADINGS = {
+    "evidence",
+    "references",
+    "reference",
+    "artifacts",
+    "attachments",
+    "proof of concept",
+    "poc",
+    "related files",
+    "supporting files",
+    "证据",
+    "参考",
+    "参考资料",
+    "附件",
+    "相关文件",
+    "复现材料",
 }
 _MARKDOWN_KEY_ALIASES = {
     "规则": "rule",
@@ -312,6 +378,53 @@ def _is_finding_heading(level: int, title: str) -> bool:
     )
 
 
+def _is_explicit_finding_heading(title: str) -> bool:
+    lowered = title.lower()
+    return any(
+        term in lowered
+        for term in ("finding", "issue", "vulnerability", "result", "alert", "rule", "cwe-", "cve-", "发现", "问题", "漏洞", "结果", "告警", "规则")
+    )
+
+
+def _is_report_section_heading(title: str) -> bool:
+    normalized = re.sub(r"[\s_/\-:：]+", " ", title.strip().lower())
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff ]", "", normalized).strip()
+    return normalized in _REPORT_SECTION_HEADINGS
+
+
+def _is_reference_section_heading(title: str) -> bool:
+    normalized = re.sub(r"[\s_/\-:：]+", " ", title.strip().lower())
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff ]", "", normalized).strip()
+    return normalized in _REFERENCE_SECTION_HEADINGS
+
+
+def _should_parse_markdown_as_single_report(text: str, sections: List[_MarkdownSection]) -> bool:
+    if len(sections) <= 1:
+        return False
+    headings = [
+        (len(match.group(1)), _clean_markdown_inline(match.group(2)))
+        for line in text.splitlines()
+        if (match := _MARKDOWN_HEADING_RE.match(line))
+    ]
+    if any(_is_explicit_finding_heading(title) for _level, title in headings):
+        return False
+    top_level_count = sum(1 for level, _title in headings if level == 1)
+    report_section_count = sum(1 for level, title in headings if level >= 2 and _is_report_section_heading(title))
+    return top_level_count == 1 and report_section_count >= 2
+
+
+def _single_markdown_section(text: str) -> _MarkdownSection:
+    title = "Markdown 报告"
+    start_line = 1
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        heading = _MARKDOWN_HEADING_RE.match(line)
+        if heading:
+            title = _clean_markdown_inline(heading.group(2)) or title
+            start_line = line_number
+            break
+    return _MarkdownSection(title=title, lines=text.splitlines(), start_line=start_line)
+
+
 def _is_flow_heading(title: str) -> bool:
     normalized = re.sub(r"\s+", " ", title.strip().lower())
     return normalized in _FLOW_HEADINGS
@@ -331,11 +444,13 @@ def _finding_from_markdown_section(
     fields: Dict[str, str] = {}
     explicit_finding_field = False
     in_flow = False
+    in_reference_section = False
 
     for line in section.lines:
         heading = _MARKDOWN_HEADING_RE.match(line)
         if heading:
             title = _clean_markdown_inline(heading.group(2))
+            in_reference_section = _is_reference_section_heading(title)
             if _is_flow_heading(title):
                 if current_flow:
                     code_flows.append(_dedupe_locations(current_flow))
@@ -387,7 +502,7 @@ def _finding_from_markdown_section(
         if parsed_locations:
             if in_flow:
                 current_flow.extend(parsed_locations)
-            else:
+            elif not in_reference_section:
                 locations.extend(parsed_locations)
 
     if current_flow:
@@ -448,8 +563,18 @@ def _parse_markdown_locations(value: str) -> List[SourceLocation]:
         raw_file = match.group("file")
         line = _optional_int(match.group("line") or match.group("line_word") or match.group("line_cn"))
         column = _optional_int(match.group("column") or match.group("column_word") or match.group("column_cn"))
-        locations.append(SourceLocation(file=_normalize_markdown_file(raw_file), line=line, column=column))
+        symbol = _markdown_symbol_from_context(value[match.end() :]) or _markdown_symbol_from_context(value)
+        locations.append(SourceLocation(file=_normalize_markdown_file(raw_file), line=line, column=column, symbol=symbol))
     return _dedupe_locations(locations)
+
+
+def _markdown_symbol_from_context(value: str) -> Optional[str]:
+    for match in _MARKDOWN_SYMBOL_RE.finditer(value):
+        symbol = match.group("symbol").strip()
+        if "." in symbol and "::" not in symbol:
+            continue
+        return symbol
+    return None
 
 
 def _normalize_markdown_file(raw_file: str) -> str:
@@ -465,7 +590,14 @@ def _apply_line_to_last_location(locations: List[SourceLocation], line: Optional
     latest = locations[-1]
     if latest.line is not None:
         return locations
-    updated = SourceLocation(file=latest.file, line=line, column=latest.column)
+    updated = SourceLocation(
+        file=latest.file,
+        line=line,
+        column=latest.column,
+        end_line=latest.end_line,
+        end_column=latest.end_column,
+        symbol=latest.symbol,
+    )
     return locations[:-1] + [updated]
 
 
@@ -475,7 +607,14 @@ def _apply_column_to_last_location(locations: List[SourceLocation], column: Opti
     latest = locations[-1]
     if latest.column is not None:
         return locations
-    updated = SourceLocation(file=latest.file, line=latest.line, column=column)
+    updated = SourceLocation(
+        file=latest.file,
+        line=latest.line,
+        column=column,
+        end_line=latest.end_line,
+        end_column=latest.end_column,
+        symbol=latest.symbol,
+    )
     return locations[:-1] + [updated]
 
 
@@ -483,7 +622,7 @@ def _dedupe_locations(locations: List[SourceLocation]) -> List[SourceLocation]:
     seen = set()
     result: List[SourceLocation] = []
     for location in locations:
-        key = location.display()
+        key = (location.display(), location.symbol)
         if key in seen:
             continue
         seen.add(key)

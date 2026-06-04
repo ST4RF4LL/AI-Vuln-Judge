@@ -1,0 +1,503 @@
+from __future__ import annotations
+
+import json
+import sys
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, TextIO, Tuple
+
+from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
+from .analyzers import AnalyzerSettings, AnalyzerSuite
+from .api import DEFAULT_RECORDS_DIR, _export_run_markdown
+from .evidence import EvidenceCollector
+from .mcp_config import DEFAULT_MCP_SERVERS_FILE
+from .models import RunConfig, SourceLocation, to_jsonable
+from .pipeline import run_judgement
+from .providers import DEFAULT_PROVIDERS_FILE
+from .records import RunRecordStore
+from .sarif import load_report
+from .skills import DEFAULT_SKILLS_FILE, load_project_context
+from .source import SourceIndexer
+
+
+MCP_PROTOCOL_VERSION = "2024-11-05"
+SERVER_NAME = "vuln-judger-mcp"
+SERVER_VERSION = "0.1.0"
+
+
+@dataclass
+class JudgerMCPSettings:
+    records_dir: Path = DEFAULT_RECORDS_DIR
+    providers_file: Path = DEFAULT_PROVIDERS_FILE
+    mcp_servers_file: Path = DEFAULT_MCP_SERVERS_FILE
+    skills_file: Path = DEFAULT_SKILLS_FILE
+    agents_dir: Path = DEFAULT_AGENTS_DIR
+
+
+class JudgerMCPServer:
+    def __init__(
+        self,
+        settings: Optional[JudgerMCPSettings] = None,
+        stdin: Optional[TextIO] = None,
+        stdout: Optional[TextIO] = None,
+    ):
+        self.settings = settings or JudgerMCPSettings()
+        self.stdin = stdin or sys.stdin
+        self.stdout = stdout or sys.stdout
+        self.records = RunRecordStore(self.settings.records_dir)
+        self.agent_store = AgentDirectoryStore(self.settings.agents_dir)
+        self.tools = _tool_specs()
+
+    def serve_forever(self) -> None:
+        while True:
+            incoming = _read_message(self.stdin)
+            if incoming is None:
+                return
+            message, framing = incoming
+            response = self._handle_message(message)
+            if response is not None:
+                _write_message(self.stdout, response, framing)
+
+    def _handle_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        request_id = message.get("id")
+        method = str(message.get("method") or "")
+        if request_id is None and method.startswith("notifications/"):
+            return None
+        try:
+            if method == "initialize":
+                return _result(
+                    request_id,
+                    {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                    },
+                )
+            if method == "ping":
+                return _result(request_id, {})
+            if method == "tools/list":
+                return _result(request_id, {"tools": self.tools})
+            if method == "tools/call":
+                params = message.get("params") or {}
+                name = str(params.get("name") or "")
+                arguments = params.get("arguments") or {}
+                return self._tool_response(request_id, name, arguments if isinstance(arguments, dict) else {})
+            if method in {"resources/list", "prompts/list"}:
+                key = "resources" if method == "resources/list" else "prompts"
+                return _result(request_id, {key: []})
+            return _error(request_id, -32601, f"Method not found: {method}")
+        except Exception as exc:
+            return _error(request_id, -32603, str(exc), {"traceback": traceback.format_exc(limit=8)})
+
+    def _tool_response(self, request_id: Any, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            payload = self._call_tool(name, arguments)
+            return _tool_result(request_id, payload)
+        except Exception as exc:
+            return _tool_result(
+                request_id,
+                {"error": str(exc), "tool": name, "traceback": traceback.format_exc(limit=8)},
+                is_error=True,
+            )
+
+    def _call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        if name == "judge_report":
+            return self._judge_report(arguments)
+        if name == "collect_evidence":
+            return self._collect_evidence(arguments)
+        if name == "resolve_report_locations":
+            return self._resolve_report_locations(arguments)
+        if name == "list_runs":
+            return self._list_runs(arguments)
+        if name == "get_run":
+            return self._get_run(arguments)
+        if name == "get_finding":
+            return self._get_finding(arguments)
+        if name == "export_run_markdown":
+            return self._export_run_markdown(arguments)
+        raise ValueError(f"Unknown tool: {name}")
+
+    def _judge_report(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        report_path = _required_path(arguments, "report_path")
+        source_path = _required_path(arguments, "source_path")
+        skills_path = _optional_path(arguments.get("skills_path"))
+        run_id = _optional_text(arguments.get("run_id"))
+        enable_llm = bool(arguments.get("enable_llm", False))
+        config = RunConfig(
+            sarif_path=report_path,
+            source_path=source_path,
+            skills_path=skills_path,
+            providers_file=_optional_path(arguments.get("providers_file")) or self.settings.providers_file,
+            mcp_servers_file=_optional_path(arguments.get("mcp_servers_file")) or self.settings.mcp_servers_file,
+            run_id=run_id,
+            max_rounds=int(arguments.get("max_rounds") or 4),
+            auto_index_tools=bool(arguments.get("auto_index_tools", False)),
+            enable_external_tools=bool(arguments.get("enable_external_tools", True)),
+            enable_llm=enable_llm,
+            affirmative_provider_id=_optional_text(arguments.get("affirmative_provider_id")),
+            negative_provider_id=_optional_text(arguments.get("negative_provider_id")),
+            affirmative_agent=self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile"))),
+            negative_agent=self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile"))),
+        )
+        report = run_judgement(config)
+        saved = bool(arguments.get("save", True))
+        payload = to_jsonable(report)
+        if saved:
+            self.records.save_payload(payload)
+        result = _run_summary(payload)
+        result["saved"] = saved
+        result["record_path"] = str(self.records._path(report.run_id)) if saved else None
+        if bool(arguments.get("include_report", False)):
+            result["report"] = payload
+        return result
+
+    def _collect_evidence(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        finding, findings, indexer, collector = self._collector_context(arguments)
+        bundle = collector.collect(finding)
+        return {
+            "finding_count": len(findings),
+            "selected_finding": _finding_brief(finding),
+            "diagnostics": bundle.diagnostics,
+            "evidence": to_jsonable(bundle.evidence),
+        }
+
+    def _resolve_report_locations(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        report_path = _required_path(arguments, "report_path")
+        source_path = _required_path(arguments, "source_path")
+        findings = load_report(report_path)
+        indexer = SourceIndexer(source_path)
+        max_snippets = int(arguments.get("max_snippets") or 12)
+        snippet_count = 0
+        result = []
+        for finding in findings:
+            locations = []
+            for location in finding.locations:
+                resolved = indexer.resolve_location(location)
+                item = {
+                    "requested": location.display(),
+                    "requested_file": location.file,
+                    "resolved_file": resolved.relative_path,
+                    "exists": resolved.exists,
+                    "line_exists": resolved.line_exists,
+                    "language": resolved.language,
+                    "symbol": resolved.symbol,
+                    "location": to_jsonable(
+                        SourceLocation(
+                            file=resolved.relative_path,
+                            line=resolved.requested.line,
+                            column=resolved.requested.column,
+                            end_line=resolved.requested.end_line,
+                            end_column=resolved.requested.end_column,
+                            symbol=resolved.symbol or resolved.requested.symbol,
+                        )
+                    ),
+                }
+                if resolved.snippet and snippet_count < max_snippets:
+                    item["snippet"] = resolved.snippet
+                    snippet_count += 1
+                locations.append(item)
+            result.append({**_finding_brief(finding), "locations": locations, "code_flow_count": len(finding.code_flows)})
+        return {"finding_count": len(findings), "findings": result}
+
+    def _list_runs(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        limit = int(arguments.get("limit") or 50)
+        return {"runs": self.records.list()[:limit]}
+
+    def _get_run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        run = self._load_run(arguments)
+        if bool(arguments.get("include_reports", False)):
+            return run
+        return _run_summary(run)
+
+    def _get_finding(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        run = self._load_run(arguments)
+        finding_id = _required_text(arguments, "finding_id")
+        for report in run.get("reports") or []:
+            if report.get("finding_id") == finding_id:
+                return report
+        raise ValueError(f"Finding not found: {finding_id}")
+
+    def _export_run_markdown(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        run = self._load_run(arguments)
+        return {"run_id": run.get("run_id"), "markdown": _export_run_markdown(run)}
+
+    def _load_run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        run_id = _required_text(arguments, "run_id")
+        run = self.records.get(run_id)
+        if run is None:
+            raise ValueError(f"Run not found: {run_id}")
+        return run
+
+    def _collector_context(
+        self, arguments: Dict[str, Any]
+    ) -> Tuple[Any, Sequence[Any], SourceIndexer, EvidenceCollector]:
+        report_path = _required_path(arguments, "report_path")
+        source_path = _required_path(arguments, "source_path")
+        findings = load_report(report_path)
+        finding = _select_finding(findings, arguments)
+        indexer = SourceIndexer(source_path)
+        languages = list(indexer.languages)
+        project_context = load_project_context(_optional_path(arguments.get("skills_path")))
+        collector = EvidenceCollector(
+            indexer=indexer,
+            project_context=project_context,
+            analyzers=AnalyzerSuite(),
+            analyzer_settings=AnalyzerSettings(
+                enabled=bool(arguments.get("enable_external_tools", True)),
+                auto_index=bool(arguments.get("auto_index_tools", False)),
+                mcp_servers_file=_optional_path(arguments.get("mcp_servers_file")) or self.settings.mcp_servers_file,
+            ),
+            languages=languages,
+        )
+        return finding, findings, indexer, collector
+
+
+def serve_mcp(settings: Optional[JudgerMCPSettings] = None) -> None:
+    JudgerMCPServer(settings=settings).serve_forever()
+
+
+def _tool_specs() -> List[Dict[str, Any]]:
+    return [
+        _tool(
+            "judge_report",
+            "Run vuln-judger on a SARIF or Markdown report and optionally save the run record.",
+            {
+                "report_path": {"type": "string", "description": "SARIF/JSON/Markdown report path."},
+                "source_path": {"type": "string", "description": "Source tree root path."},
+                "skills_path": {"type": "string", "description": "Optional project skills directory."},
+                "max_rounds": {"type": "integer", "minimum": 1, "default": 4},
+                "enable_external_tools": {"type": "boolean", "default": True},
+                "auto_index_tools": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Automatically build an Atlas index when .atlas/atlas.db is missing.",
+                },
+                "enable_llm": {"type": "boolean", "default": False},
+                "save": {"type": "boolean", "default": True},
+                "include_report": {"type": "boolean", "default": False},
+                "run_id": {"type": "string"},
+            },
+            ["report_path", "source_path"],
+        ),
+        _tool(
+            "collect_evidence",
+            "Collect source, SARIF, Atlas, search and impact evidence for one finding without running debate.",
+            _analysis_properties(),
+            ["report_path", "source_path"],
+        ),
+        _tool(
+            "resolve_report_locations",
+            "Resolve report locations against a source tree and return snippets for validation.",
+            {
+                "report_path": {"type": "string"},
+                "source_path": {"type": "string"},
+                "max_snippets": {"type": "integer", "minimum": 0, "default": 12},
+            },
+            ["report_path", "source_path"],
+        ),
+        _tool(
+            "list_runs",
+            "List saved vuln-judger run records.",
+            {"limit": {"type": "integer", "minimum": 1, "default": 50}},
+            [],
+        ),
+        _tool(
+            "get_run",
+            "Get a saved run summary or full run report.",
+            {"run_id": {"type": "string"}, "include_reports": {"type": "boolean", "default": False}},
+            ["run_id"],
+        ),
+        _tool(
+            "get_finding",
+            "Get one finding report from a saved run.",
+            {"run_id": {"type": "string"}, "finding_id": {"type": "string"}},
+            ["run_id", "finding_id"],
+        ),
+        _tool(
+            "export_run_markdown",
+            "Export a saved run as Markdown.",
+            {"run_id": {"type": "string"}},
+            ["run_id"],
+        ),
+    ]
+
+
+def _analysis_properties() -> Dict[str, Any]:
+    return {
+        "report_path": {"type": "string"},
+        "source_path": {"type": "string"},
+        "skills_path": {"type": "string"},
+        "finding_index": {"type": "integer", "minimum": 0},
+        "finding_id": {"type": "string"},
+        "rule_id": {"type": "string"},
+        "enable_external_tools": {"type": "boolean", "default": True},
+        "auto_index_tools": {
+            "type": "boolean",
+            "default": False,
+            "description": "Automatically build an Atlas index when .atlas/atlas.db is missing.",
+        },
+        "mcp_servers_file": {"type": "string"},
+    }
+
+
+def _tool(name: str, description: str, properties: Dict[str, Any], required: Sequence[str]) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": properties,
+            "required": list(required),
+            "additionalProperties": False,
+        },
+    }
+
+def _read_message(stdin: TextIO) -> Optional[Tuple[Dict[str, Any], str]]:
+    raw_line = stdin.buffer.readline() if hasattr(stdin, "buffer") else stdin.readline().encode("utf-8")
+    while raw_line in {b"\n", b"\r\n"}:
+        raw_line = stdin.buffer.readline() if hasattr(stdin, "buffer") else stdin.readline().encode("utf-8")
+    if not raw_line:
+        return None
+    if raw_line.lower().startswith(b"content-length:"):
+        headers = [raw_line]
+        while True:
+            line = stdin.buffer.readline() if hasattr(stdin, "buffer") else stdin.readline().encode("utf-8")
+            if not line:
+                return None
+            if line in {b"\n", b"\r\n"}:
+                break
+            headers.append(line)
+        length = _content_length(headers)
+        body = stdin.buffer.read(length) if hasattr(stdin, "buffer") else stdin.read(length).encode("utf-8")
+        return json.loads(body.decode("utf-8")), "header"
+    return json.loads(raw_line.decode("utf-8")), "line"
+
+
+def _write_message(stdout: TextIO, message: Dict[str, Any], framing: str) -> None:
+    raw = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if framing == "header":
+        stdout.buffer.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
+        stdout.buffer.flush()
+    else:
+        stdout.write(raw.decode("utf-8") + "\n")
+        stdout.flush()
+
+
+def _content_length(headers: Iterable[bytes]) -> int:
+    for header in headers:
+        name, _, value = header.partition(b":")
+        if name.strip().lower() == b"content-length":
+            return int(value.strip())
+    raise ValueError("Missing Content-Length header")
+
+
+def _result(request_id: Any, result: Any) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def _error(request_id: Any, code: int, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    error = {"code": code, "message": message}
+    if data:
+        error["data"] = data
+    return {"jsonrpc": "2.0", "id": request_id, "error": error}
+
+
+def _tool_result(request_id: Any, payload: Any, is_error: bool = False) -> Dict[str, Any]:
+    return _result(
+        request_id,
+        {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2, sort_keys=True),
+                }
+            ],
+            "isError": is_error,
+        },
+    )
+
+
+def _required_path(arguments: Dict[str, Any], key: str) -> Path:
+    value = _required_text(arguments, key)
+    return Path(value).expanduser().resolve()
+
+
+def _optional_path(value: Any) -> Optional[Path]:
+    text = _optional_text(value)
+    return Path(text).expanduser().resolve() if text else None
+
+
+def _required_text(arguments: Dict[str, Any], key: str) -> str:
+    value = _optional_text(arguments.get(key))
+    if not value:
+        raise ValueError(f"{key} is required")
+    return value
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+def _select_finding(findings: Sequence[Any], arguments: Dict[str, Any]) -> Any:
+    if not findings:
+        raise ValueError("Report contains no findings")
+    finding_id = _optional_text(arguments.get("finding_id"))
+    if finding_id:
+        for finding in findings:
+            if finding.finding_id == finding_id:
+                return finding
+        raise ValueError(f"finding_id not found: {finding_id}")
+    rule_id = _optional_text(arguments.get("rule_id"))
+    if rule_id:
+        for finding in findings:
+            if finding.rule_id == rule_id:
+                return finding
+        raise ValueError(f"rule_id not found: {rule_id}")
+    index = int(arguments.get("finding_index") or 0)
+    if index < 0 or index >= len(findings):
+        raise ValueError(f"finding_index out of range: {index}")
+    return findings[index]
+
+
+def _finding_brief(finding: Any) -> Dict[str, Any]:
+    return {
+        "finding_id": finding.finding_id,
+        "rule_id": finding.rule_id,
+        "level": finding.level,
+        "message": finding.message,
+        "locations": [location.display() for location in finding.locations],
+    }
+
+
+def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
+    reports = run.get("reports") or []
+    counts: Dict[str, int] = {}
+    finding_summaries = []
+    for report in reports:
+        verdict = str(report.get("verdict") or "UNKNOWN")
+        counts[verdict] = counts.get(verdict, 0) + 1
+        finding_summaries.append(
+            {
+                "finding_id": report.get("finding_id"),
+                "rule_id": report.get("rule_id"),
+                "verdict": report.get("verdict"),
+                "confidence": report.get("confidence"),
+                "summary": report.get("reasoning_summary"),
+                "source_locations": report.get("source_locations", []),
+            }
+        )
+    return {
+        "run_id": run.get("run_id"),
+        "status": run.get("status", "completed"),
+        "created_at": run.get("created_at"),
+        "source_path": run.get("source_path"),
+        "sarif_path": run.get("sarif_path"),
+        "languages": run.get("languages", []),
+        "finding_count": run.get("finding_count", len(reports)),
+        "verdict_counts": counts,
+        "findings": finding_summaries,
+        "diagnostics": run.get("diagnostics", []),
+    }

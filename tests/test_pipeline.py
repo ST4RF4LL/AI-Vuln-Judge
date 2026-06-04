@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -16,16 +18,52 @@ from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
 from vuln_judger.llm import LLMClient
+from vuln_judger.mcp import MCPStdioClient
 from vuln_judger.mcp_config import MCPServerStore
 from vuln_judger.models import AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, Finding, RunConfig, SourceLocation, Verdict, to_jsonable
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunRecordStore
+from vuln_judger.sarif import parse_markdown_report
 from vuln_judger.skills import SkillSourceStore
-from vuln_judger.source import SourceIndexer
+from vuln_judger.source import SourceIndexer, detect_project_languages
 
 
 class PipelineTests(unittest.TestCase):
+    def test_project_languages_are_detected_from_source_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("print('x')\n", encoding="utf-8")
+            (root / "src" / "lib.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
+            (root / "build").mkdir()
+            (root / "build" / "Generated.java").write_text("class Generated {}\n", encoding="utf-8")
+
+            profile = detect_project_languages(root)
+
+            self.assertEqual(profile.file_counts, {"python": 1, "cpp": 1})
+            self.assertEqual(profile.total_supported_files, 2)
+            self.assertFalse(profile.fallback_used)
+            self.assertEqual(set(profile.languages), {"python", "cpp"})
+
+    def test_run_uses_detected_project_languages_not_payload_languages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, skills = write_python_fixture(root)
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    skills_path=skills,
+                    languages=["java"],
+                    enable_external_tools=False,
+                )
+            )
+            self.assertEqual(report.languages, ["python"])
+            source_root = next(item for item in report.reports[0].evidence_chain if item.kind == EvidenceKind.SOURCE_ROOT)
+            self.assertEqual(source_root.data["languages"], ["python"])
+            self.assertEqual(source_root.data["language_file_counts"], {"python": 1})
+
     def test_python_code_flow_becomes_true_positive(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -114,6 +152,89 @@ class PipelineTests(unittest.TestCase):
                 item for item in report.reports[0].evidence_chain if item.kind == EvidenceKind.SOURCE_LOCATION
             ]
             self.assertTrue(all(item.data["line_exists"] for item in source_evidence))
+
+    def test_markdown_single_vulnerability_report_sections_are_merged(self):
+        markdown = "\n".join(
+            [
+                "# FAISS-PANORAMA-DESER-OOB",
+                "",
+                "## Summary",
+                "",
+                "Malformed serialized `IndexFlatPanorama` objects are accepted by `faiss::read_index()`.",
+                "",
+                "Severity: High",
+                "",
+                "## Affected Code",
+                "",
+                "- `/tmp/faiss/faiss/impl/index_read.cpp`: `IxFP` branch in `read_index_up()`",
+                "- `/tmp/faiss/faiss/impl/Panorama.h`: search-time cumulative-sum reads",
+                "- `/tmp/faiss/faiss/IndexFlat.cpp`: `IndexFlatPanorama::permute_entries()`",
+                "- `/tmp/faiss/faiss/impl/Panorama.cpp`: `Panorama::copy_entry()`",
+                "",
+                "## Root Cause",
+                "",
+                "The deserializer does not validate serialized vector sizes.",
+                "",
+                "## Evidence",
+                "",
+                "- `pocs/panorama_exp.py`",
+                "- `pocs/panorama_trigger.cpp`",
+                "",
+                "## Recommended Fix",
+                "",
+                "Reject malformed `IxFP` objects during deserialization.",
+            ]
+        )
+        findings = parse_markdown_report(markdown)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].rule_id, "FAISS-PANORAMA-DESER-OOB")
+        self.assertEqual(findings[0].level, "high")
+        self.assertIn("Malformed serialized", findings[0].message)
+        self.assertEqual(
+            [location.file for location in findings[0].locations],
+            [
+                "/tmp/faiss/faiss/impl/index_read.cpp",
+                "/tmp/faiss/faiss/impl/Panorama.h",
+                "/tmp/faiss/faiss/IndexFlat.cpp",
+                "/tmp/faiss/faiss/impl/Panorama.cpp",
+            ],
+        )
+        self.assertEqual(
+            [location.symbol for location in findings[0].locations],
+            [
+                "read_index_up",
+                None,
+                "IndexFlatPanorama::permute_entries",
+                "Panorama::copy_entry",
+            ],
+        )
+
+    def test_source_indexer_resolves_markdown_symbol_locations_without_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "faiss").mkdir()
+            source = root / "faiss" / "IndexFlat.cpp"
+            source.write_text(
+                "\n".join(
+                    [
+                        "namespace faiss {",
+                        "",
+                        "void helper();",
+                        "",
+                        "void IndexFlatPanorama::permute_entries(const idx_t* perm) {",
+                        "    helper();",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            resolved = SourceIndexer(root, ["cpp"]).resolve_location(
+                SourceLocation("faiss/IndexFlat.cpp", symbol="IndexFlatPanorama::permute_entries")
+            )
+            self.assertTrue(resolved.line_exists)
+            self.assertEqual(resolved.requested.line, 5)
+            self.assertEqual(resolved.symbol, "IndexFlatPanorama::permute_entries")
+            self.assertIn("permute_entries", resolved.snippet)
 
     def test_sarif_path_with_redundant_project_prefix_resolves_by_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -466,7 +587,10 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('id="mcp-server-panel"', html)
         self.assertIn('id="skill-source-panel"', html)
         self.assertIn('#mcp-server-panel', html)
-        self.assertIn('min-height: 720px', html)
+        self.assertIn('flex: 1 1 auto', html)
+        self.assertIn('class="wide checkbox-row"', html)
+        self.assertIn('启用 MCP Server', html)
+        self.assertNotIn('min-height: 720px', html)
         self.assertIn('#skill-source-panel', html)
         self.assertIn('min-height: 520px', html)
         self.assertIn('id="mcp-list"', html)
@@ -474,6 +598,9 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('id="default-atlas-mcp"', html)
         self.assertIn('id="default-skill-source"', html)
         self.assertIn('id="run-skill-source"', html)
+        self.assertNotIn('id="run-languages"', html)
+        self.assertIn('自动 Atlas 构建索引', html)
+        self.assertNotIn('自动索引工具', html)
         self.assertIn('id="agent-affirmative-profile-panel"', html)
         self.assertIn('id="agent-negative-profile-panel"', html)
         self.assertIn('#agent-affirmative-profile-panel', html)
@@ -830,6 +957,142 @@ class PipelineTests(unittest.TestCase):
                 llm_server.shutdown()
                 llm_server.server_close()
                 llm_thread.join(timeout=5)
+
+    def test_vuln_judger_mcp_server_tools_run_and_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, skills = write_python_fixture(root)
+            records = root / "records"
+            command = [
+                sys.executable,
+                "-m",
+                "vuln_judger",
+                "mcp",
+                "--records-dir",
+                str(records),
+                "--providers-file",
+                str(root / "providers.json"),
+                "--mcp-servers-file",
+                str(root / "mcp.json"),
+                "--skills-file",
+                str(root / "skills.json"),
+                "--agents-dir",
+                str(root / "agents"),
+            ]
+            with MCPStdioClient(command, cwd=Path.cwd(), timeout=10) as client:
+                tools = {tool.get("name") for tool in client.list_tools()}
+                self.assertIn("judge_report", tools)
+                self.assertIn("collect_evidence", tools)
+                self.assertIn("export_run_markdown", tools)
+
+                resolved = mcp_tool_json(
+                    client.call_tool(
+                        "resolve_report_locations",
+                        {"report_path": str(sarif), "source_path": str(root)},
+                    )
+                )
+                self.assertEqual(resolved["finding_count"], 1)
+                self.assertTrue(resolved["findings"][0]["locations"][0]["line_exists"])
+
+                evidence = mcp_tool_json(
+                    client.call_tool(
+                        "collect_evidence",
+                        {
+                            "report_path": str(sarif),
+                            "source_path": str(root),
+                            "skills_path": str(skills),
+                            "enable_external_tools": False,
+                        },
+                    )
+                )
+                self.assertTrue(any(item["kind"] == "SOURCE_LOCATION" for item in evidence["evidence"]))
+
+                judged = mcp_tool_json(
+                    client.call_tool(
+                        "judge_report",
+                        {
+                            "report_path": str(sarif),
+                            "source_path": str(root),
+                            "skills_path": str(skills),
+                            "enable_external_tools": False,
+                            "save": True,
+                        },
+                    )
+                )
+                self.assertEqual(judged["finding_count"], 1)
+                self.assertTrue(judged["saved"])
+                run_id = judged["run_id"]
+
+                runs = mcp_tool_json(client.call_tool("list_runs", {"limit": 5}))
+                self.assertTrue(any(item["run_id"] == run_id for item in runs["runs"]))
+                run_summary = mcp_tool_json(client.call_tool("get_run", {"run_id": run_id}))
+                finding_id = run_summary["findings"][0]["finding_id"]
+                finding = mcp_tool_json(client.call_tool("get_finding", {"run_id": run_id, "finding_id": finding_id}))
+                self.assertEqual(finding["finding_id"], finding_id)
+                exported = mcp_tool_json(client.call_tool("export_run_markdown", {"run_id": run_id}))
+                self.assertIn("# 漏洞研判报告", exported["markdown"])
+
+    def test_vuln_judger_mcp_server_supports_content_length_framing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "vuln_judger",
+                    "mcp",
+                    "--records-dir",
+                    str(root / "records"),
+                    "--providers-file",
+                    str(root / "providers.json"),
+                    "--mcp-servers-file",
+                    str(root / "mcp.json"),
+                    "--skills-file",
+                    str(root / "skills.json"),
+                    "--agents-dir",
+                    str(root / "agents"),
+                ],
+                cwd=str(Path.cwd()),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                send_mcp_header_message(
+                    process,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": {"name": "unit", "version": "test"},
+                        },
+                    },
+                )
+                initialized = read_mcp_header_message(process)
+                self.assertEqual(initialized["result"]["serverInfo"]["name"], "vuln-judger-mcp")
+                send_mcp_header_message(process, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+                tools = read_mcp_header_message(process)
+                self.assertTrue(any(tool["name"] == "judge_report" for tool in tools["result"]["tools"]))
+            finally:
+                if process.stdin is not None:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
 
     def test_affirmative_and_negative_use_independent_clients(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1250,6 +1513,42 @@ for raw in sys.stdin:
         else:
             tool_response(request_id, {"error": "unknown tool"}, True)
 '''
+
+
+def mcp_tool_json(response):
+    result = response.get("result") or {}
+    content = result.get("content") or []
+    text = "\n".join(item.get("text") or "" for item in content if item.get("type") == "text")
+    return json.loads(text)
+
+
+def send_mcp_header_message(process, payload):
+    assert process.stdin is not None
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    process.stdin.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
+    process.stdin.flush()
+
+
+def read_mcp_header_message(process):
+    assert process.stdout is not None
+    headers = []
+    while True:
+        line = process.stdout.readline()
+        if not line:
+            raise AssertionError("MCP server closed stdout")
+        if line in {b"\n", b"\r\n"}:
+            break
+        headers.append(line)
+    length = None
+    for header in headers:
+        name, _, value = header.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+            break
+    if length is None:
+        raise AssertionError(f"Missing content-length in {headers!r}")
+    body = process.stdout.read(length)
+    return json.loads(body.decode("utf-8"))
 
 
 def post_json(url, payload):

@@ -77,7 +77,7 @@ class AtlasAnalyzer(Analyzer):
                         evidence_id=evidence_id(finding.finding_id, self.name, "not-indexed"),
                         kind=EvidenceKind.TOOL_DIAGNOSTIC,
                         strength=EvidenceStrength.PARTIAL,
-                        summary="Atlas 已安装，但缺少 .atlas/atlas.db；请先在源码目录执行 atlas index --analysis full，或使用 --auto-index-tools 自动尝试 full analysis 索引",
+                        summary="Atlas 已安装，但缺少 .atlas/atlas.db；请先在源码目录执行 atlas index --analysis full，或使用 --auto-index-tools 自动 Atlas 构建索引",
                         source=self.name,
                     )
                 ]
@@ -150,25 +150,34 @@ class AtlasAnalyzer(Analyzer):
             if resolved.relative_path in seen_files:
                 continue
             seen_files.add(resolved.relative_path)
-            snippet = indexer.snippet(resolved.absolute_path, location.line or 1, before=15, after=15)
-            symbol = resolved.symbol or indexer.symbol_at(resolved.absolute_path, location.line or 1, resolved.language)
+            effective = resolved.requested
+            effective_line = effective.line or 1
+            snippet = indexer.snippet(resolved.absolute_path, effective_line, before=15, after=15)
+            symbol = resolved.symbol or indexer.symbol_at(resolved.absolute_path, effective_line, resolved.language)
             language = resolved.language or "unknown"
             if symbol:
-                summary = f"直接阅读源码 {resolved.relative_path}:{location.line}，邻近符号 `{symbol}`"
+                summary = f"直接阅读源码 {resolved.relative_path}:{effective.line}，邻近符号 `{symbol}`"
             else:
-                summary = f"直接阅读源码 {resolved.relative_path}:{location.line}，已提取代码上下文"
+                summary = f"直接阅读源码 {resolved.relative_path}:{effective.line}，已提取代码上下文"
             evidence.append(
                 CodeEvidence(
-                    evidence_id=evidence_id(finding.finding_id, self.name, "direct-source", resolved.relative_path, str(location.line)),
+                    evidence_id=evidence_id(finding.finding_id, self.name, "direct-source", resolved.relative_path, str(effective.line)),
                     kind=EvidenceKind.SOURCE_LOCATION,
                     strength=EvidenceStrength.MEDIUM,
                     summary=summary,
                     source=self.name,
-                    locations=[SourceLocation(file=resolved.relative_path, line=location.line, column=location.column)],
+                    locations=[
+                        SourceLocation(
+                            file=resolved.relative_path,
+                            line=effective.line,
+                            column=effective.column,
+                            symbol=symbol,
+                        )
+                    ],
                     snippet=snippet,
                     data={
                         "file": resolved.relative_path,
-                        "line": location.line,
+                        "line": effective.line,
                         "language": language,
                         "symbol": symbol,
                         "direct_read": True,
@@ -321,8 +330,14 @@ class AtlasAnalyzer(Analyzer):
                     continue
                 matched_files.append(resolved.relative_path)
                 statuses[resolved.relative_path] = str(item.get("status") or "unknown")
+                effective = resolved.requested
                 matched_locations.append(
-                    SourceLocation(file=resolved.relative_path, line=location.line, column=location.column)
+                    SourceLocation(
+                        file=resolved.relative_path,
+                        line=effective.line,
+                        column=effective.column,
+                        symbol=resolved.symbol or effective.symbol,
+                    )
                 )
                 break
         matched_files = list(dict.fromkeys(matched_files))

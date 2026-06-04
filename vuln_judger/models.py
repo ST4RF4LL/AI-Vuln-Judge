@@ -45,6 +45,7 @@ class SourceLocation:
     column: Optional[int] = None
     end_line: Optional[int] = None
     end_column: Optional[int] = None
+    symbol: Optional[str] = None
 
     def display(self) -> str:
         if self.line is None:
@@ -154,7 +155,7 @@ class RunConfig:
     providers_file: Optional[Path] = None
     mcp_servers_file: Optional[Path] = None
     run_id: Optional[str] = None
-    languages: List[str] = field(default_factory=lambda: ["java", "cpp", "python"])
+    languages: List[str] = field(default_factory=list)
     max_rounds: int = 4
     auto_index_tools: bool = False
     enable_external_tools: bool = True

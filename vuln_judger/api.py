@@ -382,9 +382,6 @@ def _config_from_payload(
     mcp_servers_file: Optional[Path] = None,
     skill_store: Optional[SkillSourceStore] = None,
 ) -> RunConfig:
-    languages = payload.get("languages") or ["java", "cpp", "python"]
-    if isinstance(languages, str):
-        languages = [item.strip().lower() for item in languages.split(",") if item.strip()]
     skills_path: Optional[Path] = Path(payload["skills_path"]) if payload.get("skills_path") else None
     skill_source_id = payload.get("skill_source_id")
     if skills_path is None and skill_source_id and skill_store is not None:
@@ -409,7 +406,6 @@ def _config_from_payload(
         providers_file=providers_file,
         mcp_servers_file=mcp_servers_file,
         run_id=run_id,
-        languages=languages,
         max_rounds=int(payload.get("max_rounds") or 4),
         auto_index_tools=bool(payload.get("auto_index_tools") or False),
         enable_external_tools=bool(payload.get("enable_external_tools", True)),
@@ -831,6 +827,18 @@ def app_html() -> str:
     }}
     textarea {{ min-height: 88px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
     label {{ display: grid; gap: 5px; font-size: 12px; color: var(--muted); }}
+    .checkbox-row {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 34px;
+      color: var(--text);
+    }}
+    .checkbox-row input[type="checkbox"] {{
+      width: auto;
+      min-height: 0;
+      padding: 0;
+    }}
     .toolbar {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }}
     .muted {{ color: var(--muted); }}
     .pane {{
@@ -958,7 +966,7 @@ def app_html() -> str:
       grid-auto-rows: max-content;
     }}
     #mcp-server-panel {{
-      min-height: 720px;
+      min-height: 0;
       height: auto;
       overflow: visible;
     }}
@@ -969,9 +977,15 @@ def app_html() -> str:
     }}
     #mcp-server-panel .detail-body,
     #skill-source-panel .detail-body {{
-      min-height: 460px;
+      min-height: 0;
       align-content: start;
       grid-auto-rows: max-content;
+    }}
+    #mcp-server-panel textarea {{
+      min-height: 68px;
+    }}
+    #mcp-description {{
+      min-height: 54px;
     }}
     .form-grid {{ display: grid; grid-template-columns: repeat(2, minmax(160px, 1fr)); gap: 12px; }}
     .form-grid .wide {{ grid-column: 1 / -1; }}
@@ -1087,7 +1101,7 @@ def app_html() -> str:
       border-bottom: 1px solid var(--line);
     }}
     .settings-head h2 {{ margin: 0; font-size: 18px; }}
-    .settings-body {{ padding: 16px; overflow: auto; display: grid; gap: 16px; }}
+    .settings-body {{ flex: 1 1 auto; min-height: 0; padding: 16px; overflow: auto; display: grid; gap: 16px; align-content: start; }}
     .profile-grid {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
@@ -1280,15 +1294,13 @@ def app_html() -> str:
               <label>名称<input id="mcp-name" placeholder="Atlas 默认 MCP"></label>
               <label>类型<input id="mcp-kind" value="atlas"></label>
               <label>命令<input id="mcp-command" placeholder="atlas"></label>
+              <label class="wide checkbox-row"><input id="mcp-enabled" type="checkbox" checked> 启用 MCP Server</label>
               <label class="wide">参数 JSON<textarea id="mcp-args" placeholder='["mcp","--project","{{project}}","--log-format","json"]'></textarea></label>
               <label class="wide">工作目录<input id="mcp-cwd" placeholder="{{project}}"></label>
               <label class="wide">环境变量 JSON<textarea id="mcp-env" placeholder='{{"HTTP_PROXY":"http://127.0.0.1:7890"}}'></textarea></label>
               <label class="wide">说明<textarea id="mcp-description" placeholder="本地 Atlas MCP Server"></textarea></label>
               <label>默认 Atlas MCP<select id="default-atlas-mcp"></select></label>
               <label>测试项目路径<input id="mcp-test-project" placeholder="/path/to/project"></label>
-            </div>
-            <div class="chips">
-              <label><input id="mcp-enabled" type="checkbox" checked> 启用 MCP Server</label>
             </div>
             <div class="toolbar">
               <button id="save-mcp" type="button">保存 MCP</button>
@@ -1345,7 +1357,6 @@ def app_html() -> str:
               <label class="wide">源码路径<input id="run-source" placeholder="fixtures/demo_sarif/source"></label>
               <label>Skill Source<select id="run-skill-source"></select></label>
               <label class="wide">Skills 路径<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
-              <label>语言<input id="run-languages" value="java,cpp,python"></label>
               <label>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
               <label>正方提供商<select id="run-affirmative-provider"></select></label>
               <label>反方提供商<select id="run-negative-provider"></select></label>
@@ -1354,7 +1365,7 @@ def app_html() -> str:
             </div>
             <div class="chips">
               <label><input id="run-external-tools" type="checkbox" checked> 启用外部工具</label>
-              <label><input id="run-auto-index" type="checkbox"> 自动索引工具</label>
+              <label><input id="run-auto-index" type="checkbox"> 自动 Atlas 构建索引</label>
               <label><input id="run-llm" type="checkbox"> 使用 LLM 博弈</label>
             </div>
             <div class="toolbar">
@@ -1428,7 +1439,6 @@ def app_html() -> str:
       runSource: document.getElementById('run-source'),
       runSkillSource: document.getElementById('run-skill-source'),
       runSkills: document.getElementById('run-skills'),
-      runLanguages: document.getElementById('run-languages'),
       runMaxRounds: document.getElementById('run-max-rounds'),
       runAffirmativeProvider: document.getElementById('run-affirmative-provider'),
       runNegativeProvider: document.getElementById('run-negative-provider'),
@@ -2265,7 +2275,6 @@ def app_html() -> str:
       el.runSource.value = 'fixtures/demo_sarif/source';
       el.runSkills.value = 'fixtures/demo_sarif/skills';
       el.runSkillSource.value = '';
-      el.runLanguages.value = 'java,cpp,python';
       el.runMaxRounds.value = '4';
       el.runExternalTools.checked = false;
       el.runAutoIndex.checked = false;
@@ -2278,7 +2287,6 @@ def app_html() -> str:
       el.runSource.value = 'fixtures/demo_sarif/source';
       el.runSkills.value = 'fixtures/demo_sarif/skills';
       el.runSkillSource.value = '';
-      el.runLanguages.value = 'java,cpp,python';
       el.runMaxRounds.value = '4';
       el.runExternalTools.checked = false;
       el.runAutoIndex.checked = false;
@@ -2293,7 +2301,6 @@ def app_html() -> str:
           source_path: el.runSource.value.trim(),
           skill_source_id: el.runSkillSource.value || null,
           skills_path: el.runSkills.value.trim() || null,
-          languages: el.runLanguages.value.trim(),
           max_rounds: Number(el.runMaxRounds.value || 4),
           enable_external_tools: el.runExternalTools.checked,
           auto_index_tools: el.runAutoIndex.checked,

@@ -15,7 +15,6 @@ uv run vuln-judger run \
   --report report.sarif \
   --source ./target-project \
   --skills ./skills \
-  --languages java,cpp,python \
   --out result.json
 ```
 
@@ -29,7 +28,8 @@ uv run vuln-judger run \
 ```
 
 命令会输出 JSON 研判报告，包含每个发现的结论、置信度、证据链、正反方博弈回合、争议点、
-源码位置和建议下一步。默认语言为中文；机器接口字段名和枚举值保持稳定。
+源码位置和建议下一步。项目语言构成会在分析源码目录时自动检测；默认语言为中文；
+机器接口字段名和枚举值保持稳定。
 
 默认情况下，博弈过程是确定性的、证据约束的。配置 OpenAI 兼容 Provider 并使用 `--llm`
 后，可以让模型生成正方/反方回合，最终结论仍由证据规则约束。
@@ -49,7 +49,7 @@ uv run vuln-judger run \
    `存在分歧`，并将整体结论降级为 `INCONCLUSIVE`。
 
 Atlas 证据优先检查 `.atlas/atlas.db`。缺少数据库时，报告会提示执行
-`atlas index --analysis full`；启用 `--auto-index-tools` 时会自动尝试 full analysis 索引。
+`atlas index --analysis full`；启用 `--auto-index-tools` 时会自动 Atlas 构建索引。
 检测到新版 Atlas 的 `mcp` 子命令后，平台会优先通过 `atlas mcp --project <源码目录>`
 调用 `project/status`、`project/files`、`trace`、`search` 和 `calls` 工具，生成
 `atlas-mcp` 来源的源码真实性、数据流和调用图证据。MCP 不可用时才回退到 CLI
@@ -78,6 +78,102 @@ Web 端选择 Skill Source，或继续手动填写 `skills_path`。
 
 Web 端右上角提供 `MCP / Skills` 配置入口，支持 MCP Server 保存、删除、默认 Atlas MCP
 选择、连通性测试，以及 Skill Source 保存、删除、默认知识库选择和加载测试。
+
+## vuln-judger MCP Server
+
+`vuln-judger` 也可以作为 stdio MCP Server 暴露给 Codex、opencode 等 CLI 客户端。客户端
+可以通过 MCP 工具触发漏洞研判、采集证据、解析报告位置、读取历史记录并导出 Markdown。
+
+启动命令：
+
+```bash
+uv run vuln-judger mcp \
+  --records-dir .vuln-judger/runs \
+  --providers-file .vuln-judger/providers.json \
+  --mcp-servers-file .vuln-judger/mcp.json \
+  --skills-file .vuln-judger/skills.json \
+  --agents-dir agents
+```
+
+可用工具：
+
+- `judge_report`：对 SARIF/Markdown 报告和源码目录运行完整研判，可保存 run 记录。
+- `collect_evidence`：只采集某个 finding 的源码、SARIF、Atlas、检索和影响证据，不运行博弈。
+- `resolve_report_locations`：把报告路径映射到源码树中的真实文件并返回代码片段。
+- `list_runs` / `get_run` / `get_finding`：读取历史研判记录。
+- `export_run_markdown`：导出指定 run 的 Markdown 报告。
+
+### Codex 配置
+
+在项目级 `.codex/config.toml` 或全局 `~/.codex/config.toml` 中加入：
+
+```toml
+[mcp_servers.vuln-judger]
+type = "stdio"
+command = "uv"
+args = [
+  "--directory",
+  "/path/to/vuln_judger",
+  "run",
+  "vuln-judger",
+  "mcp",
+  "--records-dir",
+  "/path/to/vuln_judger/.vuln-judger/runs",
+  "--providers-file",
+  "/path/to/vuln_judger/.vuln-judger/providers.json",
+  "--mcp-servers-file",
+  "/path/to/vuln_judger/.vuln-judger/mcp.json",
+  "--skills-file",
+  "/path/to/vuln_judger/.vuln-judger/skills.json",
+  "--agents-dir",
+  "/path/to/vuln_judger/agents",
+]
+startup_timeout_sec = 120
+```
+
+如果 `uv` 不在 Codex 启动环境的 `PATH` 中，把 `command` 改为 `which uv` 输出的绝对路径。
+改完后重启 Codex 会话，再让 Codex 使用 `vuln-judger` MCP 工具即可。
+
+### opencode 配置
+
+在项目级或全局 `opencode.jsonc` 中加入：
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "vuln-judger": {
+      "type": "local",
+      "command": [
+        "uv",
+        "--directory",
+        "/path/to/vuln_judger",
+        "run",
+        "vuln-judger",
+        "mcp",
+        "--records-dir",
+        "/path/to/vuln_judger/.vuln-judger/runs",
+        "--providers-file",
+        "/path/to/vuln_judger/.vuln-judger/providers.json",
+        "--mcp-servers-file",
+        "/path/to/vuln_judger/.vuln-judger/mcp.json",
+        "--skills-file",
+        "/path/to/vuln_judger/.vuln-judger/skills.json",
+        "--agents-dir",
+        "/path/to/vuln_judger/agents"
+      ],
+      "enabled": true,
+      "timeout": 120000
+    }
+  }
+}
+```
+
+opencode 的本地 MCP server 使用 `type: "local"`，并把启动命令及参数放在同一个
+`command` 数组中。改完后重启 opencode，或执行 `opencode mcp list` 检查 server 状态。
+
+以上示例中的 `/path/to/vuln_judger` 需要替换为本仓库绝对路径。若 MCP 客户端从本仓库
+目录内启动，也可以把 `.vuln-judger/...`、`agents` 等参数改回相对路径。
 
 ## LLM 提供商
 
