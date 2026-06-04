@@ -98,6 +98,7 @@ uv run vuln-judger mcp \
 可用工具：
 
 - `judge_report`：对 SARIF/Markdown 报告和源码目录运行完整研判，可保存 run 记录。
+- `one_round_judge`：对单个 finding 使用默认配置进行单轮快速验证，返回缺失证据和补证建议。
 - `collect_evidence`：只采集某个 finding 的源码、SARIF、Atlas、检索和影响证据，不运行博弈。
 - `resolve_report_locations`：把报告路径映射到源码树中的真实文件并返回代码片段。
 - `list_runs` / `get_run` / `get_finding`：读取历史研判记录。

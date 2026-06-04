@@ -1027,6 +1027,7 @@ for raw in sys.stdin.buffer:
             with MCPStdioClient(command, cwd=Path.cwd(), timeout=10) as client:
                 tools = {tool.get("name") for tool in client.list_tools()}
                 self.assertIn("judge_report", tools)
+                self.assertIn("one_round_judge", tools)
                 self.assertIn("collect_evidence", tools)
                 self.assertIn("export_run_markdown", tools)
 
@@ -1051,6 +1052,32 @@ for raw in sys.stdin.buffer:
                     )
                 )
                 self.assertTrue(any(item["kind"] == "SOURCE_LOCATION" for item in evidence["evidence"]))
+
+                quick = mcp_tool_json(
+                    client.call_tool(
+                        "one_round_judge",
+                        {
+                            "report_path": str(sarif),
+                            "source_path": str(root),
+                            "skills_path": str(skills),
+                            "enable_external_tools": False,
+                            "include_evidence": True,
+                            "evidence_limit": 5,
+                        },
+                    )
+                )
+                self.assertEqual(quick["mode"], "one_round_judge")
+                self.assertEqual(quick["configuration"]["max_rounds"], 1)
+                self.assertFalse(quick["configuration"]["enable_llm"])
+                self.assertFalse(quick["saved"])
+                self.assertEqual(quick["finding_count"], 1)
+                self.assertEqual(quick["judged_finding_count"], 1)
+                self.assertEqual(quick["selected_finding"]["rule_id"], "python-command-injection")
+                self.assertEqual(quick["verdict"]["verdict"], "TRUE_POSITIVE")
+                self.assertIn("evidence_summary", quick)
+                self.assertIn("missing_evidence", quick)
+                self.assertLessEqual(len(quick["evidence"]), 5)
+                self.assertTrue(quick["debate"])
 
                 judged = mcp_tool_json(
                     client.call_tool(

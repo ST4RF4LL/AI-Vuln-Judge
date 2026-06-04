@@ -4,12 +4,15 @@ import json
 import sys
 import traceback
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, TextIO, Tuple
+from uuid import uuid4
 
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
 from .analyzers import AnalyzerSettings, AnalyzerSuite
 from .api import DEFAULT_RECORDS_DIR, _export_run_markdown
+from .debate import DebateOrchestrator
 from .evidence import EvidenceCollector
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE
 from .models import RunConfig, SourceLocation, to_jsonable
@@ -104,6 +107,8 @@ class JudgerMCPServer:
     def _call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
         if name == "judge_report":
             return self._judge_report(arguments)
+        if name == "one_round_judge":
+            return self._one_round_judge(arguments)
         if name == "collect_evidence":
             return self._collect_evidence(arguments)
         if name == "resolve_report_locations":
@@ -150,6 +155,74 @@ class JudgerMCPServer:
         result["record_path"] = str(self.records._path(report.run_id)) if saved else None
         if bool(arguments.get("include_report", False)):
             result["report"] = payload
+        return result
+
+    def _one_round_judge(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        finding, findings, indexer, collector = self._collector_context(arguments)
+        bundle = collector.collect(finding)
+        report = DebateOrchestrator(
+            max_rounds=1,
+            affirmative_agent=self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile"))),
+            negative_agent=self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile"))),
+        ).adjudicate(bundle)
+        report_payload = to_jsonable(report)
+        run_id = _optional_text(arguments.get("run_id")) or f"run-{uuid4().hex[:12]}"
+        created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        run_payload = {
+            "run_id": run_id,
+            "status": "completed",
+            "created_at": created_at,
+            "source_path": str(_required_path(arguments, "source_path")),
+            "sarif_path": str(_required_path(arguments, "report_path")),
+            "languages": list(indexer.languages),
+            "finding_count": 1,
+            "source_finding_count": len(findings),
+            "project_context_facts": len(collector.project_context.facts),
+            "reports": [report_payload],
+            "diagnostics": [f"{finding.finding_id}: {item}" for item in bundle.diagnostics],
+            "llm_providers": {"enabled": False, "affirmative": {}, "negative": {}},
+            "agent_configs": {},
+        }
+        saved = bool(arguments.get("save", False))
+        if saved:
+            self.records.save_payload(run_payload)
+        evidence = report_payload.get("evidence_chain") or []
+        evidence_limit = int(arguments.get("evidence_limit") or 40)
+        result = {
+            "mode": "one_round_judge",
+            "run_id": run_id,
+            "saved": saved,
+            "record_path": str(self.records._path(run_id)) if saved else None,
+            "configuration": {
+                "max_rounds": 1,
+                "enable_external_tools": bool(arguments.get("enable_external_tools", True)),
+                "auto_index_tools": bool(arguments.get("auto_index_tools", False)),
+                "enable_llm": False,
+                "languages": list(indexer.languages),
+            },
+            "finding_count": len(findings),
+            "judged_finding_count": 1,
+            "selected_finding": _finding_brief(finding),
+            "verdict": _verdict_detail(report_payload),
+            "missing_evidence": _missing_evidence(
+                report_payload,
+                bundle.diagnostics,
+                external_tools_enabled=bool(arguments.get("enable_external_tools", True)),
+            ),
+            "evidence_summary": _evidence_summary(evidence),
+            "source_locations": report_payload.get("source_locations", []),
+            "recommended_next_steps": report_payload.get("recommended_next_steps", []),
+            "disputed_points": report_payload.get("disputed_points", []),
+            "debate": report_payload.get("debate", []),
+            "diagnostics": run_payload["diagnostics"],
+        }
+        if bool(arguments.get("include_evidence", True)):
+            result["evidence"] = evidence[: max(0, evidence_limit)]
+            result["evidence_truncated"] = len(evidence) > max(0, evidence_limit)
+            result["evidence_total"] = len(evidence)
+        if bool(arguments.get("include_report", False)):
+            result["report"] = report_payload
+            result["run"] = run_payload
         return result
 
     def _collect_evidence(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -276,6 +349,31 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "enable_llm": {"type": "boolean", "default": False},
                 "save": {"type": "boolean", "default": True},
                 "include_report": {"type": "boolean", "default": False},
+                "run_id": {"type": "string"},
+            },
+            ["report_path", "source_path"],
+        ),
+        _tool(
+            "one_round_judge",
+            "Quickly validate one finding with default settings, one debate round, evidence collection, and missing-evidence guidance.",
+            {
+                "report_path": {"type": "string", "description": "SARIF/JSON/Markdown report path."},
+                "source_path": {"type": "string", "description": "Source tree root path."},
+                "skills_path": {"type": "string", "description": "Optional project skills directory."},
+                "finding_index": {"type": "integer", "minimum": 0, "default": 0},
+                "finding_id": {"type": "string"},
+                "rule_id": {"type": "string"},
+                "enable_external_tools": {"type": "boolean", "default": True},
+                "auto_index_tools": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Automatically build an Atlas index when .atlas/atlas.db is missing.",
+                },
+                "mcp_servers_file": {"type": "string"},
+                "include_evidence": {"type": "boolean", "default": True},
+                "evidence_limit": {"type": "integer", "minimum": 0, "default": 40},
+                "include_report": {"type": "boolean", "default": False},
+                "save": {"type": "boolean", "default": False},
                 "run_id": {"type": "string"},
             },
             ["report_path", "source_path"],
@@ -470,6 +568,174 @@ def _finding_brief(finding: Any) -> Dict[str, Any]:
         "message": finding.message,
         "locations": [location.display() for location in finding.locations],
     }
+
+
+def _verdict_detail(report: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "finding_id": report.get("finding_id"),
+        "rule_id": report.get("rule_id"),
+        "verdict": report.get("verdict"),
+        "confidence": report.get("confidence"),
+        "reasoning_summary": report.get("reasoning_summary"),
+        "final_conclusion": report.get("final_conclusion"),
+        "protection_assessment": report.get("protection_assessment"),
+        "impact_assessment": report.get("impact_assessment"),
+    }
+
+
+def _evidence_summary(evidence: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    by_kind: Dict[str, int] = {}
+    by_source: Dict[str, int] = {}
+    by_strength: Dict[str, int] = {}
+    key_evidence = []
+    for item in evidence:
+        kind = str(item.get("kind") or "UNKNOWN")
+        source = str(item.get("source") or "unknown")
+        strength = str(item.get("strength") or "UNKNOWN")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+        by_source[source] = by_source.get(source, 0) + 1
+        by_strength[strength] = by_strength.get(strength, 0) + 1
+        if len(key_evidence) < 12 and (
+            kind
+            in {
+                "REPORT",
+                "SOURCE_LOCATION",
+                "SARIF_CODE_FLOW",
+                "DATA_FLOW",
+                "CALL_CHAIN",
+                "TOOL_DIAGNOSTIC",
+            }
+            or source.startswith("atlas")
+        ):
+            key_evidence.append(
+                {
+                    "evidence_id": item.get("evidence_id"),
+                    "kind": kind,
+                    "source": source,
+                    "strength": strength,
+                    "summary": item.get("summary"),
+                    "locations": item.get("locations", []),
+                }
+            )
+    return {
+        "total": len(evidence),
+        "by_kind": by_kind,
+        "by_source": by_source,
+        "by_strength": by_strength,
+        "key_evidence": key_evidence,
+    }
+
+
+def _missing_evidence(
+    report: Dict[str, Any],
+    diagnostics: Sequence[str],
+    external_tools_enabled: bool = True,
+) -> List[Dict[str, Any]]:
+    evidence = report.get("evidence_chain") or []
+    missing: List[Dict[str, Any]] = []
+    if not _has_evidence_kind(evidence, "SOURCE_LOCATION", require_line=True):
+        missing.append(
+            {
+                "type": "source_location",
+                "summary": "缺少可解析到源码树的具体文件/行号证据。",
+                "suggestion": "先调用 resolve_report_locations 校验报告路径，必要时补充正确 source_path 或报告行号。",
+            }
+        )
+    if not _has_meaningful_evidence(evidence, {"SARIF_CODE_FLOW", "DATA_FLOW", "CALL_CHAIN"}):
+        missing.append(
+            {
+                "type": "flow_or_call_chain",
+                "summary": "缺少中等以上强度的数据流或调用链闭环证据。",
+                "suggestion": "优先补充 SARIF codeFlows；或构建 Atlas 索引后通过 collect_evidence 获取 trace/calls。",
+            }
+        )
+    if _has_cpp_compile_gap(evidence):
+        missing.append(
+            {
+                "type": "cpp_compile_database",
+                "summary": "C++ 项目缺少 compile_commands.json，语义证据质量会降级。",
+                "suggestion": "生成 compile_commands.json，或使用 Atlas calls/search 与源码片段手动补齐路径。",
+            }
+        )
+    if external_tools_enabled and not _has_atlas_success(evidence):
+        missing.append(
+            {
+                "type": "atlas_evidence",
+                "summary": "未获得成功的 Atlas MCP 语义证据。",
+                "suggestion": "确认 Atlas MCP 配置可用；必要时开启 auto_index_tools 自动 Atlas 构建索引。",
+            }
+        )
+    if _has_evidence_kind(evidence, "PROTECTION"):
+        missing.append(
+            {
+                "type": "protection_validation",
+                "summary": "存在校验、鉴权、消毒或过滤相关防护证据，尚需验证是否覆盖攻击路径。",
+                "suggestion": "检查防护代码与报告位置的数据关系，补充可绕过或不可绕过的源码证据。",
+            }
+        )
+    if not _has_evidence_kind(evidence, "IMPACT") and not _has_evidence_kind(evidence, "PROJECT_CONTEXT"):
+        missing.append(
+            {
+                "type": "impact_context",
+                "summary": "缺少资产、权限边界或业务影响上下文。",
+                "suggestion": "补充项目 Skill/上下文，说明可达汇点对应的数据资产或权限影响。",
+            }
+        )
+    for point in report.get("disputed_points") or []:
+        if point and not any(point == item.get("summary") for item in missing):
+            missing.append({"type": "disputed_point", "summary": point, "suggestion": "按该争议点补充证据后重新运行 one_round_judge。"})
+    for diagnostic in diagnostics:
+        missing.append({"type": "diagnostic", "summary": diagnostic, "suggestion": "先处理该工具或配置诊断，再重新快速验证。"})
+    for step in report.get("recommended_next_steps") or []:
+        missing.append({"type": "next_step", "summary": step, "suggestion": step})
+    return _dedupe_missing(missing)
+
+
+def _has_evidence_kind(evidence: Sequence[Dict[str, Any]], kind: str, require_line: bool = False) -> bool:
+    for item in evidence:
+        if item.get("kind") != kind:
+            continue
+        if not require_line:
+            return True
+        if item.get("data", {}).get("line_exists") or item.get("data", {}).get("indexed_files"):
+            return True
+    return False
+
+
+def _has_meaningful_evidence(evidence: Sequence[Dict[str, Any]], kinds: set[str]) -> bool:
+    for item in evidence:
+        if item.get("kind") not in kinds:
+            continue
+        if item.get("source") == "code-search":
+            continue
+        if item.get("strength") in {"STRONG", "MEDIUM"}:
+            return True
+    return False
+
+
+def _has_cpp_compile_gap(evidence: Sequence[Dict[str, Any]]) -> bool:
+    for item in evidence:
+        if item.get("kind") != "TOOL_DIAGNOSTIC" or item.get("source") != "code-search":
+            continue
+        if item.get("data", {}).get("compile_database") is None and "compile_commands.json" in str(item.get("summary") or ""):
+            return True
+    return False
+
+
+def _has_atlas_success(evidence: Sequence[Dict[str, Any]]) -> bool:
+    return any(str(item.get("source") or "").startswith("atlas") and item.get("data", {}).get("mcp_success") for item in evidence)
+
+
+def _dedupe_missing(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    result = []
+    for item in items:
+        marker = (item.get("type"), item.get("summary"))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(dict(item))
+    return result
 
 
 def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
