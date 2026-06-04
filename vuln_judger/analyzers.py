@@ -18,6 +18,8 @@ from .source import ResolvedLocation, SourceIndexer, detect_language, evidence_i
 class AnalyzerSettings:
     enabled: bool = True
     auto_index: bool = False
+    agentic_atlas: bool = True
+    agentic_atlas_direct: bool = False
     timeout_seconds: int = 30
     mcp_servers_file: Optional[Path] = None
 
@@ -63,16 +65,20 @@ class AtlasAnalyzer(Analyzer):
         primary = finding.primary_location
         if primary is None:
             return []
+        agentic_enabled = settings.agentic_atlas or settings.agentic_atlas_direct
         if not self.binary and not self._configured_mcp_server(settings):
-            return [_tool_unavailable(finding, self.name, "未找到 atlas 命令")]
+            diagnostics = [_tool_unavailable(finding, self.name, "未找到 atlas 命令")]
+            if agentic_enabled:
+                return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
+            return diagnostics
         resolved_locations = self._resolved_locations(finding, indexer)
-        if not resolved_locations:
+        if not resolved_locations and not agentic_enabled:
             return []
         atlas_db = indexer.source_root / ".atlas" / "atlas.db"
         diagnostics: List[CodeEvidence] = []
         if not atlas_db.exists():
             if not settings.auto_index:
-                return [
+                diagnostics = [
                     CodeEvidence(
                         evidence_id=evidence_id(finding.finding_id, self.name, "not-indexed"),
                         kind=EvidenceKind.TOOL_DIAGNOSTIC,
@@ -81,9 +87,14 @@ class AtlasAnalyzer(Analyzer):
                         source=self.name,
                     )
                 ]
+                if agentic_enabled:
+                    return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
+                return diagnostics
             diagnostics.extend(self._index_project(finding, indexer, settings))
         if not atlas_db.exists():
-            return diagnostics + self._direct_source_evidence(finding, indexer)
+            return diagnostics + self._direct_source_evidence(finding, indexer) + (
+                self._agentic_source_reading_evidence(finding, indexer) if agentic_enabled else []
+            )
         diagnostics.append(
             CodeEvidence(
                 evidence_id=evidence_id(finding.finding_id, self.name, "database-present"),
@@ -105,13 +116,31 @@ class AtlasAnalyzer(Analyzer):
                     data={"database": str(atlas_db), "mcp_supported": False},
                 )
             )
-            return diagnostics + self._direct_source_evidence(finding, indexer)
+            return diagnostics + self._direct_source_evidence(finding, indexer) + (
+                self._agentic_source_reading_evidence(finding, indexer) if agentic_enabled else []
+            )
+        direct_source = self._direct_source_evidence(finding, indexer)
+        if settings.agentic_atlas_direct:
+            agentic_evidence = self._agentic_mcp_evidence(finding, indexer, settings, resolved_locations)
+            if _has_substantive_mcp_evidence(agentic_evidence):
+                return diagnostics + agentic_evidence + direct_source
+            return diagnostics + agentic_evidence + direct_source + self._agentic_source_reading_evidence(finding, indexer)
+        if not resolved_locations:
+            agentic_evidence = self._agentic_mcp_evidence(finding, indexer, settings, resolved_locations)
+            if _has_substantive_mcp_evidence(agentic_evidence):
+                return diagnostics + agentic_evidence + direct_source
+            return diagnostics + agentic_evidence + direct_source + self._agentic_source_reading_evidence(finding, indexer)
         mcp_evidence = self._mcp_evidence(finding, indexer, settings, resolved_locations)
-        if not any(item.data.get("mcp_success") for item in mcp_evidence):
+        if not _has_complete_semantic_mcp_evidence(mcp_evidence):
             diagnostics.extend(mcp_evidence)
-            diagnostics.extend(self._direct_source_evidence(finding, indexer))
+            if settings.agentic_atlas:
+                agentic_evidence = self._agentic_mcp_evidence(finding, indexer, settings, resolved_locations)
+                if _has_substantive_mcp_evidence(agentic_evidence):
+                    return diagnostics + agentic_evidence + direct_source
+                return diagnostics + agentic_evidence + direct_source + self._agentic_source_reading_evidence(finding, indexer)
+            diagnostics.extend(direct_source)
             return diagnostics
-        return diagnostics + mcp_evidence + self._direct_source_evidence(finding, indexer)
+        return diagnostics + mcp_evidence + direct_source
 
     def _resolved_locations(self, finding: Finding, indexer: SourceIndexer) -> List[ResolvedLocation]:
         resolved: List[ResolvedLocation] = []
@@ -238,6 +267,320 @@ class AtlasAnalyzer(Analyzer):
                     data={"transport": "mcp", "mcp_success": False},
                 )
             ]
+
+    def _agentic_mcp_evidence(
+        self,
+        finding: Finding,
+        indexer: SourceIndexer,
+        settings: AnalyzerSettings,
+        resolved_locations: Sequence[ResolvedLocation],
+    ) -> List[CodeEvidence]:
+        terms = _agentic_query_terms(finding)
+        path_prefixes = _agentic_path_prefixes(finding)
+        try:
+            command, cwd, env = self._mcp_command(indexer, settings)
+            with MCPStdioClient(command, cwd=cwd, timeout=settings.timeout_seconds, env=env) as client:
+                tools = {tool.get("name") for tool in client.list_tools()}
+                evidence: List[CodeEvidence] = [
+                    CodeEvidence(
+                        evidence_id=evidence_id(finding.finding_id, self.name, "agentic-start", ",".join(sorted(terms[:8]))),
+                        kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                        strength=EvidenceStrength.MEDIUM,
+                        summary=(
+                            "AI 自主 Atlas MCP 补证启动：基于报告文本、路径片段和符号生成查询计划；"
+                            f"候选词 {', '.join(terms[:8]) or '无'}；候选路径 {', '.join(path_prefixes[:5]) or '无'}"
+                        ),
+                        source="atlas-agent-mcp",
+                        data={
+                            "transport": "mcp",
+                            "agentic_atlas": True,
+                            "mcp_success": True,
+                            "tools": sorted(str(tool) for tool in tools),
+                            "query_terms": terms,
+                            "path_prefixes": path_prefixes,
+                        },
+                    )
+                ]
+                if "project" in tools:
+                    status_payload, status_text, status_error = _mcp_tool_payload(
+                        client.call_tool("project", {"action": "status", "verbose": True})
+                    )
+                    evidence.append(self._agentic_status_evidence(finding, status_payload, status_text, status_error))
+                    evidence.extend(self._agentic_file_evidence(client, finding, path_prefixes))
+                if "search" in tools:
+                    search_results = self._agentic_search_results(client, terms)
+                    if search_results:
+                        evidence.append(_agentic_search_evidence(finding, search_results))
+                        trace_locations = _agentic_locations_from_search(search_results, limit=6)
+                        if "trace" in tools:
+                            evidence.extend(self._agentic_trace_evidence(client, finding, trace_locations))
+                        if "calls" in tools:
+                            evidence.extend(self._agentic_call_evidence(client, finding, search_results))
+                    else:
+                        evidence.append(
+                            CodeEvidence(
+                                evidence_id=evidence_id(finding.finding_id, self.name, "agentic-search-empty", ",".join(terms[:8])),
+                                kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                                strength=EvidenceStrength.WEAK,
+                                summary="AI 自主 Atlas MCP search 未找到报告相关符号或路径候选",
+                                source="atlas-agent-mcp",
+                                data={"transport": "mcp", "mcp_tool": "search", "mcp_success": False, "query_terms": terms},
+                            )
+                        )
+                if resolved_locations and "trace" in tools:
+                    evidence.extend(self._agentic_trace_evidence(client, finding, [_display_resolved_location(item) for item in resolved_locations[:4]]))
+                return evidence
+        except (MCPError, OSError, ValueError) as exc:
+            return [
+                CodeEvidence(
+                    evidence_id=evidence_id(finding.finding_id, self.name, "agentic-mcp-failed"),
+                    kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                    strength=EvidenceStrength.WEAK,
+                    summary=f"AI 自主 Atlas MCP 补证失败：{exc}",
+                    source="atlas-agent-mcp",
+                    data={"transport": "mcp", "agentic_atlas": True, "mcp_success": False},
+                )
+            ]
+
+    def _agentic_status_evidence(self, finding: Finding, payload: Any, raw_text: str, is_error: bool) -> CodeEvidence:
+        if is_error or not isinstance(payload, dict):
+            return CodeEvidence(
+                evidence_id=evidence_id(finding.finding_id, self.name, "agentic-status"),
+                kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                strength=EvidenceStrength.WEAK,
+                summary="AI 自主 Atlas MCP project/status 未返回可解析状态" + (f"：{raw_text[:240]}" if raw_text else ""),
+                source="atlas-agent-mcp",
+                data={"transport": "mcp", "mcp_tool": "project/status", "mcp_success": False, "raw": raw_text[:1000]},
+            )
+        summary = payload.get("summary") or {}
+        bits = []
+        for key, label in (("files", "文件"), ("symbols", "符号"), ("edges", "边")):
+            if summary.get(key) is not None:
+                bits.append(f"{label} {summary.get(key)}")
+        return CodeEvidence(
+            evidence_id=evidence_id(finding.finding_id, self.name, "agentic-status"),
+            kind=EvidenceKind.TOOL_DIAGNOSTIC,
+            strength=EvidenceStrength.MEDIUM,
+            summary="AI 自主 Atlas MCP project/status 确认索引状态" + ("：" + "，".join(bits) if bits else ""),
+            source="atlas-agent-mcp",
+            data={
+                "transport": "mcp",
+                "mcp_tool": "project/status",
+                "mcp_success": True,
+                "agentic_atlas": True,
+                "summary": summary,
+                "project": payload.get("project") or {},
+                "server": payload.get("server") or {},
+            },
+        )
+
+    def _agentic_file_evidence(
+        self, client: MCPStdioClient, finding: Finding, path_prefixes: Sequence[str]
+    ) -> List[CodeEvidence]:
+        matched: Dict[str, Dict[str, Any]] = {}
+        for prefix in path_prefixes[:12]:
+            payload, _, is_error = _mcp_tool_payload(
+                client.call_tool("project", {"action": "files", "path_prefix": prefix, "limit": 50})
+            )
+            if is_error or not isinstance(payload, dict):
+                continue
+            for item in payload.get("files") or []:
+                path = str(item.get("path") or "")
+                if not path:
+                    continue
+                if _path_candidate_matches(path, prefix):
+                    matched[path] = item
+        if not matched:
+            return []
+        locations = [SourceLocation(file=path) for path in sorted(matched)[:12]]
+        status_text = ", ".join(f"{path}={matched[path].get('status')}" for path in sorted(matched)[:5])
+        return [
+            CodeEvidence(
+                evidence_id=evidence_id(finding.finding_id, self.name, "agentic-files", *sorted(matched)[:12]),
+                kind=EvidenceKind.SOURCE_LOCATION,
+                strength=EvidenceStrength.MEDIUM,
+                summary="AI 自主 Atlas MCP project/files 找到报告路径候选：" + status_text,
+                source="atlas-agent-mcp",
+                locations=locations,
+                data={
+                    "transport": "mcp",
+                    "mcp_tool": "project/files",
+                    "mcp_success": True,
+                    "agentic_atlas": True,
+                    "matched_files": sorted(matched),
+                    "path_prefixes": list(path_prefixes),
+                },
+            )
+        ]
+
+    def _agentic_search_results(self, client: MCPStdioClient, terms: Sequence[str]) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str, int]] = set()
+        for term in terms[:12]:
+            payload, _, is_error = _mcp_tool_payload(client.call_tool("search", {"query": term, "limit": 10}))
+            if is_error or not isinstance(payload, dict):
+                continue
+            for item in payload.get("results") or []:
+                if not isinstance(item, dict):
+                    continue
+                marker = (str(item.get("qualified_name") or item.get("name") or ""), str(item.get("file") or ""), _optional_int(item.get("line")) or 0)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                copied = dict(item)
+                copied["query"] = term
+                results.append(copied)
+                if len(results) >= 30:
+                    return results
+        return results
+
+    def _agentic_trace_evidence(
+        self, client: MCPStdioClient, finding: Finding, locations: Sequence[SourceLocation]
+    ) -> List[CodeEvidence]:
+        evidence: List[CodeEvidence] = []
+        for location in locations[:6]:
+            if not location.file or not location.line:
+                continue
+            column = location.column or 1
+            for trace_kind in ("point", "variable"):
+                arguments: Dict[str, Any] = {
+                    "kind": trace_kind,
+                    "file_path": location.file,
+                    "line": location.line,
+                    "column": column,
+                }
+                if trace_kind == "variable":
+                    arguments["max_depth"] = 30
+                payload, raw_text, is_error = _mcp_tool_payload(client.call_tool("trace", arguments))
+                item = _mcp_trace_item(
+                    finding,
+                    trace_kind,
+                    payload,
+                    raw_text,
+                    is_error,
+                    SourceLocation(file=location.file, line=location.line, column=column, symbol=location.symbol),
+                )
+                item.source = "atlas-agent-mcp"
+                item.evidence_id = evidence_id(
+                    finding.finding_id,
+                    self.name,
+                    "agentic-trace",
+                    trace_kind,
+                    location.file,
+                    str(location.line),
+                    str(column),
+                )
+                item.summary = "AI 自主 " + item.summary
+                item.data["agentic_atlas"] = True
+                evidence.append(item)
+        return evidence
+
+    def _agentic_call_evidence(
+        self, client: MCPStdioClient, finding: Finding, search_results: Sequence[Dict[str, Any]]
+    ) -> List[CodeEvidence]:
+        evidence: List[CodeEvidence] = []
+        seen: set[str] = set()
+        for result in search_results[:12]:
+            qname = str(result.get("qualified_name") or result.get("name") or "").strip()
+            if not qname or qname in seen:
+                continue
+            seen.add(qname)
+            payload, raw_text, is_error = _mcp_tool_payload(
+                client.call_tool("calls", {"symbol": qname, "direction": "both", "depth": 2, "limit": 30})
+            )
+            location = SourceLocation(
+                file=str(result.get("file") or ""),
+                line=_optional_int(result.get("line")),
+                symbol=qname,
+            )
+            if is_error or not isinstance(payload, dict):
+                evidence.append(
+                    CodeEvidence(
+                        evidence_id=evidence_id(finding.finding_id, self.name, "agentic-calls", qname),
+                        kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                        strength=EvidenceStrength.WEAK,
+                        summary=f"AI 自主 Atlas MCP calls 未能解析 `{qname}` 的调用图：{raw_text[:240]}",
+                        source="atlas-agent-mcp",
+                        locations=[location] if location.file else [],
+                        data={"transport": "mcp", "mcp_tool": "calls", "mcp_success": False, "agentic_atlas": True, "symbols": [qname]},
+                    )
+                )
+                continue
+            callers = _mcp_call_entries(payload, "callers")
+            callees = _mcp_call_entries(payload, "callees")
+            if not callers and not callees:
+                continue
+            locations = [location] if location.file else []
+            locations.extend(_locations_from_mcp_entries(callers + callees, limit=12))
+            evidence.append(
+                CodeEvidence(
+                    evidence_id=evidence_id(finding.finding_id, self.name, "agentic-calls", qname),
+                    kind=EvidenceKind.CALL_CHAIN,
+                    strength=EvidenceStrength.MEDIUM,
+                    summary=f"AI 自主 Atlas MCP calls 提取 `{qname}` 调用图：调用方 {len(callers)} 个，被调用方 {len(callees)} 个",
+                    source="atlas-agent-mcp",
+                    locations=locations,
+                    data={
+                        "transport": "mcp",
+                        "mcp_tool": "calls",
+                        "mcp_success": True,
+                        "agentic_atlas": True,
+                        "symbols": [qname],
+                        "callers": callers[:10],
+                        "callees": callees[:10],
+                    },
+                )
+            )
+        return evidence
+
+    def _agentic_source_reading_evidence(self, finding: Finding, indexer: SourceIndexer) -> List[CodeEvidence]:
+        terms = _agentic_query_terms(finding)
+        path_names = {Path(location.file.replace("\\", "/")).name for location in finding.locations if location.file}
+        evidence: List[CodeEvidence] = []
+        for file in _source_files(indexer.source_root):
+            try:
+                text = file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            relative = str(file.relative_to(indexer.source_root)).replace("\\", "/")
+            lower = text.lower()
+            matched_terms = [term for term in terms if len(term) >= 3 and term.lower() in lower][:8]
+            if Path(relative).name in path_names and Path(relative).name:
+                matched_terms.append(Path(relative).name)
+            if not matched_terms:
+                continue
+            line = _first_matching_line(text, matched_terms) or 1
+            evidence.append(
+                CodeEvidence(
+                    evidence_id=evidence_id(finding.finding_id, self.name, "agentic-source", relative),
+                    kind=EvidenceKind.SOURCE_LOCATION,
+                    strength=EvidenceStrength.WEAK,
+                    summary=f"AI 自主源码阅读找到候选文件 {relative}，匹配：{', '.join(list(dict.fromkeys(matched_terms))[:6])}",
+                    source="agentic-source-reader",
+                    locations=[SourceLocation(file=relative, line=line)],
+                    snippet=indexer.snippet(file, line, before=5, after=8),
+                    data={
+                        "agentic_source_reading": True,
+                        "matched_terms": list(dict.fromkeys(matched_terms)),
+                        "line_exists": True,
+                        "resolved_file": relative,
+                    },
+                )
+            )
+            if len(evidence) >= 8:
+                break
+        if not evidence:
+            evidence.append(
+                CodeEvidence(
+                    evidence_id=evidence_id(finding.finding_id, self.name, "agentic-source-empty"),
+                    kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                    strength=EvidenceStrength.WEAK,
+                    summary="AI 自主源码阅读未找到与报告路径、符号或关键词匹配的候选代码",
+                    source="agentic-source-reader",
+                    data={"agentic_source_reading": True, "query_terms": terms},
+                )
+            )
+        return evidence
 
     def _mcp_command(self, indexer: SourceIndexer, settings: AnalyzerSettings) -> tuple[List[str], Path, Dict[str, str]]:
         server = self._configured_mcp_server(settings)
@@ -824,6 +1167,210 @@ def _locations_from_mcp_entries(entries: Sequence[Dict[str, Any]], limit: int) -
             continue
         locations.append(SourceLocation(file=str(file), line=_optional_int(item.get("line"))))
     return locations
+
+
+def _has_substantive_mcp_evidence(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(
+        item.data.get("mcp_success")
+        and item.kind in {EvidenceKind.SOURCE_LOCATION, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN}
+        for item in evidence
+    )
+
+
+def _has_complete_semantic_mcp_evidence(evidence: Sequence[CodeEvidence]) -> bool:
+    return all(
+        any(item.data.get("mcp_success") and item.kind == kind for item in evidence)
+        for kind in (EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN)
+    )
+
+
+def _agentic_query_terms(finding: Finding, limit: int = 24) -> List[str]:
+    raw_text = " ".join(
+        [
+            finding.rule_id,
+            finding.message,
+            " ".join(str(value) for value in finding.properties.values()),
+            json.dumps(finding.raw, ensure_ascii=False)[:4000],
+            " ".join(location.file for location in finding.locations),
+            " ".join(location.symbol or "" for location in finding.locations),
+        ]
+    )
+    terms: List[str] = []
+    for location in finding.locations:
+        if location.symbol:
+            terms.append(location.symbol)
+            terms.extend(_symbol_parts(location.symbol))
+        path = location.file.replace("\\", "/")
+        if path:
+            terms.append(Path(path).name)
+            terms.append(Path(path).stem)
+    for match in re.finditer(r"`([^`]{2,120})`", raw_text):
+        token = match.group(1).strip()
+        if "/" in token or "\\" in token:
+            terms.extend([Path(token.replace("\\", "/")).name, Path(token.replace("\\", "/")).stem])
+        elif _looks_like_symbol(token):
+            terms.append(token.rstrip("()"))
+            terms.extend(_symbol_parts(token.rstrip("()")))
+    for match in re.finditer(r"\b([A-Za-z_~][\w:~]*(?:::[A-Za-z_~][\w:~]*)*)\s*\(", raw_text):
+        token = match.group(1)
+        if token not in {"if", "for", "while", "switch", "return", "sizeof"}:
+            terms.append(token)
+            terms.extend(_symbol_parts(token))
+    for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", raw_text):
+        if token.lower() in _AGENTIC_STOP_TERMS:
+            continue
+        terms.append(token)
+    return _dedupe_text(terms, limit=limit)
+
+
+def _agentic_path_prefixes(finding: Finding, limit: int = 16) -> List[str]:
+    prefixes: List[str] = []
+    for location in finding.locations:
+        normalized = location.file.replace("\\", "/").strip("/")
+        if not normalized:
+            continue
+        parts = [part for part in normalized.split("/") if part and part not in {".", ".."}]
+        if not parts:
+            continue
+        prefixes.append(normalized)
+        for size in range(min(4, len(parts)), 0, -1):
+            prefixes.append("/".join(parts[-size:]))
+        prefixes.append(parts[-1])
+    return _dedupe_text(prefixes, limit=limit)
+
+
+def _agentic_search_evidence(finding: Finding, results: Sequence[Dict[str, Any]]) -> CodeEvidence:
+    locations = _agentic_locations_from_search(results, limit=12)
+    names = _dedupe_text([str(item.get("qualified_name") or item.get("name") or "") for item in results], limit=8)
+    compact_results = _compact_mcp_entries(results, limit=12)
+    return CodeEvidence(
+        evidence_id=evidence_id(finding.finding_id, "atlas", "agentic-search", *names[:8]),
+        kind=EvidenceKind.SOURCE_LOCATION,
+        strength=EvidenceStrength.MEDIUM if locations else EvidenceStrength.WEAK,
+        summary=f"AI 自主 Atlas MCP search 找到 {len(results)} 个报告相关候选符号：" + ", ".join(names[:8]),
+        source="atlas-agent-mcp",
+        locations=locations,
+        data={
+            "transport": "mcp",
+            "mcp_tool": "search",
+            "mcp_success": True,
+            "agentic_atlas": True,
+            "symbols": names,
+            "results": compact_results,
+        },
+    )
+
+
+def _agentic_locations_from_search(results: Sequence[Dict[str, Any]], limit: int) -> List[SourceLocation]:
+    locations: List[SourceLocation] = []
+    seen = set()
+    for item in results:
+        file = str(item.get("file") or "")
+        if not file:
+            continue
+        line = _optional_int(item.get("line") or item.get("start_line"))
+        symbol = str(item.get("qualified_name") or item.get("name") or "") or None
+        marker = (file, line, symbol)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        locations.append(SourceLocation(file=file, line=line, symbol=symbol))
+        if len(locations) >= limit:
+            break
+    return locations
+
+
+def _display_resolved_location(resolved: ResolvedLocation) -> SourceLocation:
+    return SourceLocation(
+        file=resolved.relative_path,
+        line=resolved.requested.line,
+        column=resolved.requested.column,
+        symbol=resolved.symbol or resolved.requested.symbol,
+    )
+
+
+def _path_candidate_matches(path: str, prefix: str) -> bool:
+    normalized_path = path.replace("\\", "/").strip("/")
+    normalized_prefix = prefix.replace("\\", "/").strip("/")
+    if not normalized_prefix:
+        return False
+    return (
+        normalized_path.startswith(normalized_prefix)
+        or normalized_path.endswith("/" + normalized_prefix)
+        or Path(normalized_path).name == normalized_prefix
+    )
+
+
+def _source_files(root: Path) -> List[Path]:
+    result: List[Path] = []
+    excluded = {".git", ".atlas", ".venv", "__pycache__", "node_modules", "build", "dist", "target"}
+    for path in root.rglob("*"):
+        if any(part in excluded for part in path.parts):
+            continue
+        if path.is_file() and detect_language(str(path)):
+            result.append(path)
+            if len(result) >= 2000:
+                break
+    return result
+
+
+def _first_matching_line(text: str, terms: Sequence[str]) -> Optional[int]:
+    lowered_terms = [term.lower() for term in terms if term]
+    for idx, line in enumerate(text.splitlines(), start=1):
+        lower = line.lower()
+        if any(term in lower for term in lowered_terms):
+            return idx
+    return None
+
+
+def _looks_like_symbol(token: str) -> bool:
+    return bool(re.match(r"^[A-Za-z_~][\w:~]*(?:\([^)]*\))?$", token.strip()))
+
+
+def _symbol_parts(symbol: str) -> List[str]:
+    parts = re.split(r"::|\.|->", symbol)
+    return [part for part in parts if len(part) >= 3]
+
+
+def _dedupe_text(values: Sequence[str], limit: int) -> List[str]:
+    result: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value or "").strip().strip("`'\"")
+        if not text:
+            continue
+        marker = text.lower()
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+_AGENTIC_STOP_TERMS = {
+    "true",
+    "false",
+    "null",
+    "none",
+    "warning",
+    "error",
+    "high",
+    "medium",
+    "low",
+    "critical",
+    "message",
+    "locations",
+    "format",
+    "markdown",
+    "summary",
+    "source",
+    "path",
+    "file",
+    "line",
+    "column",
+}
 
 
 def _compact_mcp_entries(entries: Sequence[Dict[str, Any]], limit: int = 12) -> List[Dict[str, Any]]:

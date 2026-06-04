@@ -53,6 +53,8 @@ def run_judgement(
     analyzer_settings = AnalyzerSettings(
         enabled=config.enable_external_tools,
         auto_index=config.auto_index_tools,
+        agentic_atlas=config.agentic_atlas,
+        agentic_atlas_direct=config.agentic_atlas_direct,
         mcp_servers_file=config.mcp_servers_file,
     )
     collector = EvidenceCollector(

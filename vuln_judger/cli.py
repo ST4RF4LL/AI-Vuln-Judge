@@ -30,6 +30,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--skills", type=Path, help="项目知识库 skill 目录")
     run_parser.add_argument("--max-rounds", type=int, default=4, help="最大博弈回合数")
     run_parser.add_argument("--auto-index-tools", action="store_true", help="自动 Atlas 构建索引")
+    run_parser.add_argument("--no-agentic-atlas", action="store_true", help="禁用 AI 自主 Atlas MCP 补证后备路径")
+    run_parser.add_argument("--agentic-atlas-direct", action="store_true", help="直接使用 AI 自主 Atlas MCP 补证路径")
     run_parser.add_argument("--no-external-tools", action="store_true", help="禁用 Atlas/CodeQL 探测")
     run_parser.add_argument("--llm", action="store_true", help="使用 OpenAI-compatible LLM 生成正反方回合")
     run_parser.add_argument("--llm-model", help="--llm 使用的模型名；也可使用 VULN_JUDGER_LLM_MODEL")
@@ -100,6 +102,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             skills_path=skills_path,
             max_rounds=args.max_rounds,
             auto_index_tools=args.auto_index_tools,
+            agentic_atlas=not args.no_agentic_atlas,
+            agentic_atlas_direct=args.agentic_atlas_direct,
             enable_external_tools=not args.no_external_tools,
             enable_llm=args.llm,
             llm_model=args.llm_model,

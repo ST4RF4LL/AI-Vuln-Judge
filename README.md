@@ -55,6 +55,23 @@ Atlas 证据优先检查 `.atlas/atlas.db`。缺少数据库时，报告会提�
 `atlas-mcp` 来源的源码真实性、数据流和调用图证据。MCP 不可用时才回退到 CLI
 `status/files` 诊断；旧版 `atlas trace` CLI 不再作为主路径。
 
+当基于报告源码位置的固定 Atlas MCP 调用没有拿到数据流或调用链等实质证据时，默认会启用
+AI 自主 Atlas 补证路径：系统会从 finding 文本、路径片段和符号中生成查询计划，继续调用
+Atlas MCP 的 `project/status`、`project/files`、`search`、`trace` 和 `calls`，并输出
+`atlas-agent-mcp` 来源的 `SOURCE_LOCATION`、`DATA_FLOW`、`CALL_CHAIN`、
+`TOOL_DIAGNOSTIC` 证据。若该自主 MCP 路径仍无法产生实质证据，会降级为
+`agentic-source-reader` 来源的源码阅读证据。
+
+相关运行参数：
+
+- `--no-agentic-atlas`：关闭固定 Atlas MCP 失败后的 AI 自主补证 fallback。
+- `--agentic-atlas-direct`：跳过固定位置调用流程，直接运行 AI 自主 Atlas MCP 补证路径。
+
+Web 端启动任务弹窗也提供 `AI 自主 Atlas 补证` 和 `直接 AI 自主运行 Atlas MCP` 两个开关。
+MCP Server 的 `judge_report`、`one_round_judge` 和 `collect_evidence` 工具同样支持
+`agentic_atlas` 与 `agentic_atlas_direct` 入参，便于 Codex/opencode 等 CLI 客户端直接获取
+自主 Atlas MCP 证据。
+
 ## MCP 和 Skills 管理
 
 MCP Server 配置默认存储在 `.vuln-judger/mcp.json`，示例文件为

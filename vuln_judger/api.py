@@ -408,6 +408,8 @@ def _config_from_payload(
         run_id=run_id,
         max_rounds=int(payload.get("max_rounds") or 4),
         auto_index_tools=bool(payload.get("auto_index_tools") or False),
+        agentic_atlas=bool(payload.get("agentic_atlas", True)),
+        agentic_atlas_direct=bool(payload.get("agentic_atlas_direct", False)),
         enable_external_tools=bool(payload.get("enable_external_tools", True)),
         enable_llm=bool(payload.get("enable_llm", False)),
         llm_model=payload.get("llm_model"),
@@ -1366,6 +1368,8 @@ def app_html() -> str:
             <div class="chips">
               <label><input id="run-external-tools" type="checkbox" checked> 启用外部工具</label>
               <label><input id="run-auto-index" type="checkbox"> 自动 Atlas 构建索引</label>
+              <label><input id="run-agentic-atlas" type="checkbox" checked> AI 自主 Atlas 补证</label>
+              <label><input id="run-agentic-atlas-direct" type="checkbox"> 直接 AI 自主运行 Atlas MCP</label>
               <label><input id="run-llm" type="checkbox"> 使用 LLM 博弈</label>
             </div>
             <div class="toolbar">
@@ -1446,6 +1450,8 @@ def app_html() -> str:
       runNegativeAgentProfile: document.getElementById('run-negative-agent-profile'),
       runExternalTools: document.getElementById('run-external-tools'),
       runAutoIndex: document.getElementById('run-auto-index'),
+      runAgenticAtlas: document.getElementById('run-agentic-atlas'),
+      runAgenticAtlasDirect: document.getElementById('run-agentic-atlas-direct'),
       runLlm: document.getElementById('run-llm'),
       runResult: document.getElementById('run-result'),
     }};
@@ -2278,6 +2284,8 @@ def app_html() -> str:
       el.runMaxRounds.value = '4';
       el.runExternalTools.checked = false;
       el.runAutoIndex.checked = false;
+      el.runAgenticAtlas.checked = true;
+      el.runAgenticAtlasDirect.checked = false;
       enableRunLlmForSelectedProviders();
       el.runResult.textContent = '已填入 SARIF 示例路径。';
     }}
@@ -2290,6 +2298,8 @@ def app_html() -> str:
       el.runMaxRounds.value = '4';
       el.runExternalTools.checked = false;
       el.runAutoIndex.checked = false;
+      el.runAgenticAtlas.checked = true;
+      el.runAgenticAtlasDirect.checked = false;
       enableRunLlmForSelectedProviders();
       el.runResult.textContent = '已填入 Markdown 示例路径。';
     }}
@@ -2304,6 +2314,8 @@ def app_html() -> str:
           max_rounds: Number(el.runMaxRounds.value || 4),
           enable_external_tools: el.runExternalTools.checked,
           auto_index_tools: el.runAutoIndex.checked,
+          agentic_atlas: el.runAgenticAtlas.checked,
+          agentic_atlas_direct: el.runAgenticAtlasDirect.checked,
           enable_llm: el.runLlm.checked,
           affirmative_provider_id: el.runAffirmativeProvider.value || null,
           negative_provider_id: el.runNegativeProvider.value || null,

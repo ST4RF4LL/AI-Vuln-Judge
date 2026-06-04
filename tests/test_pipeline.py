@@ -441,6 +441,101 @@ for raw in sys.stdin.buffer:
             self.assertTrue(any(item.data.get("trace_file") == "faiss/impl/index_read.cpp" for item in evidence))
             self.assertFalse(any("faiss/faiss/impl/index_read.cpp" in location.file for item in evidence for location in item.locations))
 
+    def test_agentic_atlas_fallback_runs_when_report_path_does_not_resolve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".atlas").mkdir()
+            (root / ".atlas" / "atlas.db").write_text("fake", encoding="utf-8")
+            (root / "app.py").write_text(
+                "\n".join(
+                    [
+                        "import os",
+                        "def handler(request):",
+                        "    cmd = request.args['cmd']",
+                        "    os.system(cmd)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-agentic-atlas",
+                rule_id="python-command-injection",
+                message="handler reaches os.system",
+                level="error",
+                locations=[SourceLocation("missing/report-only.py", 4, 5)],
+            )
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["python"]),
+                AnalyzerSettings(enabled=True),
+            )
+            summaries = "\n".join(item.summary for item in evidence)
+            self.assertIn("AI 自主 Atlas MCP 补证启动", summaries)
+            self.assertTrue(any(item.source == "atlas-agent-mcp" for item in evidence))
+            self.assertTrue(any(item.kind == EvidenceKind.CALL_CHAIN and item.source == "atlas-agent-mcp" for item in evidence))
+
+    def test_agentic_atlas_direct_skips_fixed_location_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".atlas").mkdir()
+            (root / ".atlas" / "atlas.db").write_text("fake", encoding="utf-8")
+            (root / "app.py").write_text("def handler(request): pass\n", encoding="utf-8")
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-agentic-direct",
+                rule_id="python-demo",
+                message="handler",
+                level="warning",
+                locations=[SourceLocation("app.py", 1)],
+            )
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["python"]),
+                AnalyzerSettings(enabled=True, agentic_atlas_direct=True),
+            )
+            self.assertTrue(any(item.source == "atlas-agent-mcp" for item in evidence))
+            self.assertFalse(any(item.source == "atlas-mcp" for item in evidence))
+
+    def test_agentic_atlas_falls_back_to_source_reader_when_mcp_has_no_substantive_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".atlas").mkdir()
+            (root / ".atlas" / "atlas.db").write_text("fake", encoding="utf-8")
+            (root / "app.py").write_text(
+                "\n".join(
+                    [
+                        "def handler(request):",
+                        "    payload = request.args.get('cmd')",
+                        "    return payload",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_empty_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-agentic-source",
+                rule_id="python-command-injection",
+                message="handler receives cmd",
+                level="warning",
+                locations=[SourceLocation("missing/report-only.py", 2)],
+            )
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["python"]),
+                AnalyzerSettings(enabled=True),
+            )
+            summaries = "\n".join(item.summary for item in evidence)
+            self.assertIn("AI 自主 Atlas MCP search 未找到报告相关符号或路径候选", summaries)
+            self.assertTrue(any(item.source == "agentic-source-reader" for item in evidence))
+            self.assertTrue(any(location.file == "app.py" for item in evidence for location in item.locations))
+
     def test_debate_outputs_structured_reports_and_final_conclusion(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -646,6 +741,10 @@ for raw in sys.stdin.buffer:
         self.assertNotIn('id="run-languages"', html)
         self.assertIn('自动 Atlas 构建索引', html)
         self.assertNotIn('自动索引工具', html)
+        self.assertIn('id="run-agentic-atlas"', html)
+        self.assertIn('id="run-agentic-atlas-direct"', html)
+        self.assertIn('AI 自主 Atlas 补证', html)
+        self.assertIn('直接 AI 自主运行 Atlas MCP', html)
         self.assertIn('id="agent-affirmative-profile-panel"', html)
         self.assertIn('id="agent-negative-profile-panel"', html)
         self.assertIn('#agent-affirmative-profile-panel', html)
@@ -1582,6 +1681,77 @@ for raw in sys.stdin:
                     }],
                 }]
             })
+        else:
+            tool_response(request_id, {"error": "unknown tool"}, True)
+'''
+
+
+def fake_atlas_mcp_empty_script():
+    return r'''#!/usr/bin/env python3
+import json
+import sys
+
+if "--help" in sys.argv:
+    print("Commands:")
+    print("  mcp     Start MCP server")
+    sys.exit(0)
+
+if len(sys.argv) < 2 or sys.argv[1] != "mcp":
+    sys.exit(2)
+
+TOOLS = [{"name": name} for name in ("project", "search", "trace", "calls")]
+
+def send(message):
+    print(json.dumps(message, separators=(",", ":")), flush=True)
+
+def tool_response(request_id, payload, is_error=False):
+    send({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(payload, separators=(",", ":"))}],
+            "isError": is_error,
+        },
+    })
+
+for raw in sys.stdin:
+    if not raw.strip():
+        continue
+    message = json.loads(raw)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "atlas-mcp", "version": "fake-empty"},
+            },
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}})
+    elif method == "tools/call":
+        params = message.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if name == "project" and args.get("action") == "status":
+            tool_response(request_id, {
+                "summary": {"files": 1, "symbols": 0, "edges": 0},
+                "project": {"db_path": ".atlas/atlas.db"},
+                "server": {"atlas_version": "fake-empty", "tool_contract_version": 1},
+            })
+        elif name == "project" and args.get("action") == "files":
+            tool_response(request_id, {"files": []})
+        elif name == "search":
+            tool_response(request_id, {"results": []})
+        elif name == "trace":
+            tool_response(request_id, {"ok": False, "partial_result": False, "diagnostics": ["empty"]})
+        elif name == "calls":
+            tool_response(request_id, {"hops": []})
         else:
             tool_response(request_id, {"error": "unknown tool"}, True)
 '''
