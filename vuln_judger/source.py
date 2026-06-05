@@ -218,10 +218,14 @@ class SourceIndexer:
         return evidence
 
     def protection_evidence(self, finding: Finding) -> List[CodeEvidence]:
+        scoped_paths = self._report_scope_paths(finding)
+        if not scoped_paths:
+            return []
         matches = search_source(
             self.source_root,
             SEARCH_PATTERNS["protection"],
             file_globs=self._extension_globs(),
+            paths=scoped_paths,
             context_lines=5,
             max_matches=20,
         )
@@ -242,20 +246,31 @@ class SourceIndexer:
                     evidence_id=evidence_id(finding.finding_id, "protection", file),
                     kind=EvidenceKind.PROTECTION,
                     strength=EvidenceStrength.MEDIUM if len(file_matches) >= 2 else EvidenceStrength.WEAK,
-                    summary=f"rg 搜索 {file} 中发现 {len(file_matches)} 处防护词项：{', '.join(terms[:8])}",
-                    source="code-search",
+                    summary=f"AI 自主 rg 围绕报告路径 {file} 发现 {len(file_matches)} 处候选防护词项：{', '.join(terms[:8])}",
+                    source="agentic-rg",
                     locations=[SourceLocation(file=file, line=lines[0])],
                     snippet=snippet,
-                    data={"terms": terms, "match_count": len(file_matches), "files_searched": len(by_file)},
+                    data={
+                        "terms": terms,
+                        "match_count": len(file_matches),
+                        "files_searched": len(by_file),
+                        "search_scope": "report",
+                        "scoped_paths": scoped_paths,
+                    },
                 )
             )
         return evidence
 
     def source_sink_evidence(self, finding: Finding) -> List[CodeEvidence]:
+        scoped_paths = self._report_scope_paths(finding)
+        if not scoped_paths:
+            return []
+        query_terms = _finding_query_terms(finding)
         source_matches = search_source(
             self.source_root,
             SEARCH_PATTERNS["source"],
             file_globs=self._extension_globs(),
+            paths=scoped_paths,
             context_lines=3,
             max_matches=20,
         )
@@ -263,22 +278,45 @@ class SourceIndexer:
             self.source_root,
             SEARCH_PATTERNS["sink"],
             file_globs=self._extension_globs(),
+            paths=scoped_paths,
             context_lines=3,
             max_matches=20,
         )
-        evidence: List[CodeEvidence] = []
+        evidence: List[CodeEvidence] = [
+            CodeEvidence(
+                evidence_id=evidence_id(finding.finding_id, "agentic-rg", "plan", *scoped_paths[:8]),
+                kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                strength=EvidenceStrength.MEDIUM,
+                summary=(
+                    "AI 自主 rg 补证启动：围绕报告位置和 codeFlow 文件搜索候选源点、候选汇点和防护词项；"
+                    f"范围 {', '.join(scoped_paths[:8])}"
+                ),
+                source="agentic-rg",
+                data={
+                    "search_scope": "report",
+                    "scoped_paths": scoped_paths,
+                    "query_terms": query_terms,
+                    "source_pattern": SEARCH_PATTERNS["source"],
+                    "sink_pattern": SEARCH_PATTERNS["sink"],
+                },
+            )
+        ]
         if source_matches:
             source_terms = sorted(set(_extract_terms(m.text, SEARCH_PATTERNS["source"]) for m in source_matches))[:10]
-            source_file = source_matches[0]
             evidence.append(
                 CodeEvidence(
                     evidence_id=evidence_id(finding.finding_id, "source-sink", "source"),
                     kind=EvidenceKind.DATA_FLOW,
                     strength=EvidenceStrength.WEAK,
-                    summary=f"rg 在源码中搜索到 {len(source_matches)} 处源点词项：{', '.join(source_terms)}",
-                    source="code-search",
+                    summary=f"AI 自主 rg 围绕报告路径搜索到 {len(source_matches)} 处候选源点词项：{', '.join(source_terms)}",
+                    source="agentic-rg",
                     locations=[SourceLocation(file=m.file, line=m.line) for m in source_matches[:5]],
-                    data={"source_terms": source_terms, "source_match_count": len(source_matches)},
+                    data={
+                        "source_terms": source_terms,
+                        "source_match_count": len(source_matches),
+                        "search_scope": "report",
+                        "scoped_paths": scoped_paths,
+                    },
                 )
             )
         if sink_matches:
@@ -288,13 +326,30 @@ class SourceIndexer:
                     evidence_id=evidence_id(finding.finding_id, "source-sink", "sink"),
                     kind=EvidenceKind.DATA_FLOW,
                     strength=EvidenceStrength.WEAK,
-                    summary=f"rg 在源码中搜索到 {len(sink_matches)} 处汇点词项：{', '.join(sink_terms)}",
-                    source="code-search",
+                    summary=f"AI 自主 rg 围绕报告路径搜索到 {len(sink_matches)} 处候选汇点词项：{', '.join(sink_terms)}",
+                    source="agentic-rg",
                     locations=[SourceLocation(file=m.file, line=m.line) for m in sink_matches[:5]],
-                    data={"sink_terms": sink_terms, "sink_match_count": len(sink_matches)},
+                    data={
+                        "sink_terms": sink_terms,
+                        "sink_match_count": len(sink_matches),
+                        "search_scope": "report",
+                        "scoped_paths": scoped_paths,
+                    },
                 )
             )
         return evidence
+
+    def _report_scope_paths(self, finding: Finding) -> List[str]:
+        paths: List[str] = []
+        for location in _finding_locations(finding):
+            resolved = self.resolve_location(location)
+            if not resolved.exists or not resolved.absolute_path or not resolved.relative_path:
+                continue
+            if resolved.relative_path not in paths:
+                paths.append(resolved.relative_path)
+            if len(paths) >= 12:
+                break
+        return paths
 
     def compile_database_evidence(self, finding: Finding) -> Optional[CodeEvidence]:
         primary = finding.primary_location
@@ -425,6 +480,33 @@ def supported_language_for_finding(finding: Finding, languages: Sequence[str]) -
         return True
     language = detect_language(primary.file)
     return language is None or language in {item.lower() for item in languages}
+
+
+def _finding_locations(finding: Finding) -> List[SourceLocation]:
+    locations = list(finding.locations)
+    for flow in finding.code_flows:
+        locations.extend(flow)
+    return locations
+
+
+def _finding_query_terms(finding: Finding, limit: int = 16) -> List[str]:
+    values: List[str] = [finding.rule_id, finding.message]
+    values.extend(str(value) for value in finding.properties.values())
+    for location in _finding_locations(finding):
+        values.append(location.file)
+        if location.symbol:
+            values.append(location.symbol)
+    terms: List[str] = []
+    for value in values:
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", str(value or "")):
+            lowered = token.lower()
+            if lowered in {"the", "and", "for", "with", "from", "this", "that", "warning", "error"}:
+                continue
+            if token not in terms:
+                terms.append(token)
+            if len(terms) >= limit:
+                return terms
+    return terms
 
 
 def _display_location(resolved: ResolvedLocation) -> SourceLocation:

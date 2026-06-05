@@ -31,15 +31,16 @@ def search_source(
     pattern: str,
     *,
     file_globs: Optional[Sequence[str]] = None,
+    paths: Optional[Sequence[str]] = None,
     context_lines: int = 3,
     max_matches: int = 30,
     timeout: int = 30,
 ) -> List[GrepMatch]:
     rg = _find_rg()
     if rg is not None:
-        return _search_rg(rg, source_root, pattern, file_globs, context_lines, max_matches, timeout)
+        return _search_rg(rg, source_root, pattern, file_globs, paths, context_lines, max_matches, timeout)
     grep = _find_grep()
-    return _search_grep(grep, source_root, pattern, file_globs, context_lines, max_matches, timeout)
+    return _search_grep(grep, source_root, pattern, file_globs, paths, context_lines, max_matches, timeout)
 
 
 def _search_rg(
@@ -47,6 +48,7 @@ def _search_rg(
     source_root: Path,
     pattern: str,
     file_globs: Optional[Sequence[str]],
+    paths: Optional[Sequence[str]],
     context_lines: int,
     max_matches: int,
     timeout: int,
@@ -64,7 +66,7 @@ def _search_rg(
         for glob in file_globs:
             args.extend(["-g", glob])
     args.append(pattern)
-    args.append(".")
+    args.extend(_search_paths(paths))
     try:
         result = subprocess.run(
             args,
@@ -86,6 +88,7 @@ def _search_grep(
     source_root: Path,
     pattern: str,
     file_globs: Optional[Sequence[str]],
+    paths: Optional[Sequence[str]],
     context_lines: int,
     max_matches: int,
     timeout: int,
@@ -104,7 +107,7 @@ def _search_grep(
             args = [a for a in args if a != "--include=*"]
             args.extend(["--include", f"*.{{{include}}}"])
     args.append(pattern)
-    args.append(".")
+    args.extend(_search_paths(paths))
     try:
         result = subprocess.run(
             args,
@@ -206,6 +209,16 @@ def _clean_relative_path(value: str) -> str:
     if path.startswith("./"):
         return path[2:]
     return path
+
+
+def _search_paths(paths: Optional[Sequence[str]]) -> List[str]:
+    result = []
+    for path in paths or []:
+        item = str(path).replace("\\", "/").strip()
+        if not item:
+            continue
+        result.append(item[2:] if item.startswith("./") else item)
+    return result or ["."]
 
 
 SEARCH_PATTERNS = {

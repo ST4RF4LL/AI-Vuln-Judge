@@ -89,10 +89,12 @@ class DebateOrchestrator:
         affirmative_report = self._llm_claim(
             "AFFIRMATIVE",
             (
-                "提交完整正方证据报告。必须覆盖：输入报告证据、源码真实性、函数调用链、数据流、攻击链、"
-                "攻击前提、攻击限制、防护消减分析、攻击影响、可选 PoC/EXP。"
-                "如有证据缺口，应主动从已有证据中交叉验证补强（如从 calls 调用图反查数据流、从源码片段拼接路径、用附近符号补全 search 遗漏），"
+                "提交完整正方证据报告。目标固定为：证明报告发现能否由外部接口或内部接口调用触发，"
+                "给出准确函数调用链、源到汇数据流、攻击链、攻击前提、直接影响和必要限制。"
+                "所有 Atlas、rg/grep 和源码阅读都必须围绕报告位置、报告符号、codeFlow 或其调用邻域验证，不得用全项目无关命中混充证据。"
+                "如有证据缺口，应主动从已有证据中交叉验证补强（如从 calls 调用图反查数据流、从源码片段拼接路径、用报告附近符号补全 search 遗漏），"
                 "只有在穷尽补强手段后才可标注为证据限制，并说明尝试过哪些补强方法。"
+                "防护消减只在源码或 Skill/项目上下文存在明确防护证据时分析；没有证据就不要引入防护消减假设。"
             ),
             bundle,
             extra=_stage_context(
@@ -120,8 +122,10 @@ class DebateOrchestrator:
         negative_report = self._llm_claim(
             "NEGATIVE",
             (
-                "提交反方质疑报告。必须覆盖：攻击链路真实性、调用链/数据流断点、攻击前提是否过高、"
-                "源码或知识库中的安全防护、攻击影响是否被夸大。只能引用提示中给出的证据 ID。"
+                "提交反方质疑报告。目标固定为：客观验证正方给出的报告源码真实性、外部/内部入口可达性、"
+                "调用链、源到汇数据流、攻击影响和防护分析是否由证据支持。重点找出证据跳跃、无关 rg/Atlas 命中、"
+                "把候选汇点当作可达汇点、遗漏调用前提或浑水摸鱼的地方。只能引用提示中给出的证据 ID。"
+                "防护消减只能基于源码或 Skill/项目上下文中的明确防护证据质疑；没有证据时不得凭空假设统一防护。"
             ),
             bundle,
             extra=_stage_context("反方第一回合", "正方证据报告：\n" + affirmative_report, challenges, ""),
@@ -297,6 +301,7 @@ class DebateOrchestrator:
             f"发现：{bundle.finding.rule_id} - {bundle.finding.message}\n"
             f"证据：\n" + _evidence_prompt(bundle.evidence) + "\n"
             "证据解释约束：SOURCE_ROOT 只能证明任务已配置源码根目录，不能替代具体 SOURCE_LOCATION、CALL_CHAIN 或 DATA_FLOW；"
+            "rg/grep 证据必须围绕报告位置、报告符号、codeFlow 或调用邻域解释，只能作为候选补证，不能单独证明源汇可达；"
             "若存在 atlas-mcp 证据，应优先按 MCP 的 project/status、project/files、trace、calls 结果研判；"
             "若 Atlas 数据库存在但 trace 结果为 empty/partial/No data node，应转而从 calls 调用图和源码片段交叉验证重构数据流；"
             "若 Atlas 数据库存在但 trace_supported=false，只能说明当前工具无法导出 trace，不得说 .atlas 缺失或未构建。\n"
@@ -552,6 +557,9 @@ def _data_excerpt(item: CodeEvidence) -> str:
         "symbols",
         "source_terms",
         "sink_terms",
+        "search_scope",
+        "scoped_paths",
+        "query_terms",
         "terms",
         "impacts",
         "compile_database",
@@ -634,7 +642,7 @@ def _attack_chain_report(bundle: EvidenceBundle) -> str:
     if _has_protection(evidence):
         steps.append("5. 防护限制：路径附近存在防护证据，攻击链必须证明这些控制无法覆盖该输入。")
     else:
-        steps.append("5. 防护限制：当前证据链未识别到直接覆盖该路径的校验、鉴权、消毒或限流控制。")
+        steps.append("5. 防护限制：未发现针对报告路径的防护消减证据，本轮不引入防护消减假设。")
     return "\n".join(steps)
 
 
@@ -713,7 +721,7 @@ def _negative_prerequisite_challenge(evidence: Sequence[CodeEvidence], challenge
 def _negative_protection_challenge(evidence: Sequence[CodeEvidence]) -> str:
     if _has_protection(evidence):
         return "源码附近存在可能的鉴权、校验、消毒或限流证据，正方必须证明这些控制无法消减该风险。"
-    return "当前证据未发现直接防护，但反方仍要求结合项目知识库确认全局中间件、网关或权限策略。"
+    return "当前证据未发现针对报告路径的防护消减证据；反方不得凭空引入统一防护，只能指出正方未提交相关防护证据。"
 
 
 def _negative_impact_challenge(evidence: Sequence[CodeEvidence]) -> str:
@@ -946,11 +954,14 @@ def _has_meaningful_flow(evidence: Sequence[CodeEvidence]) -> bool:
 
 
 def _has_weak_source_sink(evidence: Sequence[CodeEvidence]) -> bool:
-    return any(item.kind == EvidenceKind.DATA_FLOW and item.source == "code-search" for item in evidence)
+    sources = {"code-search", "agentic-rg"}
+    has_source = any(item.kind == EvidenceKind.DATA_FLOW and item.source in sources and item.data.get("source_terms") for item in evidence)
+    has_sink = any(item.kind == EvidenceKind.DATA_FLOW and item.source in sources and item.data.get("sink_terms") for item in evidence)
+    return has_source and has_sink
 
 
 def _has_protection(evidence: Sequence[CodeEvidence]) -> bool:
-    return any(item.kind == EvidenceKind.PROTECTION for item in evidence)
+    return any(item.kind == EvidenceKind.PROTECTION for item in evidence) or bool(_project_context_controls(evidence))
 
 
 def _has_impact(evidence: Sequence[CodeEvidence]) -> bool:
@@ -986,15 +997,51 @@ def _material_unresolved(challenges: Sequence[str]) -> bool:
 
 def _protection_assessment(evidence: Sequence[CodeEvidence]) -> str:
     protections = [item for item in evidence if item.kind == EvidenceKind.PROTECTION]
-    if not protections:
-        return "未识别到附近存在校验、鉴权、消毒或限流证据。"
+    context_controls = _project_context_controls(evidence)
+    if not protections and not context_controls:
+        return "未发现针对报告路径的防护消减证据；本轮不引入防护消减假设。"
     terms = []
     for item in protections:
         terms.extend(item.data.get("terms", []))
     unique_terms = sorted(set(terms))
+    parts = []
     if unique_terms:
-        return "路径附近发现可能的缓解控制：" + ", ".join(unique_terms)
-    return "发现可能的缓解控制，但其有效性尚未确认。"
+        parts.append("报告路径附近发现候选防护控制：" + ", ".join(unique_terms))
+    if context_controls:
+        parts.append("Skill/项目上下文存在统一防护信息：" + "; ".join(context_controls[:3]))
+    if not parts:
+        return "发现防护证据，但未提取到具体控制词项；只能作为待分析防护证据。"
+    return "；".join(parts)
+
+
+def _project_context_controls(evidence: Sequence[CodeEvidence]) -> List[str]:
+    markers = (
+        "鉴权",
+        "认证",
+        "权限",
+        "校验",
+        "消毒",
+        "过滤",
+        "限流",
+        "策略",
+        "中间件",
+        "网关",
+        "auth",
+        "permission",
+        "sanitize",
+        "validate",
+        "policy",
+        "middleware",
+        "gateway",
+    )
+    controls = []
+    for item in evidence:
+        if item.kind != EvidenceKind.PROJECT_CONTEXT:
+            continue
+        text = (item.summary + " " + str(item.data)).lower()
+        if any(marker.lower() in text for marker in markers):
+            controls.append(item.summary)
+    return controls
 
 
 def _impact_assessment(evidence: Sequence[CodeEvidence]) -> str:

@@ -189,7 +189,7 @@ class EvidenceCollector:
         if not has_meaningful_flow and not _has_strong_data_flow(evidence):
             missing.append("data_flow")
             actions.append(
-                "数据流不足：优先调用 Atlas trace point/variable；若 trace 为 partial、empty 或 No data node，应结合源码片段、源点/汇点 rg 命中和 calls 调用图逐跳手动重构。"
+                "数据流不足：优先调用 Atlas trace point/variable；若 trace 为 partial、empty 或 No data node，应结合报告路径附近源码片段、报告范围内 agentic-rg 候选源点/汇点和 calls 调用图逐跳手动重构。"
             )
         if not has_meaningful_flow and not _has_call_chain(evidence):
             missing.append("call_chain")

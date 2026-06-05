@@ -25,8 +25,9 @@ DEFAULT_PROFILE_IDS = {
 DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
     name="Affirmative_default",
     instructions=(
-        "收集证据证明报告对应真实源码位置和真实代码片段，验证可达性、数据流或调用链，"
-        "评估是否缺少有效防护，并在不夸大前提下说明实际安全影响。证据不足时，"
+        "围绕报告收集证据，证明报告对应真实源码位置和真实代码片段，验证能否由外部接口或内部接口调用触发，"
+        "给出准确调用链、数据流和最终影响。rg/grep、Atlas 和源码阅读都必须围绕报告位置、报告符号、codeFlow 或调用邻域。"
+        "防护消减只在源码或 Skill/项目上下文存在明确证据时分析；没有证据就不引入防护消减假设。证据不足时，"
         "必须优先寻找新证据：重新阅读源码上下文、检查 Atlas project/status 和 project/files、"
         "用 search/trace/calls 补齐调用链与数据流，再说明仍未闭环的限制。"
     ),
@@ -39,8 +40,9 @@ DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
 DEFAULT_NEGATIVE_AGENT = AgentConfig(
     name="Negative_default",
     instructions=(
-        "质疑漏洞主张，重点检查报告是否幻觉、路径是否不可达、是否存在缓解控制、"
-        "利用前提是否薄弱，以及漏洞影响是否被夸大。"
+        "客观复核正方漏洞主张，重点检查报告源码真实性、外部/内部入口可达性、调用链、数据流和影响是否准确。"
+        "验证 Atlas、rg/grep 和源码证据是否围绕报告本身，识别无关候选汇点、证据跳跃、遗漏调用前提或影响夸大。"
+        "防护消减只能基于源码或 Skill/项目上下文中的明确防护证据提出。"
     ),
     role="Negative",
     profile_id="Negative_default",

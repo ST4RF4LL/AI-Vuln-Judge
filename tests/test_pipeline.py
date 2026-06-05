@@ -617,6 +617,118 @@ for raw in sys.stdin.buffer:
             self.assertIn("正方补证策略", finding.debate[0].claim)
             self.assertIn("应继续主动补证", finding.debate[0].claim)
 
+    def test_agentic_rg_is_scoped_to_report_files_for_sink_candidates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "safe.py").write_text(
+                "\n".join(
+                    [
+                        "def handler(request):",
+                        "    value = request.args.get('cmd')",
+                        "    return value",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (root / "danger.py").write_text(
+                "import os\n\ndef unrelated(cmd):\n    os.system(cmd)\n",
+                encoding="utf-8",
+            )
+            sarif = root / "report.sarif"
+            sarif.write_text(
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "unit"}},
+                                "results": [
+                                    {
+                                        "ruleId": "python-command-injection",
+                                        "level": "warning",
+                                        "message": {"text": "handler receives command input"},
+                                        "locations": [
+                                            {
+                                                "physicalLocation": {
+                                                    "artifactLocation": {"uri": "safe.py"},
+                                                    "region": {"startLine": 2, "startColumn": 13},
+                                                }
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            )
+            evidence = report.reports[0].evidence_chain
+            rg_items = [item for item in evidence if item.source == "agentic-rg"]
+            self.assertTrue(rg_items)
+            self.assertTrue(all("safe.py" in item.data.get("scoped_paths", []) for item in rg_items))
+            self.assertFalse(any(location.file == "danger.py" for item in rg_items for location in item.locations))
+            self.assertFalse(any(item.data.get("sink_terms") for item in rg_items))
+
+    def test_agentic_rg_does_not_use_unrelated_protection_as_mitigation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "safe.py").write_text(
+                "def handler(request):\n    return request.args.get('cmd')\n",
+                encoding="utf-8",
+            )
+            (root / "guard.py").write_text(
+                "def guard(user):\n    return authorize(user) and check(user)\n",
+                encoding="utf-8",
+            )
+            sarif = root / "report.sarif"
+            sarif.write_text(
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "unit"}},
+                                "results": [
+                                    {
+                                        "ruleId": "python-command-injection",
+                                        "level": "warning",
+                                        "message": {"text": "handler receives command input"},
+                                        "locations": [
+                                            {
+                                                "physicalLocation": {
+                                                    "artifactLocation": {"uri": "safe.py"},
+                                                    "region": {"startLine": 2, "startColumn": 12},
+                                                }
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            )
+            finding = report.reports[0]
+            self.assertFalse(any(item.kind == EvidenceKind.PROTECTION for item in finding.evidence_chain))
+            self.assertIn("未发现针对报告路径的防护消减证据", finding.protection_assessment)
+            self.assertNotIn("guard.py", finding.protection_assessment)
+
     def test_markdown_without_locations_still_passes_source_root_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
