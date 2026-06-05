@@ -236,6 +236,52 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(resolved.symbol, "IndexFlatPanorama::permute_entries")
             self.assertIn("permute_entries", resolved.snippet)
 
+    def test_numeric_report_path_does_not_read_missing_source_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "real.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+            sarif = root / "report.sarif"
+            sarif.write_text(
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "unit"}},
+                                "results": [
+                                    {
+                                        "ruleId": "numeric-location",
+                                        "message": {"text": "bad location parsed as a line number"},
+                                        "locations": [
+                                            {
+                                                "physicalLocation": {
+                                                    "artifactLocation": {"uri": "411"},
+                                                    "region": {"startLine": 1},
+                                                }
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            )
+            source_items = [
+                item for item in report.reports[0].evidence_chain if item.kind == EvidenceKind.SOURCE_LOCATION
+            ]
+            self.assertTrue(source_items)
+            self.assertFalse(source_items[0].data["exists"])
+            self.assertIn("无法在源码根目录下解析", source_items[0].summary)
+
     def test_sarif_path_with_redundant_project_prefix_resolves_by_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

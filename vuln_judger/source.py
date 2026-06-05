@@ -418,10 +418,15 @@ class SourceIndexer:
 
     def _read_lines(self, path: Path) -> List[str]:
         if path not in self._file_cache:
-            self._file_cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            try:
+                self._file_cache[path] = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                return []
         return self._file_cache[path]
 
     def _resolve_path(self, raw: str) -> Optional[Path]:
+        if not _looks_like_source_path(raw):
+            return None
         candidates = self._path_candidates(raw)
         in_root: List[Path] = []
         for item in candidates:
@@ -439,6 +444,8 @@ class SourceIndexer:
 
     def _path_candidates(self, raw: str) -> List[Path]:
         normalized = raw.replace("\\", "/").strip()
+        if not _looks_like_source_path(normalized):
+            return []
         candidate = Path(normalized)
         candidates: List[Path] = []
         if candidate.is_absolute():
@@ -480,6 +487,15 @@ def supported_language_for_finding(finding: Finding, languages: Sequence[str]) -
         return True
     language = detect_language(primary.file)
     return language is None or language in {item.lower() for item in languages}
+
+
+def _looks_like_source_path(raw: str) -> bool:
+    value = str(raw or "").replace("\\", "/").strip()
+    if not value:
+        return False
+    if value.isdigit():
+        return False
+    return True
 
 
 def _finding_locations(finding: Finding) -> List[SourceLocation]:
