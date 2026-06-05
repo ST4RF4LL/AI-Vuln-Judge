@@ -991,6 +991,12 @@ def app_html() -> str:
     }}
     .form-grid {{ display: grid; grid-template-columns: repeat(2, minmax(160px, 1fr)); gap: 12px; }}
     .form-grid .wide {{ grid-column: 1 / -1; }}
+    .run-agent-grid {{
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(160px, 1fr));
+      gap: 12px;
+    }}
     pre {{
       margin: 0;
       white-space: pre-wrap;
@@ -1148,6 +1154,7 @@ def app_html() -> str:
       .pane {{ min-height: 360px; }}
       .summary-grid {{ grid-template-columns: repeat(2, minmax(120px, 1fr)); }}
       .form-grid {{ grid-template-columns: 1fr; }}
+      .run-agent-grid {{ grid-template-columns: 1fr; }}
       .profile-grid {{ grid-template-columns: 1fr; }}
     }}
   </style>
@@ -1360,10 +1367,12 @@ def app_html() -> str:
               <label>Skill Source<select id="run-skill-source"></select></label>
               <label class="wide">Skills 路径<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
               <label>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
-              <label>正方提供商<select id="run-affirmative-provider"></select></label>
-              <label>反方提供商<select id="run-negative-provider"></select></label>
-              <label>正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
-              <label>反方 Agent 配置档案<select id="run-negative-agent-profile"></select></label>
+              <div class="run-agent-grid">
+                <label>正方提供商<select id="run-affirmative-provider"></select></label>
+                <label>正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
+                <label>反方提供商<select id="run-negative-provider"></select></label>
+                <label>反方 Agent 配置档案<select id="run-negative-agent-profile"></select></label>
+              </div>
             </div>
             <div class="chips">
               <label><input id="run-external-tools" type="checkbox" checked> 启用外部工具</label>

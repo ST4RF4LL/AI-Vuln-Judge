@@ -103,7 +103,7 @@ class DebateOrchestrator:
                     "才可表述为“Atlas 已索引但当前工具无法导出数据流 trace”，不得说 .atlas 缺失或未构建。"
                 ),
                 challenges,
-                "",
+                _affirmative_evidence_hunting_context(bundle),
             ),
         ) or _affirmative_evidence_report(bundle, base_decision, challenges)
         turns: List[DebateTurn] = []
@@ -153,7 +153,7 @@ class DebateOrchestrator:
                     f"正方第 {round_index} 回合澄清",
                     "上一轮反方质疑：\n" + last_negative,
                     unresolved,
-                    "",
+                    _affirmative_evidence_hunting_context(bundle),
                 ),
             ) or _affirmative_clarification_report(bundle, unresolved, round_index)
             answer_ids = source_root_ids + location_ids + flow_ids + protection_ids + impact_ids
@@ -424,6 +424,8 @@ def _affirmative_evidence_report(
             _impact_assessment(evidence),
             "### 8. PoC/EXP",
             _poc_report(evidence),
+            "### 9. 正方补证策略",
+            _affirmative_evidence_hunting_report(evidence),
             "### 正方阶段性结论",
             f"{decision.reasoning_summary} 当前启发式标签倾向：{_verdict_label(decision.verdict)}。",
         ]
@@ -553,6 +555,11 @@ def _data_excerpt(item: CodeEvidence) -> str:
         "impacts",
         "compile_database",
         "code_flow_count",
+        "missing_evidence",
+        "suggested_actions",
+        "agentic_atlas_enabled",
+        "agentic_atlas_direct",
+        "auto_index_tools",
         "indexed_files",
         "indexed_file_count",
         "files_indexed",
@@ -646,6 +653,38 @@ def _poc_report(evidence: Sequence[CodeEvidence]) -> str:
     if _has_meaningful_flow(evidence) and not _has_protection(evidence):
         return "证据支持生成最小验证用例，但当前自动流程不生成可执行 EXP；建议在授权测试环境中基于入口参数构造最小非破坏性 PoC。"
     return "证据尚不足以安全生成 PoC/EXP；应先补齐可达入口、数据流和防护有效性验证。"
+
+
+def _affirmative_evidence_hunting_context(bundle: EvidenceBundle) -> str:
+    plans = _affirmative_evidence_plans(bundle.evidence)
+    if not plans:
+        return "正方证据不足补强策略：当前自动证据未生成额外补证计划；仍需优先进行源码分析、Atlas 检查和交叉验证路径。"
+    lines = ["正方证据不足补强策略：证据不足时不得直接停止，应先按以下补证计划寻找新证据。"]
+    for item in plans[:3]:
+        lines.append(f"- 引用 `{item.evidence_id}`：{item.summary}")
+        for action in (item.data.get("suggested_actions") or [])[:5]:
+            lines.append(f"  - {action}")
+    lines.append("执行要求：优先补充 SOURCE_LOCATION、DATA_FLOW、CALL_CHAIN 和 TOOL_DIAGNOSTIC 证据引用；如果仍失败，必须说明已尝试的源码分析、Atlas 检查和交叉验证路径。")
+    return "\n".join(lines)
+
+
+def _affirmative_evidence_hunting_report(evidence: Sequence[CodeEvidence]) -> str:
+    plans = _affirmative_evidence_plans(evidence)
+    if not plans:
+        return "当前自动证据未生成额外补证计划；正方仍应优先交叉验证源码位置、调用链、数据流和影响归因。"
+    lines = []
+    for item in plans[:3]:
+        missing = item.data.get("missing_evidence") or []
+        lines.append(f"- `{item.evidence_id}` {item.summary}")
+        if missing:
+            lines.append("  缺口：" + ", ".join(str(value) for value in missing))
+        for action in (item.data.get("suggested_actions") or [])[:6]:
+            lines.append(f"  - {action}")
+    return "\n".join(lines)
+
+
+def _affirmative_evidence_plans(evidence: Sequence[CodeEvidence]) -> List[CodeEvidence]:
+    return [item for item in evidence if item.source == "affirmative-evidence-planner"]
 
 
 def _negative_chain_challenge(evidence: Sequence[CodeEvidence]) -> str:

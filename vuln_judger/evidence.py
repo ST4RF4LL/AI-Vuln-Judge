@@ -69,6 +69,7 @@ class EvidenceCollector:
         evidence.extend(self._impact_evidence(finding))
         evidence.extend(self._project_context_evidence(finding))
         evidence.extend(self.analyzers.analyze(finding, self.indexer, self.analyzer_settings))
+        evidence.extend(self._affirmative_evidence_hunting_evidence(finding, evidence))
         return EvidenceBundle(finding=finding, evidence=_dedupe_evidence(evidence), diagnostics=diagnostics)
 
     def _source_root_evidence(self, finding: Finding) -> CodeEvidence:
@@ -173,6 +174,68 @@ class EvidenceCollector:
             )
         return result
 
+    def _affirmative_evidence_hunting_evidence(
+        self, finding: Finding, evidence: Sequence[CodeEvidence]
+    ) -> List[CodeEvidence]:
+        missing: List[str] = []
+        actions: List[str] = []
+        has_valid_location = _has_valid_source_location(evidence)
+        has_meaningful_flow = _has_meaningful_flow(evidence)
+        if not has_valid_location:
+            missing.append("source_location")
+            actions.append(
+                "源码真实性不足：优先用报告路径后缀、文件名和符号名重新匹配源码；检查 Atlas project/files；必要时全文搜索报告中的文件名、函数名和规则关键词。"
+            )
+        if not has_meaningful_flow and not _has_strong_data_flow(evidence):
+            missing.append("data_flow")
+            actions.append(
+                "数据流不足：优先调用 Atlas trace point/variable；若 trace 为 partial、empty 或 No data node，应结合源码片段、源点/汇点 rg 命中和 calls 调用图逐跳手动重构。"
+            )
+        if not has_meaningful_flow and not _has_call_chain(evidence):
+            missing.append("call_chain")
+            actions.append(
+                "调用链不足：使用报告符号、附近函数、文件 stem 和危险汇点作为 Atlas search 查询词，再对候选 qualified_name 调用 calls both，并从调用方/被调用方两端拼接路径。"
+            )
+        if (
+            self.analyzer_settings.enabled
+            and (not has_valid_location or not has_meaningful_flow)
+            and not _has_atlas_semantic_evidence(evidence)
+        ):
+            missing.append("atlas_semantic")
+            if _atlas_database_exists(evidence):
+                actions.append(
+                    "Atlas 语义证据不足：读取 project/status 确认索引规模和语言能力，读取 project/files 确认报告文件已入库，再用 search/trace/calls 补齐缺口。"
+                )
+            else:
+                actions.append(
+                    "Atlas 索引不足：检查 .atlas/atlas.db；可启用 auto_index_tools 自动 Atlas 构建索引，或在源码目录执行 atlas index --analysis full 后重跑。"
+                )
+        if _has_protection_evidence(evidence):
+            missing.append("protection_bypass")
+            actions.append(
+                "存在防护迹象：继续阅读防护附近源码，证明校验、鉴权、消毒或限流是否覆盖当前输入；若不能完全覆盖，应说明绕过条件和残余风险。"
+            )
+        if not missing:
+            return []
+        summary = "正方证据不足补强策略：缺口 " + ", ".join(missing) + "；应继续主动补证而非直接接受证据不足"
+        return [
+            CodeEvidence(
+                evidence_id=evidence_id(finding.finding_id, "affirmative-evidence-plan", *missing),
+                kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                strength=EvidenceStrength.MEDIUM,
+                summary=summary,
+                source="affirmative-evidence-planner",
+                data={
+                    "missing_evidence": missing,
+                    "suggested_actions": actions,
+                    "agentic_atlas_enabled": self.analyzer_settings.agentic_atlas,
+                    "agentic_atlas_direct": self.analyzer_settings.agentic_atlas_direct,
+                    "auto_index_tools": self.analyzer_settings.auto_index,
+                    "atlas_database_exists": _atlas_database_exists(evidence),
+                },
+            )
+        ]
+
 
 def _dedupe_evidence(evidence: List[CodeEvidence]) -> List[CodeEvidence]:
     seen = set()
@@ -183,3 +246,56 @@ def _dedupe_evidence(evidence: List[CodeEvidence]) -> List[CodeEvidence]:
         seen.add(item.evidence_id)
         result.append(item)
     return result
+
+
+def _has_valid_source_location(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(
+        item.kind == EvidenceKind.SOURCE_LOCATION
+        and (item.data.get("line_exists") or item.data.get("mcp_success") or item.data.get("matched_files"))
+        for item in evidence
+    )
+
+
+def _has_strong_data_flow(evidence: Sequence[CodeEvidence]) -> bool:
+    for item in evidence:
+        if item.kind == EvidenceKind.SARIF_CODE_FLOW and item.strength in {EvidenceStrength.STRONG, EvidenceStrength.MEDIUM}:
+            return True
+        if item.kind == EvidenceKind.DATA_FLOW and item.source != "code-search" and item.strength in {
+            EvidenceStrength.STRONG,
+            EvidenceStrength.MEDIUM,
+        }:
+            return True
+    return False
+
+
+def _has_call_chain(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(
+        item.kind == EvidenceKind.CALL_CHAIN
+        and item.strength in {EvidenceStrength.STRONG, EvidenceStrength.MEDIUM}
+        for item in evidence
+    )
+
+
+def _has_meaningful_flow(evidence: Sequence[CodeEvidence]) -> bool:
+    return _has_strong_data_flow(evidence) or _has_call_chain(evidence)
+
+
+def _has_atlas_semantic_evidence(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(
+        item.source.startswith("atlas")
+        and item.data.get("mcp_success")
+        and item.kind in {EvidenceKind.SOURCE_LOCATION, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN}
+        for item in evidence
+    )
+
+
+def _atlas_database_exists(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(
+        (item.kind == EvidenceKind.SOURCE_ROOT and item.data.get("atlas_database_exists"))
+        or (item.source.startswith("atlas") and item.data.get("database"))
+        for item in evidence
+    )
+
+
+def _has_protection_evidence(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(item.kind == EvidenceKind.PROTECTION for item in evidence)

@@ -26,7 +26,9 @@ DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
     name="Affirmative_default",
     instructions=(
         "收集证据证明报告对应真实源码位置和真实代码片段，验证可达性、数据流或调用链，"
-        "评估是否缺少有效防护，并在不夸大前提下说明实际安全影响。"
+        "评估是否缺少有效防护，并在不夸大前提下说明实际安全影响。证据不足时，"
+        "必须优先寻找新证据：重新阅读源码上下文、检查 Atlas project/status 和 project/files、"
+        "用 search/trace/calls 补齐调用链与数据流，再说明仍未闭环的限制。"
     ),
     role="Affirmative",
     profile_id="Affirmative_default",

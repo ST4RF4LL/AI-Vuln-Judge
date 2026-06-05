@@ -559,6 +559,64 @@ for raw in sys.stdin.buffer:
             self.assertTrue(finding.final_conclusion.startswith("【真实漏洞】"))
             self.assertEqual(finding.debate[-1].claim, finding.final_conclusion)
 
+    def test_affirmative_planner_pushes_evidence_hunting_when_chain_is_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "\n".join(
+                    [
+                        "def handler(request):",
+                        "    value = request.args.get('cmd')",
+                        "    return value",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            sarif = root / "report.sarif"
+            sarif.write_text(
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "unit"}},
+                                "results": [
+                                    {
+                                        "ruleId": "python-command-injection",
+                                        "level": "warning",
+                                        "message": {"text": "handler receives command input"},
+                                        "locations": [
+                                            {
+                                                "physicalLocation": {
+                                                    "artifactLocation": {"uri": "app.py"},
+                                                    "region": {"startLine": 2, "startColumn": 13},
+                                                }
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            )
+            finding = report.reports[0]
+            plans = [item for item in finding.evidence_chain if item.source == "affirmative-evidence-planner"]
+            self.assertTrue(plans)
+            self.assertIn("data_flow", plans[0].data["missing_evidence"])
+            self.assertIn("call_chain", plans[0].data["missing_evidence"])
+            self.assertTrue(any("Atlas trace" in action for action in plans[0].data["suggested_actions"]))
+            self.assertIn("正方补证策略", finding.debate[0].claim)
+            self.assertIn("应继续主动补证", finding.debate[0].claim)
+
     def test_markdown_without_locations_still_passes_source_root_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -745,6 +803,9 @@ for raw in sys.stdin.buffer:
         self.assertIn('id="run-agentic-atlas-direct"', html)
         self.assertIn('AI 自主 Atlas 补证', html)
         self.assertIn('直接 AI 自主运行 Atlas MCP', html)
+        self.assertIn('class="run-agent-grid"', html)
+        self.assertLess(html.index('id="run-affirmative-provider"'), html.index('id="run-affirmative-agent-profile"'))
+        self.assertLess(html.index('id="run-negative-provider"'), html.index('id="run-negative-agent-profile"'))
         self.assertIn('id="agent-affirmative-profile-panel"', html)
         self.assertIn('id="agent-negative-profile-panel"', html)
         self.assertIn('#agent-affirmative-profile-panel', html)
@@ -1323,6 +1384,8 @@ for raw in sys.stdin.buffer:
             ).adjudicate(bundle)
             self.assertIn("利用证据指证员", affirmative.calls[0][0])
             self.assertIn("优先关注资产窃取证据。", affirmative.calls[0][0])
+            self.assertIn("正方证据不足补强策略", affirmative.calls[0][1])
+            self.assertIn("源码分析、Atlas 检查和交叉验证路径", affirmative.calls[0][1])
             self.assertIn("可达性复核员", negative.calls[0][0])
             self.assertIn("质疑死代码和缓解措施。", negative.calls[0][0])
 

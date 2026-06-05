@@ -18,7 +18,9 @@ class RunRecordStore:
 
     def save_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         path = self._path(str(payload.get("run_id") or "run-unknown"))
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path.replace(path)
         return payload
 
     def get(self, run_id: str) -> Optional[Dict[str, Any]]:
