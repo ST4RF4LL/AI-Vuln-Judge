@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -331,8 +332,8 @@ class DebateOrchestrator:
         llm_statement = self._llm_claim(
             role,
             (
-                f"给出唯一结论标签和简短结案陈述。结论标签已固定为【{label}】，不得改成其他标签。"
-                "只输出 1 到 3 句话，不要输出 Markdown 表格。"
+                f"给出简短结案陈述。结论标签已固定为【{label}】，不得改成其他标签。"
+                "只输出结案陈述正文 1 到 3 句话，不要输出 Markdown 表格，不要复述用户要求、任务要求、角色名称或格式说明。"
             ),
             bundle,
             extra=_stage_context("结案", "最近一轮反方意见：\n" + last_negative, challenges, ""),
@@ -807,7 +808,31 @@ def _clean_final_statement(text: str, label: str) -> str:
     if not lines:
         return ""
     statement = " ".join(lines[:3]).strip()
+    if _looks_like_task_echo(statement):
+        return ""
     return statement[:500]
+
+
+def _looks_like_task_echo(statement: str) -> bool:
+    normalized = re.sub(r"\s+", "", statement.lower())
+    markers = (
+        "用户要求",
+        "任务要求",
+        "根据任务要求",
+        "结论标签固定",
+        "标签固定为",
+        "只输出",
+        "1到3句话",
+        "1-3句话",
+        "markdown表格",
+        "作为正方",
+        "作为反方",
+        "affirmative_default",
+        "negative_default",
+        "给出最终结案陈述",
+        "给出唯一结论标签",
+    )
+    return any(marker in normalized for marker in markers)
 
 
 def _final_conclusion(affirmative: SideConclusion, negative: SideConclusion) -> str:
