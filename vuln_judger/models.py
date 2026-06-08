@@ -168,6 +168,10 @@ class RunConfig:
     affirmative_agent: Optional[AgentConfig] = None
     negative_agent: Optional[AgentConfig] = None
     moderator_agent: Optional[AgentConfig] = None
+    created_at: Optional[str] = None
+    resume_from_finding_index: int = 0
+    resume_reports: List[Any] = field(default_factory=list)
+    resume_diagnostics: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -184,6 +188,11 @@ class RunReport:
     llm_providers: Dict[str, Any] = field(default_factory=dict)
     agent_configs: Dict[str, Any] = field(default_factory=dict)
     diagnostics: List[str] = field(default_factory=list)
+    completed_finding_count: int = 0
+    current_finding_id: Optional[str] = None
+    current_finding_index: Optional[int] = None
+    resume_from_finding_id: Optional[str] = None
+    resume_from_finding_index: Optional[int] = None
 
 
 def to_jsonable(value: Any) -> Any:

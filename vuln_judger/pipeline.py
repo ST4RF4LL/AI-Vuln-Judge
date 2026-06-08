@@ -12,7 +12,19 @@ from .debate import DebateOrchestrator
 from .evidence import EvidenceCollector
 from .llm import LLMClient, build_llm_clients
 from .logging_config import logger
-from .models import RunConfig, RunReport, to_jsonable
+from .models import (
+    CodeEvidence,
+    DebateRole,
+    DebateTurn,
+    EvidenceKind,
+    EvidenceStrength,
+    RunConfig,
+    RunReport,
+    SourceLocation,
+    Verdict,
+    VerdictReport,
+    to_jsonable,
+)
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderConfig, ProviderStore
 from .sarif import load_sarif, prepare_report_for_processing
 from .skills import load_project_context
@@ -36,7 +48,7 @@ def run_judgement(
     indexer = SourceIndexer(source_path)
     languages = list(indexer.languages)
     run_id = config.run_id or _run_id(sarif_path, source_path, languages)
-    created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    created_at = config.created_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     LOG.info(
         "开始漏洞研判 run_id=%s report=%s source=%s languages=%s llm=%s external_tools=%s",
         config.run_id,
@@ -108,16 +120,26 @@ def run_judgement(
         moderator_client,
     )
     agent_configs = _agent_config_metadata(orchestrator_template)
-    reports = []
+    reports = [_coerce_verdict_report(item) for item in config.resume_reports]
+    diagnostics = [*config.resume_diagnostics, *diagnostics]
+    start_index = _resume_start_index(config.resume_from_finding_index, len(reports), len(findings))
 
     def check_stop() -> None:
         if should_stop is not None and should_stop():
-            LOG.info("漏洞研判收到停止信号 run_id=%s", run_id)
-            raise RunStopped(f"任务 {run_id} 已停止")
+            LOG.info("漏洞研判收到中断信号 run_id=%s", run_id)
+            raise RunStopped(f"任务 {run_id} 已中断")
 
-    def emit_progress(partial_reports=None) -> None:
+    def emit_progress(
+        partial_reports=None,
+        *,
+        current_finding=None,
+        current_finding_index: Optional[int] = None,
+        completed_finding_count: Optional[int] = None,
+    ) -> None:
         if progress_callback is None:
             return
+        completed_count = len(reports) if completed_finding_count is None else completed_finding_count
+        resume_index = current_finding_index if current_finding_index is not None else completed_count
         progress_callback(
             RunReport(
                 run_id=run_id,
@@ -132,21 +154,44 @@ def run_judgement(
                 llm_providers=llm_providers,
                 agent_configs=agent_configs,
                 diagnostics=list(diagnostics),
+                completed_finding_count=completed_count,
+                current_finding_id=current_finding.finding_id if current_finding is not None else None,
+                current_finding_index=current_finding_index,
+                resume_from_finding_id=current_finding.finding_id if current_finding is not None else None,
+                resume_from_finding_index=resume_index,
             )
         )
 
     emit_progress()
     check_stop()
-    for finding in findings:
+    for finding_index, finding in enumerate(findings):
+        if finding_index < start_index:
+            continue
         check_stop()
         LOG.info("开始处理 finding=%s rule=%s", finding.finding_id, finding.rule_id)
+        emit_progress(
+            reports,
+            current_finding=finding,
+            current_finding_index=finding_index,
+            completed_finding_count=len(reports),
+        )
         bundle = collector.collect(finding)
         diagnostics.extend(f"{finding.finding_id}: {item}" for item in bundle.diagnostics)
-        emit_progress(reports)
+        emit_progress(
+            reports,
+            current_finding=finding,
+            current_finding_index=finding_index,
+            completed_finding_count=len(reports),
+        )
         check_stop()
 
         def on_finding_progress(partial_report):
-            emit_progress([*reports, partial_report])
+            emit_progress(
+                [*reports, partial_report],
+                current_finding=finding,
+                current_finding_index=finding_index,
+                completed_finding_count=len(reports),
+            )
             check_stop()
 
         orchestrator = DebateOrchestrator(
@@ -161,7 +206,7 @@ def run_judgement(
         )
         verdict = orchestrator.adjudicate(bundle)
         reports.append(verdict)
-        emit_progress(reports)
+        emit_progress(reports, completed_finding_count=len(reports))
         check_stop()
         LOG.info(
             "完成处理 finding=%s verdict=%s confidence=%s evidence=%s diagnostics=%s",
@@ -184,6 +229,8 @@ def run_judgement(
         llm_providers=llm_providers,
         agent_configs=agent_configs,
         diagnostics=diagnostics,
+        completed_finding_count=len(reports),
+        resume_from_finding_index=len(reports),
     )
     LOG.info("漏洞研判完成 run_id=%s findings=%s diagnostics=%s", report.run_id, report.finding_count, len(report.diagnostics))
     return report
@@ -195,6 +242,96 @@ def run_to_json(config: RunConfig, output_path: Optional[Path] = None) -> str:
     if output_path is not None:
         output_path.expanduser().resolve().write_text(payload + "\n", encoding="utf-8")
     return payload
+
+
+def _resume_start_index(requested_index: int, completed_count: int, finding_count: int) -> int:
+    try:
+        index = int(requested_index)
+    except (TypeError, ValueError):
+        index = completed_count
+    index = max(index, completed_count)
+    return min(index, finding_count)
+
+
+def _coerce_verdict_report(value) -> VerdictReport:
+    if isinstance(value, VerdictReport):
+        return value
+    if not isinstance(value, dict):
+        raise TypeError(f"Unsupported verdict report payload: {type(value)!r}")
+    return VerdictReport(
+        finding_id=str(value.get("finding_id") or ""),
+        rule_id=str(value.get("rule_id") or ""),
+        verdict=_coerce_enum(Verdict, value.get("verdict"), Verdict.INCONCLUSIVE),
+        confidence=float(value.get("confidence") or 0.0),
+        reasoning_summary=str(value.get("reasoning_summary") or ""),
+        final_conclusion=str(value.get("final_conclusion") or ""),
+        evidence_chain=[_coerce_code_evidence(item) for item in value.get("evidence_chain") or []],
+        debate=[_coerce_debate_turn(item) for item in value.get("debate") or []],
+        disputed_points=[str(item) for item in value.get("disputed_points") or []],
+        protection_assessment=str(value.get("protection_assessment") or ""),
+        impact_assessment=str(value.get("impact_assessment") or ""),
+        source_locations=[_coerce_source_location(item) for item in value.get("source_locations") or []],
+        recommended_next_steps=[str(item) for item in value.get("recommended_next_steps") or []],
+    )
+
+
+def _coerce_code_evidence(value) -> CodeEvidence:
+    if isinstance(value, CodeEvidence):
+        return value
+    data = value if isinstance(value, dict) else {}
+    return CodeEvidence(
+        evidence_id=str(data.get("evidence_id") or ""),
+        kind=_coerce_enum(EvidenceKind, data.get("kind"), EvidenceKind.TOOL_DIAGNOSTIC),
+        strength=_coerce_enum(EvidenceStrength, data.get("strength"), EvidenceStrength.WEAK),
+        summary=str(data.get("summary") or ""),
+        source=str(data.get("source") or ""),
+        locations=[_coerce_source_location(item) for item in data.get("locations") or []],
+        snippet=data.get("snippet"),
+        data=data.get("data") if isinstance(data.get("data"), dict) else {},
+    )
+
+
+def _coerce_debate_turn(value) -> DebateTurn:
+    if isinstance(value, DebateTurn):
+        return value
+    data = value if isinstance(value, dict) else {}
+    return DebateTurn(
+        role=_coerce_enum(DebateRole, data.get("role"), DebateRole.MODERATOR),
+        round_index=int(data.get("round_index") or 0),
+        claim=str(data.get("claim") or ""),
+        evidence_ids=[str(item) for item in data.get("evidence_ids") or []],
+        resolved=bool(data.get("resolved", False)),
+    )
+
+
+def _coerce_source_location(value) -> SourceLocation:
+    if isinstance(value, SourceLocation):
+        return value
+    data = value if isinstance(value, dict) else {}
+    return SourceLocation(
+        file=str(data.get("file") or ""),
+        line=_optional_int(data.get("line")),
+        column=_optional_int(data.get("column")),
+        end_line=_optional_int(data.get("end_line")),
+        end_column=_optional_int(data.get("end_column")),
+        symbol=str(data.get("symbol")) if data.get("symbol") is not None else None,
+    )
+
+
+def _coerce_enum(enum_type, value, default):
+    try:
+        return enum_type(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _optional_int(value) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _run_id(sarif_path: Path, source_path: Path, languages: Sequence[str]) -> str:

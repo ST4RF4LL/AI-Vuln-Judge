@@ -1175,14 +1175,21 @@ for raw in sys.stdin.buffer:
         self.assertIn('data-run-delete="true"', html)
         self.assertIn('async function deleteRun(runId)', html)
         self.assertIn('data-run-stop="true"', html)
+        self.assertIn('data-run-pause="true"', html)
+        self.assertIn('data-run-resume="true"', html)
         self.assertIn('class="run-item-actions"', html)
         self.assertIn('.run-item-actions', html)
         self.assertIn('class="chips run-verdict-chips"', html)
         self.assertIn('.run-verdict-chips', html)
         self.assertIn('flex-wrap: nowrap', html)
         self.assertIn('async function stopRun(runId)', html)
+        self.assertIn('async function pauseRun(runId)', html)
+        self.assertIn('async function resumeRun(runId)', html)
+        self.assertIn("paused: '已暂停'", html)
+        self.assertIn("pausing: '正在暂停'", html)
         self.assertIn('function isTerminalStatus(status)', html)
         self.assertIn("stopped: '已停止'", html)
+        self.assertIn("status === 'paused'", html)
         self.assertIn("SOURCE_ROOT: '源码根目录'", html)
         self.assertIn("fetchJson('/mcp-servers')", html)
         self.assertIn("fetchJson('/skill-sources')", html)
@@ -1527,6 +1534,76 @@ for raw in sys.stdin.buffer:
                 with urllib.request.urlopen(f"{base}/runs/{created['run_id']}/findings", timeout=5) as response:
                     findings = json.loads(response.read().decode("utf-8"))
                 self.assertIsInstance(findings, list)
+            finally:
+                api_server.shutdown()
+                api_server.server_close()
+                api_thread.join(timeout=5)
+                llm_server.shutdown()
+                llm_server.server_close()
+                llm_thread.join(timeout=5)
+
+    def test_api_can_pause_and_resume_running_task_from_current_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, skills = write_python_fixture(root)
+            llm_server = ThreadingHTTPServer(("127.0.0.1", 0), SlowFakeOpenAIHandler)
+            llm_thread = Thread(target=llm_server.serve_forever, daemon=True)
+            llm_thread.start()
+            store = RunRecordStore(root / "records")
+            provider_store = ProviderStore(root / "providers.json")
+            provider_store.upsert(
+                {
+                    "id": "slow",
+                    "name": "Slow",
+                    "endpoint": f"http://127.0.0.1:{llm_server.server_port}/v1/chat/completions",
+                    "model": "fake-model",
+                    "api_key": "secret",
+                }
+            )
+            provider_store.set_defaults("slow", "slow", "slow")
+            api_server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(store, provider_store))
+            api_thread = Thread(target=api_server.serve_forever, daemon=True)
+            api_thread.start()
+            base = f"http://127.0.0.1:{api_server.server_port}"
+            try:
+                created = post_json(
+                    f"{base}/runs",
+                    {
+                        "report_path": str(sarif),
+                        "source_path": str(root),
+                        "skills_path": str(skills),
+                        "enable_external_tools": False,
+                        "enable_llm": True,
+                        "max_rounds": 4,
+                    },
+                )
+                running = wait_for_run_field(base, created["run_id"], "current_finding_id")
+                self.assertEqual(running["current_finding_index"], 0)
+
+                pause = post_json(f"{base}/runs/{created['run_id']}/pause", {})
+                self.assertEqual(pause["status"], "pausing")
+                paused = wait_for_run_status(base, created["run_id"], {"paused"})
+                self.assertEqual(paused["status"], "paused")
+                self.assertEqual(paused["completed_finding_count"], 0)
+                self.assertEqual(paused["resume_from_finding_index"], 0)
+                self.assertEqual(paused["resume_from_finding_id"], running["current_finding_id"])
+                with urllib.request.urlopen(f"{base}/runs/{created['run_id']}/findings", timeout=5) as response:
+                    paused_findings = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(paused_findings, [])
+
+                resumed = post_json(f"{base}/runs/{created['run_id']}/resume", {})
+                self.assertEqual(resumed["status"], "running")
+                with urllib.request.urlopen(f"{base}/runs", timeout=5) as response:
+                    running_runs = json.loads(response.read().decode("utf-8"))
+                listed = next(item for item in running_runs if item["run_id"] == created["run_id"])
+                self.assertEqual(listed["status"], "running")
+                completed = wait_for_run_status(base, created["run_id"], {"completed"})
+                self.assertEqual(completed["status"], "completed")
+                self.assertEqual(completed["completed_finding_count"], 1)
+                with urllib.request.urlopen(f"{base}/runs/{created['run_id']}/findings", timeout=5) as response:
+                    findings = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0]["rule_id"], "python-command-injection")
             finally:
                 api_server.shutdown()
                 api_server.server_close()
@@ -2365,6 +2442,18 @@ def wait_for_run_status(base, run_id, statuses):
             raise AssertionError(run.get("error"))
         time.sleep(0.1)
     raise AssertionError(f"run did not reach {statuses}: {run_id}")
+
+
+def wait_for_run_field(base, run_id, field):
+    for _ in range(80):
+        with urllib.request.urlopen(f"{base}/runs/{run_id}", timeout=5) as response:
+            run = json.loads(response.read().decode("utf-8"))
+        if run.get(field):
+            return run
+        if run.get("status") == "failed":
+            raise AssertionError(run.get("error"))
+        time.sleep(0.1)
+    raise AssertionError(f"run did not populate {field}: {run_id}")
 
 
 class FakeOpenAIHandler(BaseHTTPRequestHandler):

@@ -68,4 +68,9 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
         "project_context_facts": payload.get("project_context_facts", 0),
         "diagnostic_count": len(payload.get("diagnostics", [])),
         "verdict_counts": verdict_counts,
+        "completed_finding_count": payload.get("completed_finding_count", len(payload.get("reports", []))),
+        "current_finding_id": payload.get("current_finding_id"),
+        "current_finding_index": payload.get("current_finding_index"),
+        "resume_from_finding_id": payload.get("resume_from_finding_id"),
+        "resume_from_finding_index": payload.get("resume_from_finding_index"),
     }

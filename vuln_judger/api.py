@@ -78,6 +78,7 @@ def make_handler(
     skill_store = skill_store or SkillSourceStore(store.root.parent / "skills.json")
     tasks = {}
     stop_events = {}
+    pause_events = {}
     tasks_lock = Lock()
 
     class Handler(BaseHTTPRequestHandler):
@@ -93,10 +94,16 @@ def make_handler(
                     config = _config_from_payload(payload, provider_store.path, run_id, agent_store, mcp_store.path, skill_store)
                     task = _task_from_config(config, run_id, "running")
                     stop_event = Event()
+                    pause_event = Event()
                     with tasks_lock:
                         tasks[run_id] = task
                         stop_events[run_id] = stop_event
-                    Thread(target=_run_task, args=(config, store, tasks, stop_events, tasks_lock, stop_event), daemon=True).start()
+                        pause_events[run_id] = pause_event
+                    Thread(
+                        target=_run_task,
+                        args=(config, store, tasks, stop_events, pause_events, tasks_lock, stop_event, pause_event),
+                        daemon=True,
+                    ).start()
                     self._json(
                         {
                             "run_id": run_id,
@@ -113,6 +120,33 @@ def make_handler(
                         self._json({"error": "运行任务未找到或已结束"}, HTTPStatus.NOT_FOUND)
                     else:
                         LOG.info("收到停止任务请求 run_id=%s status=%s", parts[1], result.get("status"))
+                        self._json(result)
+                    return
+                if len(parts) == 3 and parts[0] == "runs" and parts[2] == "pause":
+                    result = _request_pause(tasks, pause_events, tasks_lock, parts[1])
+                    if result is None:
+                        self._json({"error": "运行任务未找到或已结束"}, HTTPStatus.NOT_FOUND)
+                    else:
+                        LOG.info("收到暂停任务请求 run_id=%s status=%s", parts[1], result.get("status"))
+                        self._json(result)
+                    return
+                if len(parts) == 3 and parts[0] == "runs" and parts[2] == "resume":
+                    result = _request_resume(
+                        store,
+                        tasks,
+                        stop_events,
+                        pause_events,
+                        tasks_lock,
+                        parts[1],
+                        provider_store.path,
+                        agent_store,
+                        mcp_store.path,
+                        skill_store,
+                    )
+                    if result is None:
+                        self._json({"error": "暂停任务未找到或状态不允许恢复"}, HTTPStatus.NOT_FOUND)
+                    else:
+                        LOG.info("收到恢复任务请求 run_id=%s status=%s", parts[1], result.get("status"))
                         self._json(result)
                     return
                 if parts == ["providers"]:
@@ -286,8 +320,9 @@ def make_handler(
             if len(parts) >= 2 and parts[0] == "runs":
                 run = store.get(parts[1])
                 task = _get_task(tasks, tasks_lock, parts[1])
+                active_task = task if task is not None and task.get("status") != "completed" else None
                 if len(parts) == 3 and parts[2] == "export":
-                    payload = run if run is not None else task
+                    payload = active_task if active_task is not None else run if run is not None else task
                     if payload is None:
                         self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
                         return
@@ -299,6 +334,20 @@ def make_handler(
                         raw = _export_run_markdown(payload).encode("utf-8")
                         self._download(raw, "text/markdown; charset=utf-8", f"{parts[1]}.md")
                     return
+                if active_task is not None:
+                    if len(parts) == 2:
+                        self._json(active_task)
+                        return
+                    if len(parts) == 3 and parts[2] == "findings":
+                        self._json([_finding_summary(report) for report in active_task.get("reports", [])])
+                        return
+                    if len(parts) == 4 and parts[2] == "findings":
+                        for report in active_task.get("reports", []):
+                            if report.get("finding_id") == parts[3]:
+                                self._json(report)
+                                return
+                        self._json({"error": "发现尚未生成或未找到"}, HTTPStatus.NOT_FOUND)
+                        return
                 if run is None:
                     if task is None:
                         self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
@@ -444,18 +493,25 @@ def _run_detail(run):
         "llm_providers": run.get("llm_providers", {}),
         "agent_configs": run.get("agent_configs", {}),
         "verdict_counts": _verdict_counts(run),
+        "completed_finding_count": run.get("completed_finding_count", len(run.get("reports", []))),
+        "current_finding_id": run.get("current_finding_id"),
+        "current_finding_index": run.get("current_finding_index"),
+        "resume_from_finding_id": run.get("resume_from_finding_id"),
+        "resume_from_finding_index": run.get("resume_from_finding_index"),
+        "config": run.get("config", {}),
     }
 
 
 def _list_runs(store: RunRecordStore, tasks: dict, tasks_lock: Lock):
     records = store.list()
-    completed_ids = {item.get("run_id") for item in records}
     with tasks_lock:
         visible_tasks = [
             dict(task)
             for task in tasks.values()
-            if task.get("status") != "completed" and task.get("run_id") not in completed_ids
+            if task.get("status") != "completed"
         ]
+    active_ids = {item.get("run_id") for item in visible_tasks}
+    records = [item for item in records if item.get("run_id") not in active_ids]
     combined = visible_tasks + records
     combined.sort(key=lambda item: item.get("created_at") or "", reverse=True)
     return combined
@@ -497,6 +553,12 @@ def _task_from_config(config: RunConfig, run_id: str, status: str, error: Option
         "verdict_counts": {},
         "reports": [],
         "error": error,
+        "config": _config_task_snapshot(config),
+        "completed_finding_count": 0,
+        "current_finding_id": None,
+        "current_finding_index": None,
+        "resume_from_finding_id": None,
+        "resume_from_finding_index": 0,
     }
 
 
@@ -505,8 +567,10 @@ def _run_task(
     store: RunRecordStore,
     tasks: dict,
     stop_events: dict,
+    pause_events: dict,
     tasks_lock: Lock,
     stop_event: Event,
+    pause_event: Event,
 ) -> None:
     last_payload = None
     try:
@@ -514,8 +578,9 @@ def _run_task(
         def on_progress(progress_report):
             nonlocal last_payload
             payload = to_jsonable(progress_report)
+            payload["config"] = _config_task_snapshot(config)
             last_payload = payload
-            status = "stopping" if stop_event.is_set() else "running"
+            status = "stopping" if stop_event.is_set() else "pausing" if pause_event.is_set() else "running"
             with tasks_lock:
                 tasks[payload["run_id"]] = _task_from_report_payload(payload, status)
             LOG.info(
@@ -525,25 +590,37 @@ def _run_task(
                 sum(len(item.get("debate", [])) for item in payload.get("reports", [])),
             )
 
-        report = run_judgement(config, progress_callback=on_progress, should_stop=stop_event.is_set)
-        store.save(report)
+        report = run_judgement(
+            config,
+            progress_callback=on_progress,
+            should_stop=lambda: stop_event.is_set() or pause_event.is_set(),
+        )
         payload = to_jsonable(report)
+        payload["config"] = _config_task_snapshot(config)
+        store.save_payload(payload)
         with tasks_lock:
             tasks[report.run_id] = _task_from_report_payload(payload, "completed")
         LOG.info("后台任务完成 run_id=%s findings=%s", report.run_id, report.finding_count)
     except RunStopped as exc:
-        LOG.info("后台任务已停止 run_id=%s", config.run_id)
-        stopped_payload = dict(last_payload or _task_from_config(config, config.run_id or _new_run_id(), "stopped"))
-        stopped_payload["status"] = "stopped"
-        stopped_payload["error"] = None
-        diagnostics = list(stopped_payload.get("diagnostics", []))
-        diagnostics.append(str(exc))
-        stopped_payload["diagnostics"] = diagnostics
-        if "reports" not in stopped_payload:
-            stopped_payload["reports"] = []
+        if pause_event.is_set() and not stop_event.is_set():
+            LOG.info("后台任务已暂停 run_id=%s", config.run_id)
+            stopped_payload = _pause_payload(config, last_payload, str(exc))
+            status = "paused"
+        else:
+            LOG.info("后台任务已停止 run_id=%s", config.run_id)
+            stopped_payload = dict(last_payload or _task_from_config(config, config.run_id or _new_run_id(), "stopped"))
+            stopped_payload["status"] = "stopped"
+            stopped_payload["error"] = None
+            diagnostics = list(stopped_payload.get("diagnostics", []))
+            diagnostics.append(str(exc))
+            stopped_payload["diagnostics"] = diagnostics
+            if "reports" not in stopped_payload:
+                stopped_payload["reports"] = []
+            stopped_payload["config"] = _config_task_snapshot(config)
+            status = "stopped"
         store.save_payload(stopped_payload)
         with tasks_lock:
-            tasks[stopped_payload["run_id"]] = _task_from_report_payload(stopped_payload, "stopped")
+            tasks[stopped_payload["run_id"]] = _task_from_report_payload(stopped_payload, status)
     except Exception as exc:
         LOG.exception("后台任务失败 run_id=%s", config.run_id)
         with tasks_lock:
@@ -556,6 +633,7 @@ def _run_task(
     finally:
         with tasks_lock:
             stop_events.pop(config.run_id, None)
+            pause_events.pop(config.run_id, None)
 
 
 def _task_from_report_payload(payload: dict, status: str) -> dict:
@@ -574,8 +652,71 @@ def _task_from_report_payload(payload: dict, status: str) -> dict:
         "agent_configs": payload.get("agent_configs", {}),
         "verdict_counts": _verdict_counts(payload),
         "reports": payload.get("reports", []),
-        "error": None,
+        "error": payload.get("error"),
+        "config": payload.get("config", {}),
+        "completed_finding_count": payload.get("completed_finding_count", len(payload.get("reports", []))),
+        "current_finding_id": payload.get("current_finding_id"),
+        "current_finding_index": payload.get("current_finding_index"),
+        "resume_from_finding_id": payload.get("resume_from_finding_id"),
+        "resume_from_finding_index": payload.get("resume_from_finding_index"),
     }
+
+
+def _config_task_snapshot(config: RunConfig) -> dict:
+    return {
+        "report_path": str(config.sarif_path),
+        "source_path": str(config.source_path),
+        "skills_path": str(config.skills_path) if config.skills_path is not None else None,
+        "max_rounds": config.max_rounds,
+        "auto_index_tools": config.auto_index_tools,
+        "enable_external_tools": config.enable_external_tools,
+        "enable_llm": config.enable_llm,
+        "llm_model": config.llm_model,
+        "llm_endpoint": config.llm_endpoint,
+        "affirmative_provider_id": config.affirmative_provider_id,
+        "negative_provider_id": config.negative_provider_id,
+        "moderator_provider_id": config.moderator_provider_id,
+        "affirmative_agent": to_jsonable(config.affirmative_agent) if config.affirmative_agent else None,
+        "negative_agent": to_jsonable(config.negative_agent) if config.negative_agent else None,
+        "moderator_agent": to_jsonable(config.moderator_agent) if config.moderator_agent else None,
+    }
+
+
+def _pause_payload(config: RunConfig, last_payload: Optional[dict], reason: str) -> dict:
+    payload = dict(last_payload or _task_from_config(config, config.run_id or _new_run_id(), "paused"))
+    reports = list(payload.get("reports") or [])
+    completed_count = _bounded_int(payload.get("completed_finding_count"), default=len(reports), minimum=0, maximum=len(reports))
+    resume_index = _bounded_int(
+        payload.get("current_finding_index"),
+        default=completed_count,
+        minimum=completed_count,
+        maximum=int(payload.get("finding_count") or completed_count),
+    )
+    resume_id = payload.get("current_finding_id") or payload.get("resume_from_finding_id")
+    payload["status"] = "paused"
+    payload["error"] = None
+    payload["reports"] = reports[:completed_count]
+    payload["completed_finding_count"] = completed_count
+    payload["current_finding_id"] = None
+    payload["current_finding_index"] = None
+    payload["resume_from_finding_id"] = resume_id
+    payload["resume_from_finding_index"] = resume_index
+    payload["config"] = payload.get("config") or _config_task_snapshot(config)
+    diagnostics = list(payload.get("diagnostics") or [])
+    resume_text = f"finding index {resume_index}"
+    if resume_id:
+        resume_text += f" ({resume_id})"
+    diagnostics.append(f"{reason}；任务已暂停，恢复时将从 {resume_text} 重新处理。")
+    payload["diagnostics"] = diagnostics
+    return payload
+
+
+def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = default
+    return min(max(result, minimum), maximum)
 
 
 def _request_stop(tasks: dict, stop_events: dict, tasks_lock: Lock, run_id: str) -> Optional[dict]:
@@ -592,6 +733,98 @@ def _request_stop(tasks: dict, stop_events: dict, tasks_lock: Lock, run_id: str)
         updated["stop_requested"] = True
         tasks[run_id] = updated
         return dict(updated)
+
+
+def _request_pause(tasks: dict, pause_events: dict, tasks_lock: Lock, run_id: str) -> Optional[dict]:
+    with tasks_lock:
+        task = tasks.get(run_id)
+        pause_event = pause_events.get(run_id)
+        if task is None:
+            return None
+        if task.get("status") == "paused":
+            return dict(task)
+        if pause_event is None or task.get("status") in {"completed", "failed", "stopped"}:
+            return None
+        pause_event.set()
+        updated = dict(task)
+        updated["status"] = "pausing"
+        updated["pause_requested"] = True
+        tasks[run_id] = updated
+        return dict(updated)
+
+
+def _request_resume(
+    store: RunRecordStore,
+    tasks: dict,
+    stop_events: dict,
+    pause_events: dict,
+    tasks_lock: Lock,
+    run_id: str,
+    providers_file: Path,
+    agent_store: AgentDirectoryStore,
+    mcp_servers_file: Path,
+    skill_store: SkillSourceStore,
+) -> Optional[dict]:
+    with tasks_lock:
+        active_task = tasks.get(run_id)
+        if active_task and active_task.get("status") in {"running", "pausing", "stopping"}:
+            return dict(active_task)
+        paused_payload = active_task if active_task and active_task.get("status") == "paused" else store.get(run_id)
+        if not paused_payload or paused_payload.get("status") != "paused":
+            return None
+        config = _config_from_paused_payload(paused_payload, providers_file, agent_store, mcp_servers_file, skill_store)
+        stop_event = Event()
+        pause_event = Event()
+        task = _task_from_report_payload(paused_payload, "running")
+        task["status"] = "running"
+        task["error"] = None
+        tasks[run_id] = task
+        stop_events[run_id] = stop_event
+        pause_events[run_id] = pause_event
+    Thread(
+        target=_run_task,
+        args=(config, store, tasks, stop_events, pause_events, tasks_lock, stop_event, pause_event),
+        daemon=True,
+    ).start()
+    return dict(task)
+
+
+def _config_from_paused_payload(
+    payload: dict,
+    providers_file: Path,
+    agent_store: AgentDirectoryStore,
+    mcp_servers_file: Path,
+    skill_store: SkillSourceStore,
+) -> RunConfig:
+    config_payload = dict(payload.get("config") or {})
+    if not config_payload:
+        config_payload = {
+            "report_path": payload.get("sarif_path"),
+            "source_path": payload.get("source_path"),
+            "enable_external_tools": True,
+        }
+    providers = payload.get("llm_providers") if isinstance(payload.get("llm_providers"), dict) else {}
+    for role in ("affirmative", "negative", "moderator"):
+        key = f"{role}_provider_id"
+        if config_payload.get(key):
+            continue
+        provider = providers.get(role) if isinstance(providers.get(role), dict) else {}
+        provider_id = provider.get("provider_id")
+        if provider_id:
+            config_payload[key] = provider_id
+    run_id = str(payload.get("run_id") or _new_run_id())
+    config = _config_from_payload(config_payload, providers_file, run_id, agent_store, mcp_servers_file, skill_store)
+    reports = list(payload.get("reports") or [])
+    config.created_at = payload.get("created_at")
+    config.resume_reports = reports
+    config.resume_diagnostics = list(payload.get("diagnostics") or [])
+    config.resume_from_finding_index = _bounded_int(
+        payload.get("resume_from_finding_index"),
+        default=len(reports),
+        minimum=0,
+        maximum=int(payload.get("finding_count") or len(reports)),
+    )
+    return config
 
 
 def _safe_payload(payload) -> dict:
@@ -925,8 +1158,8 @@ def app_html() -> str:
     .chip.inc {{ color: var(--inc); border-color: #c9c1ef; background: #f6f3ff; }}
     .chip.run-delete {{ cursor: pointer; color: var(--bad); }}
     .chip.run-delete:hover {{ border-color: var(--bad); background: #fff1f0; }}
-    .chip.run-stop {{ cursor: pointer; color: var(--accent); }}
-    .chip.run-stop:hover {{ border-color: var(--accent); background: #edf7fb; }}
+    .chip.run-stop, .chip.run-pause, .chip.run-resume {{ cursor: pointer; color: var(--accent); }}
+    .chip.run-stop:hover, .chip.run-pause:hover, .chip.run-resume:hover {{ border-color: var(--accent); background: #edf7fb; }}
     .content {{ padding: 16px; display: grid; gap: 16px; }}
     .summary-grid {{
       display: grid;
@@ -1772,6 +2005,8 @@ def app_html() -> str:
     function statusLabel(status) {{
       const labels = {{
         running: '运行中',
+        pausing: '正在暂停',
+        paused: '已暂停',
         stopping: '正在停止',
         stopped: '已停止',
         completed: '已完成',
@@ -2519,11 +2754,19 @@ def app_html() -> str:
       el.list.innerHTML = state.runs.map(run => {{
         const counts = run.verdict_counts || {{}};
         const status = run.status || 'completed';
-        const stopButton = status === 'running' || status === 'stopping'
+        const pauseButton = status === 'running' || status === 'pausing'
+          ? `<span class="chip run-pause" data-run-pause="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="暂停该任务">暂停</span>`
+          : '';
+        const resumeButton = status === 'paused'
+          ? `<span class="chip run-resume" data-run-resume="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="从当前 finding 恢复任务">恢复</span>`
+          : '';
+        const stopButton = status === 'running' || status === 'stopping' || status === 'pausing'
           ? `<span class="chip run-stop" data-run-stop="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="停止该任务">停止</span>`
           : '';
         return `<button class="run-item ${{state.selectedRun === run.run_id ? 'active' : ''}}" type="button" data-run-id="${{esc(run.run_id)}}">
           <div class="run-item-actions">
+            ${{pauseButton}}
+            ${{resumeButton}}
             ${{stopButton}}
             <span class="chip run-delete" data-run-delete="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="删除该任务记录">删除</span>
           </div>
@@ -2571,6 +2814,60 @@ def app_html() -> str:
             stopRun(button.dataset.runId);
           }}
         }});
+      }}
+      for (const button of el.list.querySelectorAll('[data-run-pause]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          pauseRun(button.dataset.runId);
+        }});
+        button.addEventListener('keydown', event => {{
+          if (event.key === 'Enter' || event.key === ' ') {{
+            event.preventDefault();
+            event.stopPropagation();
+            pauseRun(button.dataset.runId);
+          }}
+        }});
+      }}
+      for (const button of el.list.querySelectorAll('[data-run-resume]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          resumeRun(button.dataset.runId);
+        }});
+        button.addEventListener('keydown', event => {{
+          if (event.key === 'Enter' || event.key === ' ') {{
+            event.preventDefault();
+            event.stopPropagation();
+            resumeRun(button.dataset.runId);
+          }}
+        }});
+      }}
+    }}
+
+    async function pauseRun(runId) {{
+      if (!runId) return;
+      try {{
+        await fetchJson(`/runs/${{encodeURIComponent(runId)}}/pause`, jsonPost({{}}));
+        await loadRuns();
+        if (state.selectedRun === runId) {{
+          await selectRun(runId, false);
+        }}
+      }} catch (error) {{
+        renderError(error);
+      }}
+    }}
+
+    async function resumeRun(runId) {{
+      if (!runId) return;
+      try {{
+        await fetchJson(`/runs/${{encodeURIComponent(runId)}}/resume`, jsonPost({{}}));
+        state.autoRefreshEnabled = true;
+        await loadRuns();
+        if (state.selectedRun === runId) {{
+          await selectRun(runId, false);
+        }}
+        ensurePolling(runId);
+      }} catch (error) {{
+        renderError(error);
       }}
     }}
 
@@ -2628,7 +2925,30 @@ def app_html() -> str:
       const providers = run.llm_providers || {{}};
       const agents = run.agent_configs || {{}};
       const status = run.status || 'completed';
-      const runningMessage = status === 'stopping'
+      const resumeIndex = run.resume_from_finding_index;
+      const resumeFinding = run.resume_from_finding_id || '';
+      const resumeHint = status === 'paused' && resumeIndex !== null && resumeIndex !== undefined
+        ? '恢复时将从 finding #' + (Number(resumeIndex) + 1) + (resumeFinding ? ' (' + resumeFinding + ')' : '') + ' 重新处理。'
+        : '';
+      const currentHint = run.current_finding_id
+        ? '当前 Finding：' + run.current_finding_id
+        : '';
+      const detailControls = [
+        status === 'running' || status === 'pausing'
+          ? `<button type="button" data-run-pause="true" data-run-id="${{esc(run.run_id)}}">暂停</button>`
+          : '',
+        status === 'paused'
+          ? `<button type="button" data-run-resume="true" data-run-id="${{esc(run.run_id)}}">恢复</button>`
+          : '',
+        status === 'running' || status === 'stopping' || status === 'pausing'
+          ? `<button type="button" data-run-stop="true" data-run-id="${{esc(run.run_id)}}">停止</button>`
+          : ''
+      ].filter(Boolean).join('');
+      const runningMessage = status === 'pausing'
+        ? '已请求暂停。当前 LLM 请求结束后会丢弃正在处理的 finding，并从该 finding 保存恢复点。'
+        : status === 'paused'
+          ? '任务已暂停，当前正在处理的 finding 已丢弃。' + resumeHint
+          : status === 'stopping'
         ? '已请求停止。当前 LLM 请求结束后会停止后续回合。'
         : status === 'stopped'
           ? '任务已停止，下面显示停止前已经生成的部分结果。'
@@ -2642,12 +2962,16 @@ def app_html() -> str:
           <div class="detail-body">
             <div class="chips"><span class="chip">${{esc(statusLabel(status))}}</span></div>
             <div class="toolbar">
+              ${{detailControls}}
               <button type="button" data-run-export="markdown" data-run-id="${{esc(run.run_id)}}">导出 Markdown</button>
               <button type="button" data-run-export="json" data-run-id="${{esc(run.run_id)}}">导出 JSON</button>
             </div>
             <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
             <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
             <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
+            <div><strong>发现进度：</strong> ${{esc(run.completed_finding_count ?? findings.length)}} / ${{esc(run.finding_count || findings.length)}}</div>
+            ${{currentHint ? `<div><strong>当前状态：</strong> ${{esc(currentHint)}}</div>` : ''}}
+            ${{resumeHint ? `<div><strong>恢复点：</strong> ${{esc(resumeHint)}}</div>` : ''}}
             <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
             <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
             <div><strong>主持人 LLM：</strong> ${{esc(providerLabel(providers.moderator, providers.enabled))}}</div>
@@ -2662,6 +2986,7 @@ def app_html() -> str:
       if (status !== 'completed') {{
         el.detail.innerHTML = statusCard + (findings.length ? renderFindingsSection(findings) : '');
         bindRunExportButtons();
+        bindRunControlButtons(el.detail);
         bindFindingRows(findings);
         return;
       }}
@@ -2696,7 +3021,29 @@ def app_html() -> str:
         ${{renderFindingsSection(findings)}}
       `;
       bindRunExportButtons();
+      bindRunControlButtons(el.detail);
       bindFindingRows(findings);
+    }}
+
+    function bindRunControlButtons(root) {{
+      for (const button of root.querySelectorAll('[data-run-pause]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          pauseRun(button.dataset.runId);
+        }});
+      }}
+      for (const button of root.querySelectorAll('[data-run-resume]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          resumeRun(button.dataset.runId);
+        }});
+      }}
+      for (const button of root.querySelectorAll('[data-run-stop]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          stopRun(button.dataset.runId);
+        }});
+      }}
     }}
 
     function bindRunExportButtons() {{
@@ -2791,7 +3138,7 @@ def app_html() -> str:
     }}
 
     function isTerminalStatus(status) {{
-      return status === 'completed' || status === 'failed' || status === 'stopped';
+      return status === 'completed' || status === 'failed' || status === 'stopped' || status === 'paused';
     }}
 
     async function selectFinding(findingId) {{
