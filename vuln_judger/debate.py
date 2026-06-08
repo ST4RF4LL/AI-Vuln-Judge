@@ -294,8 +294,6 @@ class DebateOrchestrator:
             challenges.append("尚未建立已验证的源到汇数据流或调用路径。")
         if _has_protection(evidence):
             challenges.append("附近代码存在可能缓解问题的校验、鉴权或消毒逻辑。")
-        if _has_cpp_compile_gap(evidence):
-            challenges.append("未找到编译数据库，C++ 证据质量受限。")
         if not _has_impact(evidence):
             challenges.append("实际影响尚未关联到资产、权限或可达的危险汇点。")
         challenges.extend(bundle.diagnostics)
@@ -430,14 +428,6 @@ class DebateOrchestrator:
                 disputed_points=challenges,
                 reasoning_summary="该 SARIF 发现无法解析到提供项目中的真实源码位置。",
                 recommended_next_steps=["确认 SARIF 报告是否由同一源码版本生成。"],
-            )
-        if _has_cpp_compile_gap(evidence) and not _has_meaningful_flow(evidence):
-            return DebateDecision(
-                verdict=Verdict.INCONCLUSIVE,
-                confidence=0.45,
-                disputed_points=challenges,
-                reasoning_summary="该 C++ 发现有真实源码证据，但缺少编译数据库支撑的数据流或调用链确认。",
-                recommended_next_steps=["提供 compile_commands.json 或 CodeQL 数据库后重新研判。"],
             )
         if _has_meaningful_flow(evidence) and not _has_protection(evidence):
             return DebateDecision(
@@ -635,7 +625,6 @@ def _data_excerpt(item: CodeEvidence) -> str:
         "query_terms",
         "terms",
         "impacts",
-        "compile_database",
         "code_flow_count",
         "missing_evidence",
         "suggested_actions",
@@ -816,8 +805,6 @@ def _clarification_for_challenge(evidence: Sequence[CodeEvidence], challenge: st
         return _protection_assessment(evidence)
     if "影响" in challenge or "资产" in challenge:
         return _impact_assessment(evidence)
-    if "编译数据库" in challenge or "C++" in challenge:
-        return "C++ 语义分析依赖 compile_commands.json；缺少时 Atlass MCP 的 calls/search 仍可提供调用图证据，结合源码片段可手动重构数据流路径，不应直接断言证据不足。"
     return "该质疑需要人工复核；当前自动证据不能新增未采集事实，但可从已有调用图、源码片段和符号引用中交叉验证。"
 
 
@@ -842,8 +829,6 @@ def _challenge_still_material(evidence: Sequence[CodeEvidence], challenge: str) 
         return not _has_valid_location(evidence)
     if "数据流" in challenge or "调用" in challenge or "路径" in challenge or "尚未建立" in challenge:
         return not _has_meaningful_flow(evidence)
-    if "编译数据库" in challenge or "C++" in challenge:
-        return _has_cpp_compile_gap(evidence)
     if "防护" in challenge:
         return _has_protection(evidence)
     if "影响" in challenge:
@@ -865,8 +850,6 @@ def _fallback_side_conclusion(
     evidence = bundle.evidence
     if _all_primary_locations_invalid(evidence):
         return "误报", Verdict.FALSE_POSITIVE, "报告位置无法映射到当前源码版本，不能证明漏洞真实存在。"
-    if _has_cpp_compile_gap(evidence) and not _has_meaningful_flow(evidence):
-        return "证据不足", Verdict.INCONCLUSIVE, "C++ 发现缺少编译数据库支撑，无法确认完整数据流或调用链。"
     if role == "AFFIRMATIVE":
         if _has_meaningful_flow(evidence) and not _has_protection(evidence):
             return "真实漏洞", Verdict.TRUE_POSITIVE, "报告、源码位置和数据流/调用链证据形成闭环，当前未识别到有效防护。"
@@ -1059,16 +1042,6 @@ def _has_impact(evidence: Sequence[CodeEvidence]) -> bool:
 
 def _has_project_context(evidence: Sequence[CodeEvidence]) -> bool:
     return any(item.kind == EvidenceKind.PROJECT_CONTEXT for item in evidence)
-
-
-def _has_cpp_compile_gap(evidence: Sequence[CodeEvidence]) -> bool:
-    return any(
-        item.kind == EvidenceKind.TOOL_DIAGNOSTIC
-        and item.source == "code-search"
-        and item.data.get("compile_database") is None
-        and "compile_commands.json" in item.summary
-        for item in evidence
-    )
 
 
 def _material_unresolved(challenges: Sequence[str]) -> bool:

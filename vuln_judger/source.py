@@ -351,31 +351,6 @@ class SourceIndexer:
                 break
         return paths
 
-    def compile_database_evidence(self, finding: Finding) -> Optional[CodeEvidence]:
-        primary = finding.primary_location
-        if primary is None or detect_language(primary.file) != "cpp":
-            return None
-        candidates = [
-            self.source_root / "compile_commands.json",
-            self.source_root / "build" / "compile_commands.json",
-        ]
-        existing = [path for path in candidates if path.exists()]
-        if existing:
-            summary = f"发现 C++ 编译数据库：{existing[0].relative_to(self.source_root)}"
-            strength = EvidenceStrength.STRONG
-        else:
-            summary = "未找到 compile_commands.json；C++ 语义分析降级，但 grep/rg 和 Atlas MCP 调用图仍可提供证据"
-            strength = EvidenceStrength.PARTIAL
-        return CodeEvidence(
-            evidence_id=evidence_id(finding.finding_id, "cpp-compile-db", primary.file),
-            kind=EvidenceKind.TOOL_DIAGNOSTIC,
-            strength=strength,
-            summary=summary,
-            source="code-search",
-            locations=[],
-            data={"compile_database": str(existing[0]) if existing else None},
-        )
-
     def snippet(self, file: Path, line: int, before: int = 2, after: int = 2) -> str:
         lines = self._read_lines(file)
         start = max(1, line - before)

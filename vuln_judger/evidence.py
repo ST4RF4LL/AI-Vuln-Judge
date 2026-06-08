@@ -63,9 +63,6 @@ class EvidenceCollector:
         evidence.extend(self.indexer.evidence_for_code_flows(finding))
         evidence.extend(self.indexer.source_sink_evidence(finding))
         evidence.extend(self.indexer.protection_evidence(finding))
-        compile_db = self.indexer.compile_database_evidence(finding)
-        if compile_db is not None:
-            evidence.append(compile_db)
         evidence.extend(self._impact_evidence(finding))
         evidence.extend(self._project_context_evidence(finding))
         evidence.extend(self.analyzers.analyze(finding, self.indexer, self.analyzer_settings))

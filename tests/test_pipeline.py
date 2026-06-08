@@ -1769,7 +1769,7 @@ for raw in sys.stdin.buffer:
             )
             self.assertEqual(report.reports[0].verdict, Verdict.FALSE_POSITIVE)
 
-    def test_cpp_without_compile_database_is_inconclusive(self):
+    def test_cpp_uses_source_evidence_without_build_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "main.cpp"
@@ -1820,7 +1820,9 @@ for raw in sys.stdin.buffer:
                 )
             )
             self.assertEqual(report.reports[0].verdict, Verdict.INCONCLUSIVE)
-            self.assertIn("编译数据库", report.reports[0].reasoning_summary)
+            self.assertNotIn("编译数据库", report.reports[0].reasoning_summary)
+            summaries = "\n".join(item.summary for item in report.reports[0].evidence_chain)
+            self.assertNotIn("compile_commands.json", summaries)
 
 
 def write_python_fixture(root: Path):

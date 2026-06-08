@@ -669,14 +669,6 @@ def _missing_evidence(
                 "suggestion": "优先补充 SARIF codeFlows；或构建 Atlas 索引后通过 collect_evidence 获取 trace/calls。",
             }
         )
-    if _has_cpp_compile_gap(evidence):
-        missing.append(
-            {
-                "type": "cpp_compile_database",
-                "summary": "C++ 项目缺少 compile_commands.json，语义证据质量会降级。",
-                "suggestion": "生成 compile_commands.json，或使用 Atlas calls/search 与源码片段手动补齐路径。",
-            }
-        )
     if external_tools_enabled and not _has_atlas_success(evidence):
         missing.append(
             {
@@ -729,15 +721,6 @@ def _has_meaningful_evidence(evidence: Sequence[Dict[str, Any]], kinds: set[str]
         if item.get("source") == "code-search":
             continue
         if item.get("strength") in {"STRONG", "MEDIUM"}:
-            return True
-    return False
-
-
-def _has_cpp_compile_gap(evidence: Sequence[Dict[str, Any]]) -> bool:
-    for item in evidence:
-        if item.get("kind") != "TOOL_DIAGNOSTIC" or item.get("source") != "code-search":
-            continue
-        if item.get("data", {}).get("compile_database") is None and "compile_commands.json" in str(item.get("summary") or ""):
             return True
     return False
 
