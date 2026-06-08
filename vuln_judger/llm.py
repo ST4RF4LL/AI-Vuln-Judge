@@ -30,7 +30,7 @@ class OpenAICompatibleLLM(LLMClient):
     api_key: str
     model: str
     endpoint: str = "https://api.openai.com/v1/chat/completions"
-    timeout_seconds: int = 120
+    timeout_seconds: int = 300
     extra_json: Dict[str, Any] = field(default_factory=dict)
     provider_id: Optional[str] = None
     provider_name: Optional[str] = None

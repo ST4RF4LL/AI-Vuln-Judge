@@ -24,7 +24,7 @@ from vuln_judger.models import AgentConfig, CodeEvidence, EvidenceKind, Evidence
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunRecordStore
-from vuln_judger.sarif import load_sarif, parse_markdown_report, prepare_report_for_processing
+from vuln_judger.sarif import ReportPreparationError, load_sarif, prepare_report_for_processing
 from vuln_judger.skills import SkillSourceStore
 from vuln_judger.source import SourceIndexer, detect_project_languages
 
@@ -81,7 +81,7 @@ class PipelineTests(unittest.TestCase):
             self.assertGreaterEqual(report.reports[0].confidence, 0.75)
             self.assertTrue(report.reports[0].evidence_chain)
 
-    def test_markdown_report_becomes_true_positive(self):
+    def test_markdown_report_requires_moderator_llm(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _sarif, skills = write_python_fixture(root)
@@ -106,23 +106,19 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            report = run_judgement(
-                RunConfig(
-                    sarif_path=markdown,
-                    source_path=root,
-                    skills_path=skills,
-                    enable_external_tools=False,
+            with self.assertRaises(ReportPreparationError):
+                run_judgement(
+                    RunConfig(
+                        sarif_path=markdown,
+                        source_path=root,
+                        skills_path=skills,
+                        enable_external_tools=False,
+                    )
                 )
-            )
-            self.assertEqual(report.finding_count, 1)
-            self.assertEqual(report.reports[0].rule_id, "python-command-injection")
-            self.assertEqual(report.reports[0].source_locations[0].file, "app.py")
-            self.assertEqual(report.reports[0].verdict, Verdict.TRUE_POSITIVE)
 
     def test_markdown_table_report_is_moderated_into_temp_sarif(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            _sarif, skills = write_python_fixture(root)
             markdown = root / "report.md"
             markdown.write_text(
                 "\n".join(
@@ -136,28 +132,41 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            llm_sarif = {
+                "version": "2.1.0",
+                "runs": [
+                    {
+                        "tool": {"driver": {"name": "moderator-llm"}},
+                        "results": [
+                            {
+                                "ruleId": "python-command-injection",
+                                "level": "error",
+                                "message": {"text": "用户输入可到达命令执行点"},
+                                "locations": [
+                                    {
+                                        "physicalLocation": {
+                                            "artifactLocation": {"uri": "app.py"},
+                                            "region": {"startLine": 5},
+                                        }
+                                    }
+                                ],
+                                "properties": {"markdown_dangerousfunction": "os.system"},
+                            }
+                        ],
+                    }
+                ],
+            }
+            moderator = FakeLLM(json.dumps(llm_sarif, ensure_ascii=False))
 
-            prepared = prepare_report_for_processing(markdown)
+            prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
             self.assertNotEqual(prepared.effective_path, markdown.resolve())
             self.assertTrue(prepared.temporary)
+            self.assertTrue(moderator.calls)
             findings = load_sarif(prepared.effective_path)
             self.assertEqual(findings[0].message, "用户输入可到达命令执行点")
             self.assertEqual(findings[0].rule_id, "python-command-injection")
             self.assertEqual(findings[0].locations[0].display(), "app.py:5")
-
-            report = run_judgement(
-                RunConfig(
-                    sarif_path=markdown,
-                    source_path=root,
-                    skills_path=skills,
-                    enable_external_tools=False,
-                )
-            )
-            self.assertTrue(any("Markdown 报告转换为临时 SARIF" in item for item in report.diagnostics))
-            self.assertTrue(any("SARIF 格式验证通过" in item for item in report.diagnostics))
-            summaries = "\n".join(item.summary for item in report.reports[0].evidence_chain)
-            self.assertIn("用户输入可到达命令执行点", summaries)
-            self.assertNotIn("|------|-----|", summaries)
+            self.assertTrue(any("SARIF 格式验证通过" in item for item in prepared.diagnostics))
 
     def test_moderator_llm_interprets_markdown_before_sarif_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,75 +289,27 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            report = run_judgement(
-                RunConfig(
-                    sarif_path=markdown,
-                    source_path=root,
-                    enable_external_tools=False,
-                )
-            )
-            locations = [location.file for location in report.reports[0].source_locations]
+            llm_sarif = {
+                "version": "2.1.0",
+                "runs": [
+                    {
+                        "tool": {"driver": {"name": "moderator-llm"}},
+                        "results": [
+                            {
+                                "ruleId": "faiss-report",
+                                "message": {"text": "FAISS affected code"},
+                                "locations": [
+                                    {"physicalLocation": {"artifactLocation": {"uri": "faiss/impl/index_read.cpp"}}},
+                                    {"physicalLocation": {"artifactLocation": {"uri": "faiss/IndexFastScan.cpp"}}},
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+            prepared = prepare_report_for_processing(markdown, moderator_client=FakeLLM(json.dumps(llm_sarif)))
+            locations = [location.file for finding in load_sarif(prepared.effective_path) for location in finding.locations]
             self.assertEqual(locations, ["faiss/impl/index_read.cpp", "faiss/IndexFastScan.cpp"])
-            source_evidence = [
-                item for item in report.reports[0].evidence_chain if item.kind == EvidenceKind.SOURCE_LOCATION
-            ]
-            self.assertTrue(all(item.data["line_exists"] for item in source_evidence))
-
-    def test_markdown_single_vulnerability_report_sections_are_merged(self):
-        markdown = "\n".join(
-            [
-                "# FAISS-PANORAMA-DESER-OOB",
-                "",
-                "## Summary",
-                "",
-                "Malformed serialized `IndexFlatPanorama` objects are accepted by `faiss::read_index()`.",
-                "",
-                "Severity: High",
-                "",
-                "## Affected Code",
-                "",
-                "- `/tmp/faiss/faiss/impl/index_read.cpp`: `IxFP` branch in `read_index_up()`",
-                "- `/tmp/faiss/faiss/impl/Panorama.h`: search-time cumulative-sum reads",
-                "- `/tmp/faiss/faiss/IndexFlat.cpp`: `IndexFlatPanorama::permute_entries()`",
-                "- `/tmp/faiss/faiss/impl/Panorama.cpp`: `Panorama::copy_entry()`",
-                "",
-                "## Root Cause",
-                "",
-                "The deserializer does not validate serialized vector sizes.",
-                "",
-                "## Evidence",
-                "",
-                "- `pocs/panorama_exp.py`",
-                "- `pocs/panorama_trigger.cpp`",
-                "",
-                "## Recommended Fix",
-                "",
-                "Reject malformed `IxFP` objects during deserialization.",
-            ]
-        )
-        findings = parse_markdown_report(markdown)
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].rule_id, "FAISS-PANORAMA-DESER-OOB")
-        self.assertEqual(findings[0].level, "high")
-        self.assertIn("Malformed serialized", findings[0].message)
-        self.assertEqual(
-            [location.file for location in findings[0].locations],
-            [
-                "/tmp/faiss/faiss/impl/index_read.cpp",
-                "/tmp/faiss/faiss/impl/Panorama.h",
-                "/tmp/faiss/faiss/IndexFlat.cpp",
-                "/tmp/faiss/faiss/impl/Panorama.cpp",
-            ],
-        )
-        self.assertEqual(
-            [location.symbol for location in findings[0].locations],
-            [
-                "read_index_up",
-                None,
-                "IndexFlatPanorama::permute_entries",
-                "Panorama::copy_entry",
-            ],
-        )
 
     def test_moderator_repairs_suspicious_sarif_message_in_temp_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -977,21 +938,29 @@ for raw in sys.stdin.buffer:
             self.assertIn("未发现针对报告路径的防护消减证据", finding.protection_assessment)
             self.assertNotIn("guard.py", finding.protection_assessment)
 
-    def test_markdown_without_locations_still_passes_source_root_evidence(self):
+    def test_sarif_without_locations_still_passes_source_root_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            report_path = root / "summary.md"
+            report_path = root / "summary.sarif"
             report_path.write_text(
-                "\n".join(
-                    [
-                        "# 静态分析总结",
-                        "",
-                        "## Summary",
-                        "",
-                        "- 规则：faiss-deserialization-risk",
-                        "- 严重性：warning",
-                        "- 消息：发现 IndexAdditiveQuantizerFastScan 可能存在反序列化风险，但报告未给出源码路径。",
-                    ]
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "unit"}},
+                                "results": [
+                                    {
+                                        "ruleId": "faiss-deserialization-risk",
+                                        "level": "warning",
+                                        "message": {
+                                            "text": "发现 IndexAdditiveQuantizerFastScan 可能存在反序列化风险，但报告未给出源码路径。"
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
                 ),
                 encoding="utf-8",
             )
@@ -1247,6 +1216,12 @@ for raw in sys.stdin.buffer:
             self.assertEqual(store.defaults()["moderator"], "main")
             raw = json.loads((Path(tmp) / "providers.json").read_text(encoding="utf-8"))
             self.assertEqual(raw["providers"][0]["api_key"], "secret")
+
+    def test_openai_compatible_llm_default_timeout_is_300_seconds(self):
+        from vuln_judger.llm import OpenAICompatibleLLM
+
+        client = OpenAICompatibleLLM(api_key="secret", model="fake-model")
+        self.assertEqual(client.timeout_seconds, 300)
 
     def test_to_jsonable_decodes_nested_bytes(self):
         evidence = CodeEvidence(
