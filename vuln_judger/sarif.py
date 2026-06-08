@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import unquote, urlparse
 
+from .agents import DEFAULT_MODERATOR_AGENT
+from .llm import LLMClient
+from .models import AgentConfig
 from .models import Finding, SourceLocation
 
 
@@ -41,14 +44,24 @@ def load_sarif(path: Path) -> List[Finding]:
     return parse_sarif(data)
 
 
-def prepare_report_for_processing(path: Path) -> PreparedReport:
+def prepare_report_for_processing(
+    path: Path,
+    moderator_client: Optional[LLMClient] = None,
+    moderator_agent: Optional[AgentConfig] = None,
+) -> PreparedReport:
     """Normalize report input to SARIF without modifying the original file."""
     report_path = path.expanduser().resolve()
     suffix = report_path.suffix.lower()
     diagnostics: List[str] = []
     if suffix in {".md", ".markdown"}:
         text = report_path.read_text(encoding="utf-8", errors="replace")
-        sarif_data = markdown_to_sarif(text, source_name=str(report_path))
+        sarif_data, conversion_diagnostics = moderator_markdown_to_sarif(
+            text,
+            source_name=str(report_path),
+            moderator_client=moderator_client,
+            moderator_agent=moderator_agent,
+        )
+        diagnostics.extend(conversion_diagnostics)
         sarif_data, repairs = moderator_review_sarif(sarif_data)
         diagnostics.extend(f"Moderator 修复 Markdown 转换结果：{item}" for item in repairs)
         issues = validate_sarif_report(sarif_data)
@@ -61,7 +74,13 @@ def prepare_report_for_processing(path: Path) -> PreparedReport:
         data = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
     except json.JSONDecodeError:
         text = report_path.read_text(encoding="utf-8", errors="replace")
-        sarif_data = markdown_to_sarif(text, source_name=str(report_path))
+        sarif_data, conversion_diagnostics = moderator_markdown_to_sarif(
+            text,
+            source_name=str(report_path),
+            moderator_client=moderator_client,
+            moderator_agent=moderator_agent,
+        )
+        diagnostics.extend(conversion_diagnostics)
         sarif_data, repairs = moderator_review_sarif(sarif_data)
         diagnostics.extend(f"Moderator 修复 Markdown 转换结果：{item}" for item in repairs)
         issues = validate_sarif_report(sarif_data)
@@ -79,6 +98,52 @@ def prepare_report_for_processing(path: Path) -> PreparedReport:
         diagnostics.append(f"Moderator 已将修复后的 SARIF 写入临时文件：{temp_path}")
         return PreparedReport(report_path, temp_path, diagnostics, temporary=True)
     return PreparedReport(report_path, report_path, diagnostics, temporary=False)
+
+
+def moderator_markdown_to_sarif(
+    text: str,
+    source_name: str = "markdown-report",
+    moderator_client: Optional[LLMClient] = None,
+    moderator_agent: Optional[AgentConfig] = None,
+) -> tuple[Dict[str, Any], List[str]]:
+    diagnostics: List[str] = []
+    if moderator_client is None:
+        diagnostics.append("Moderator LLM 不可用，使用确定性 Markdown 解析兜底生成 SARIF")
+        return markdown_to_sarif(text, source_name=source_name), diagnostics
+    system, user = _markdown_to_sarif_prompt(text, source_name, moderator_agent)
+    response = moderator_client.complete(system, user)
+    if not response:
+        diagnostics.append("Moderator LLM 未返回 Markdown 转换结果，使用确定性 Markdown 解析兜底生成 SARIF")
+        return markdown_to_sarif(text, source_name=source_name), diagnostics
+    sarif_data = _extract_json_object(response)
+    if sarif_data is None:
+        diagnostics.append("Moderator LLM Markdown 转换结果不是合法 JSON，使用确定性 Markdown 解析兜底生成 SARIF")
+        return markdown_to_sarif(text, source_name=source_name), diagnostics
+    sarif_data, repairs = moderator_review_sarif(sarif_data)
+    diagnostics.extend(f"Moderator 修复 LLM SARIF：{item}" for item in repairs)
+    issues = validate_sarif_report(sarif_data)
+    if issues:
+        repaired = _repair_llm_sarif_with_moderator(
+            moderator_client,
+            text=text,
+            source_name=source_name,
+            previous_sarif=sarif_data,
+            issues=issues,
+            moderator_agent=moderator_agent,
+        )
+        if repaired is not None:
+            repaired, repair_items = moderator_review_sarif(repaired)
+            repaired_issues = validate_sarif_report(repaired)
+            if not repaired_issues:
+                diagnostics.append("Moderator LLM 已根据 SARIF 验证问题修正 Markdown 转换结果")
+                diagnostics.extend(f"Moderator 修复 LLM SARIF：{item}" for item in repair_items)
+                return repaired, diagnostics
+            diagnostics.append("Moderator LLM 修正后的 SARIF 仍未通过验证：" + "；".join(repaired_issues))
+        diagnostics.append("Moderator LLM SARIF 未通过格式验证：" + "；".join(issues))
+        diagnostics.append("使用确定性 Markdown 解析兜底生成 SARIF")
+        return markdown_to_sarif(text, source_name=source_name), diagnostics
+    diagnostics.append("Moderator LLM 已解读 Markdown 并生成 SARIF")
+    return sarif_data, diagnostics
 
 
 def markdown_to_sarif(text: str, source_name: str = "markdown-report") -> Dict[str, Any]:
@@ -205,6 +270,86 @@ def moderator_review_sarif(data: Dict[str, Any]) -> tuple[Dict[str, Any], List[s
             if repairs:
                 props["moderator_repairs"] = list(repairs)
     return reviewed, repairs
+
+
+def _markdown_to_sarif_prompt(
+    text: str,
+    source_name: str,
+    moderator_agent: Optional[AgentConfig],
+) -> tuple[str, str]:
+    agent = moderator_agent or DEFAULT_MODERATOR_AGENT
+    agent_instructions = (agent.instructions or "").strip()
+    system = (
+        f"你是 {agent.name or '中立 Moderator'}，负责把静态漏洞 Markdown 报告转换为 SARIF 2.1.0。"
+        "你必须阅读整份 Markdown，提取漏洞类型、漏洞描述、危险函数/危险 API、文件路径、行列号、严重性、调用链/数据流。"
+        "不要把 Markdown 表格分隔线、表头或格式说明当作漏洞消息。"
+        "只输出一个合法 JSON object，不要输出 Markdown、代码块、解释或额外文本。"
+    )
+    if agent_instructions:
+        system += f"\nModerator 配置：\n{agent_instructions}"
+    user = (
+        "请将下面 Markdown 报告转换为 SARIF 2.1.0 JSON。\n"
+        "必须满足：\n"
+        "1. 顶层包含 version='2.1.0' 和 runs 数组。\n"
+        "2. 每个漏洞放入 runs[0].results[]，必须包含 ruleId、message.text、level、locations。\n"
+        "3. ruleId 优先使用漏洞类型、规则 ID、CWE/CVE 或报告标题，不要使用表格分隔线。\n"
+        "4. message.text 必须是具体漏洞描述，优先包含漏洞类型、危险函数和影响，不要使用 '|------|-----|'、表头或空文本。\n"
+        "5. 文件路径放入 locations[].physicalLocation.artifactLocation.uri；行列号放入 region.startLine/startColumn。\n"
+        "6. 调用链、数据流或代码流放入 codeFlows[].threadFlows[].locations[].location。\n"
+        "7. 在 properties 中保留 source_format='markdown'、source_report、moderator_converted=true，"
+        "并尽量保留 markdown_vulnerabilitytype、markdown_dangerousfunction、markdown_description 等字段。\n\n"
+        f"source_report: {source_name}\n\n"
+        "Markdown 报告开始：\n"
+        f"{text}\n"
+        "Markdown 报告结束。"
+    )
+    return system, user
+
+
+def _repair_llm_sarif_with_moderator(
+    moderator_client: LLMClient,
+    text: str,
+    source_name: str,
+    previous_sarif: Dict[str, Any],
+    issues: List[str],
+    moderator_agent: Optional[AgentConfig],
+) -> Optional[Dict[str, Any]]:
+    agent = moderator_agent or DEFAULT_MODERATOR_AGENT
+    system = (
+        f"你是 {agent.name or '中立 Moderator'}，负责修复 Markdown 转换出的 SARIF。"
+        "只输出修复后的合法 SARIF JSON object，不要输出 Markdown、代码块、解释或额外文本。"
+    )
+    user = (
+        "上一次 SARIF 转换未通过格式验证，请基于原始 Markdown 修复。\n"
+        "验证问题：\n- "
+        + "\n- ".join(issues)
+        + "\n\n原始 Markdown：\n"
+        + text
+        + "\n\n上一次 SARIF JSON：\n"
+        + json.dumps(previous_sarif, ensure_ascii=False, indent=2, sort_keys=True)
+        + f"\n\nsource_report: {source_name}"
+    )
+    response = moderator_client.complete(system, user)
+    if not response:
+        return None
+    return _extract_json_object(response)
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    cleaned = text.strip()
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+    elif not cleaned.startswith("{"):
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start >= 0 and end > start:
+            cleaned = cleaned[start : end + 1]
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def parse_sarif(data: Dict[str, Any]) -> List[Finding]:

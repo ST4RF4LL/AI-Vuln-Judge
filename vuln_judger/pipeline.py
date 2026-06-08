@@ -46,7 +46,26 @@ def run_judgement(
         config.enable_llm,
         config.enable_external_tools,
     )
-    prepared_report = prepare_report_for_processing(sarif_path)
+    affirmative_provider, negative_provider, moderator_provider = _resolve_providers(config)
+    LOG.info(
+        "Provider 解析完成 affirmative=%s negative=%s moderator=%s",
+        affirmative_provider.id if affirmative_provider else None,
+        negative_provider.id if negative_provider else None,
+        moderator_provider.id if moderator_provider else None,
+    )
+    affirmative_client, negative_client, moderator_client = build_llm_clients(
+        enabled=config.enable_llm,
+        affirmative_provider=affirmative_provider,
+        negative_provider=negative_provider,
+        moderator_provider=moderator_provider,
+        legacy_model=config.llm_model,
+        legacy_endpoint=config.llm_endpoint,
+    )
+    prepared_report = prepare_report_for_processing(
+        sarif_path,
+        moderator_client=moderator_client,
+        moderator_agent=config.moderator_agent,
+    )
     diagnostics = list(prepared_report.diagnostics)
     findings = load_sarif(prepared_report.effective_path)
     LOG.info(
@@ -69,21 +88,6 @@ def run_judgement(
         analyzers=AnalyzerSuite(),
         analyzer_settings=analyzer_settings,
         languages=languages,
-    )
-    affirmative_provider, negative_provider, moderator_provider = _resolve_providers(config)
-    LOG.info(
-        "Provider 解析完成 affirmative=%s negative=%s moderator=%s",
-        affirmative_provider.id if affirmative_provider else None,
-        negative_provider.id if negative_provider else None,
-        moderator_provider.id if moderator_provider else None,
-    )
-    affirmative_client, negative_client, moderator_client = build_llm_clients(
-        enabled=config.enable_llm,
-        affirmative_provider=affirmative_provider,
-        negative_provider=negative_provider,
-        moderator_provider=moderator_provider,
-        legacy_model=config.llm_model,
-        legacy_endpoint=config.llm_endpoint,
     )
     orchestrator_template = DebateOrchestrator(
         max_rounds=config.max_rounds,

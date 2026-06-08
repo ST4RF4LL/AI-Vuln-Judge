@@ -159,6 +159,107 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("用户输入可到达命令执行点", summaries)
             self.assertNotIn("|------|-----|", summaries)
 
+    def test_moderator_llm_interprets_markdown_before_sarif_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markdown = root / "report.md"
+            markdown.write_text(
+                "\n".join(
+                    [
+                        "# 自然语言漏洞报告",
+                        "",
+                        "该报告描述了一个命令注入问题，危险函数是 os.system，位置在 app.py 第 5 行。",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            llm_sarif = {
+                "version": "2.1.0",
+                "runs": [
+                    {
+                        "tool": {"driver": {"name": "moderator-llm"}},
+                        "results": [
+                            {
+                                "ruleId": "LLM-MARKDOWN-COMMAND-INJECTION",
+                                "level": "error",
+                                "message": {"text": "LLM 解读：用户输入可到达 os.system。"},
+                                "locations": [
+                                    {
+                                        "physicalLocation": {
+                                            "artifactLocation": {"uri": "app.py"},
+                                            "region": {"startLine": 5},
+                                        }
+                                    }
+                                ],
+                                "properties": {"markdown_dangerousfunction": "os.system"},
+                            }
+                        ],
+                    }
+                ],
+            }
+            moderator = FakeLLM(json.dumps(llm_sarif, ensure_ascii=False))
+
+            prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
+            findings = load_sarif(prepared.effective_path)
+
+            self.assertTrue(moderator.calls)
+            self.assertIn("Markdown 报告开始", moderator.calls[0][1])
+            self.assertEqual(findings[0].rule_id, "LLM-MARKDOWN-COMMAND-INJECTION")
+            self.assertEqual(findings[0].message, "LLM 解读：用户输入可到达 os.system。")
+            self.assertTrue(any("Moderator LLM 已解读 Markdown 并生成 SARIF" in item for item in prepared.diagnostics))
+
+    def test_pipeline_uses_moderator_llm_for_markdown_conversion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _sarif, skills = write_python_fixture(root)
+            markdown = root / "report.md"
+            markdown.write_text(
+                "\n".join(
+                    [
+                        "# 自然语言漏洞报告",
+                        "",
+                        "请由 Moderator 解读：app.py 第 5 行存在命令注入，危险函数 os.system。",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            llm_server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAIHandler)
+            llm_thread = Thread(target=llm_server.serve_forever, daemon=True)
+            llm_thread.start()
+            providers_file = root / "providers.json"
+            store = ProviderStore(providers_file)
+            endpoint = f"http://127.0.0.1:{llm_server.server_port}/v1/chat/completions"
+            try:
+                store.upsert(
+                    {
+                        "id": "fake",
+                        "name": "Fake",
+                        "endpoint": endpoint,
+                        "model": "fake-model",
+                        "api_key": "secret",
+                    }
+                )
+                store.set_defaults("fake", "fake", "fake")
+
+                report = run_judgement(
+                    RunConfig(
+                        sarif_path=markdown,
+                        source_path=root,
+                        skills_path=skills,
+                        providers_file=providers_file,
+                        enable_external_tools=False,
+                        enable_llm=True,
+                    )
+                )
+            finally:
+                llm_server.shutdown()
+                llm_server.server_close()
+
+            self.assertTrue(any("Moderator LLM 已解读 Markdown 并生成 SARIF" in item for item in report.diagnostics))
+            self.assertEqual(report.reports[0].rule_id, "LLM-MARKDOWN-COMMAND-INJECTION")
+            summaries = "\n".join(item.summary for item in report.reports[0].evidence_chain)
+            self.assertIn("LLM 解读：用户输入可到达 os.system。", summaries)
+
     def test_markdown_cpp_paths_keep_full_extension(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2300,7 +2401,40 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
             raw = b'{"error":"unauthorized"}'
         else:
             self.send_response(HTTPStatus.OK)
-            content = "OK" if "connectivity" in body["messages"][0]["content"] else "LLM"
+            system_prompt = body["messages"][0]["content"]
+            user_prompt = body["messages"][1]["content"] if len(body.get("messages") or []) > 1 else ""
+            if "connectivity" in system_prompt:
+                content = "OK"
+            elif "转换为 SARIF 2.1.0" in system_prompt or "Markdown 报告开始" in user_prompt:
+                content = json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "moderator-llm"}},
+                                "results": [
+                                    {
+                                        "ruleId": "LLM-MARKDOWN-COMMAND-INJECTION",
+                                        "level": "error",
+                                        "message": {"text": "LLM 解读：用户输入可到达 os.system。"},
+                                        "locations": [
+                                            {
+                                                "physicalLocation": {
+                                                    "artifactLocation": {"uri": "app.py"},
+                                                    "region": {"startLine": 5},
+                                                }
+                                            }
+                                        ],
+                                        "properties": {"markdown_dangerousfunction": "os.system"},
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            else:
+                content = "LLM"
             raw = json.dumps({"choices": [{"message": {"content": content}}]}).encode("utf-8")
         self.send_header("content-type", "application/json")
         self.send_header("content-length", str(len(raw)))
