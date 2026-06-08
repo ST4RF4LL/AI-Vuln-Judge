@@ -1631,17 +1631,25 @@ for raw in sys.stdin.buffer:
             bundle.finding.message = "demo"
             bundle.finding.locations = finding.source_locations
             bad_final = (
-                "【证据不足】，用户要求我作为正方(Affirmative_default)给出最终结案陈述。"
+                "【证据不足】，我需要给出一个间断的结案陈述。"
+                "用户要求我作为正方(Affirmative_default)给出最终结案陈述。"
                 "根据任务要求:1.结论标签固定为 2.只输出1到3句话"
             )
+            bad_summary = "我需要总结正反方核心观点，并输出 2 到 5 句话。"
             report = DebateOrchestrator(
                 affirmative_client=FakeLLM(bad_final),
                 negative_client=FakeLLM(bad_final),
+                moderator_client=FakeLLM(bad_summary),
             ).adjudicate(bundle)
-            self.assertNotIn("用户要求", report.final_conclusion)
-            self.assertNotIn("结论标签固定", report.final_conclusion)
-            self.assertNotIn("只输出1到3句话", report.final_conclusion)
+            serialized = to_jsonable(report)
+            for field in (report.final_conclusion, report.reasoning_summary, serialized["reasoning_summary"]):
+                self.assertNotIn("我需要", field)
+                self.assertNotIn("间断", field)
+                self.assertNotIn("用户要求", field)
+                self.assertNotIn("结论标签固定", field)
+                self.assertNotIn("只输出1到3句话", field)
             self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.final_conclusion)
+            self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.reasoning_summary)
 
     def test_run_report_records_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

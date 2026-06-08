@@ -300,6 +300,11 @@ class DebateOrchestrator:
         return challenges
 
     def _llm_claim(self, role: str, task: str, bundle: EvidenceBundle, extra: str) -> Optional[str]:
+        return self._llm_response(role, task, bundle, extra, "请用中文写一个可审计的辩论回合，不要使用 Markdown 表格。")
+
+    def _llm_response(
+        self, role: str, task: str, bundle: EvidenceBundle, extra: str, output_instruction: str
+    ) -> Optional[str]:
         client = self._client_for_role(role)
         if client is None:
             return None
@@ -325,7 +330,7 @@ class DebateOrchestrator:
             "若 Atlas 数据库存在但 trace 结果为 empty/partial/No data node，应转而从 calls 调用图和源码片段交叉验证重构数据流；"
             "若 Atlas 数据库存在但 trace_supported=false，只能说明当前工具无法导出 trace，不得说 .atlas 缺失或未构建。\n"
             f"补充上下文或质疑：\n{extra}\n"
-            "请用中文写一个可审计的辩论回合，不要使用 Markdown 表格。"
+            f"{output_instruction}"
         )
         return client.complete(system, user)
 
@@ -367,7 +372,7 @@ class DebateOrchestrator:
         last_negative: str,
     ) -> SideConclusion:
         label, verdict, statement = _fallback_side_conclusion(role, bundle, decision, challenges)
-        llm_statement = self._llm_claim(
+        llm_statement = self._llm_response(
             role,
             (
                 f"给出简短结案陈述。结论标签已固定为【{label}】，不得改成其他标签。"
@@ -375,6 +380,7 @@ class DebateOrchestrator:
             ),
             bundle,
             extra=_stage_context("结案", "最近一轮反方意见：\n" + last_negative, challenges, ""),
+            output_instruction="只返回结案陈述正文 1 到 3 句话；不要说明你要做什么，不要复述任务、标签或格式要求。",
         )
         if llm_statement:
             statement = _clean_final_statement(llm_statement, label) or statement
@@ -393,7 +399,7 @@ class DebateOrchestrator:
         turn_context = "\n\n".join(
             f"{_role_label(turn.role.value)}第 {turn.round_index} 回合：\n{turn.claim}" for turn in turns[-6:]
         )
-        llm_summary = self._llm_claim(
+        llm_summary = self._llm_response(
             "MODERATOR",
             (
                 "作为中立 Moderator，总结正反方核心观点、双方一致点、主要分歧、证据闭环状态和最终研判。"
@@ -413,6 +419,7 @@ class DebateOrchestrator:
                 challenges,
                 "",
             ),
+            output_instruction="只返回主持人总结正文 2 到 5 句话；不要说明你要做什么，不要复述任务、标签或格式要求。",
         )
         if not llm_summary:
             return None
@@ -869,25 +876,53 @@ def _fallback_side_conclusion(
 
 def _clean_final_statement(text: str, label: str) -> str:
     cleaned = text.strip()
-    cleaned = cleaned.replace(f"【{label}】", "").strip(" ，,;；\n")
-    cleaned = cleaned.replace(f"{label}，", "").replace(f"{label}:", "").replace(f"{label}：", "").strip()
-    lines = [line.strip("# -*\t ") for line in cleaned.splitlines() if line.strip()]
-    if not lines:
-        return ""
-    statement = " ".join(lines[:3]).strip()
-    if _looks_like_task_echo(statement):
+    segments = _clean_statement_segments(cleaned, max_segments=3, label=label)
+    statement = " ".join(segments).strip()
+    if not statement or _looks_like_task_echo(statement):
         return ""
     return statement[:500]
 
 
 def _clean_moderator_summary(text: str) -> str:
-    lines = [line.strip("# -*\t ") for line in text.strip().splitlines() if line.strip()]
-    if not lines:
-        return ""
-    statement = " ".join(lines[:5]).strip()
-    if _looks_like_task_echo(statement):
+    segments = _clean_statement_segments(text, max_segments=5)
+    statement = " ".join(segments).strip()
+    if not statement or _looks_like_task_echo(statement):
         return ""
     return statement[:1000]
+
+
+def _clean_statement_segments(text: str, max_segments: int, label: str = "") -> List[str]:
+    segments: List[str] = []
+    for raw_line in text.strip().splitlines():
+        line = _strip_response_line(raw_line, label)
+        if not line:
+            continue
+        for segment in _split_statement_segments(line):
+            segment = _strip_response_line(segment, label)
+            if not segment or _looks_like_task_echo(segment):
+                continue
+            segments.append(segment)
+            if len(segments) >= max_segments:
+                return segments
+    return segments
+
+
+def _strip_response_line(text: str, label: str = "") -> str:
+    cleaned = text.strip("# -*\t ，,;；")
+    labels = [label] if label else []
+    labels.extend(item for item in ("真实漏洞", "误报", "证据不足") if item not in labels)
+    label_pattern = "|".join(re.escape(item) for item in labels if item)
+    if label_pattern:
+        cleaned = re.sub(rf"^\s*(?:结论标签|结论|标签)\s*[:：]?\s*【?(?:{label_pattern})】?\s*[，,;；:：-]*\s*", "", cleaned)
+        cleaned = re.sub(rf"^\s*【(?:{label_pattern})】\s*[，,;；:：-]*\s*", "", cleaned)
+        cleaned = re.sub(rf"^\s*(?:{label_pattern})\s*[，,;；:：-]+\s*", "", cleaned)
+    cleaned = re.sub(r"^\s*(?:结案陈述|结案陈词|陈述正文|正文|主持人总结|总结)\s*[:：]\s*", "", cleaned)
+    return cleaned.strip()
+
+
+def _split_statement_segments(text: str) -> List[str]:
+    parts = re.split(r"(?<=[。！？!?])\s*", text)
+    return [part.strip() for part in parts if part.strip()]
 
 
 def _looks_like_task_echo(statement: str) -> bool:
@@ -899,8 +934,11 @@ def _looks_like_task_echo(statement: str) -> bool:
         "结论标签固定",
         "标签固定为",
         "只输出",
+        "只返回",
         "1到3句话",
         "1-3句话",
+        "2到5句话",
+        "2-5句话",
         "markdown表格",
         "作为正方",
         "作为反方",
@@ -909,10 +947,32 @@ def _looks_like_task_echo(statement: str) -> bool:
         "affirmative_default",
         "negative_default",
         "moderator_default",
+        "给出简短结案陈述",
         "给出最终结案陈述",
+        "结案陈述正文",
+        "结案陈词",
         "给出唯一结论标签",
+        "格式要求",
+        "格式说明",
+        "请用中文",
+        "可审计的辩论回合",
+        "我需要给出",
+        "我会给出",
+        "我将给出",
+        "需要给出",
+        "我需要输出",
+        "我会输出",
+        "需要输出",
+        "我需要总结",
+        "我会总结",
+        "需要总结",
+        "总结正反方核心观点",
     )
-    return any(marker in normalized for marker in markers)
+    if any(marker in normalized for marker in markers):
+        return True
+    first_person_task = re.search(r"(?:我|本人)?(?:需要|会|将|应该|必须).{0,12}(?:给出|输出|提供|总结|生成|撰写|写)", normalized)
+    task_target = any(term in normalized for term in ("结案", "陈述", "陈词", "摘要", "总结", "标签", "任务", "要求"))
+    return bool(first_person_task and task_target)
 
 
 def _final_conclusion(affirmative: SideConclusion, negative: SideConclusion) -> str:
@@ -924,12 +984,13 @@ def _final_conclusion(affirmative: SideConclusion, negative: SideConclusion) -> 
 def _decision_from_conclusions(
     base: DebateDecision, affirmative: SideConclusion, negative: SideConclusion, final_conclusion: str
 ) -> DebateDecision:
+    reasoning_summary = _clean_moderator_summary(final_conclusion) or base.reasoning_summary
     if affirmative.verdict == negative.verdict:
         return DebateDecision(
             verdict=affirmative.verdict,
             confidence=base.confidence,
             disputed_points=base.disputed_points,
-            reasoning_summary=final_conclusion,
+            reasoning_summary=reasoning_summary,
             recommended_next_steps=base.recommended_next_steps,
         )
     disputed = list(base.disputed_points)
@@ -938,7 +999,7 @@ def _decision_from_conclusions(
         verdict=Verdict.INCONCLUSIVE,
         confidence=min(base.confidence, 0.5),
         disputed_points=disputed,
-        reasoning_summary=final_conclusion,
+        reasoning_summary=reasoning_summary,
         recommended_next_steps=base.recommended_next_steps + ["人工复核正反方分歧点后再定性。"],
     )
 
