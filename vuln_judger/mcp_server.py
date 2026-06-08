@@ -138,14 +138,14 @@ class JudgerMCPServer:
             run_id=run_id,
             max_rounds=int(arguments.get("max_rounds") or 4),
             auto_index_tools=bool(arguments.get("auto_index_tools", False)),
-            agentic_atlas=bool(arguments.get("agentic_atlas", True)),
-            agentic_atlas_direct=bool(arguments.get("agentic_atlas_direct", False)),
             enable_external_tools=bool(arguments.get("enable_external_tools", True)),
             enable_llm=enable_llm,
             affirmative_provider_id=_optional_text(arguments.get("affirmative_provider_id")),
             negative_provider_id=_optional_text(arguments.get("negative_provider_id")),
+            moderator_provider_id=_optional_text(arguments.get("moderator_provider_id")),
             affirmative_agent=self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile"))),
             negative_agent=self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile"))),
+            moderator_agent=self.agent_store.agent("moderator", _optional_text(arguments.get("moderator_agent_profile"))),
         )
         report = run_judgement(config)
         saved = bool(arguments.get("save", True))
@@ -166,6 +166,7 @@ class JudgerMCPServer:
             max_rounds=1,
             affirmative_agent=self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile"))),
             negative_agent=self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile"))),
+            moderator_agent=self.agent_store.agent("moderator", _optional_text(arguments.get("moderator_agent_profile"))),
         ).adjudicate(bundle)
         report_payload = to_jsonable(report)
         run_id = _optional_text(arguments.get("run_id")) or f"run-{uuid4().hex[:12]}"
@@ -182,8 +183,12 @@ class JudgerMCPServer:
             "project_context_facts": len(collector.project_context.facts),
             "reports": [report_payload],
             "diagnostics": [f"{finding.finding_id}: {item}" for item in bundle.diagnostics],
-            "llm_providers": {"enabled": False, "affirmative": {}, "negative": {}},
-            "agent_configs": {},
+            "llm_providers": {"enabled": False, "affirmative": {}, "negative": {}, "moderator": {}},
+            "agent_configs": {
+                "affirmative": to_jsonable(self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile")))),
+                "negative": to_jsonable(self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile")))),
+                "moderator": to_jsonable(self.agent_store.agent("moderator", _optional_text(arguments.get("moderator_agent_profile")))),
+            },
         }
         saved = bool(arguments.get("save", False))
         if saved:
@@ -199,8 +204,7 @@ class JudgerMCPServer:
                 "max_rounds": 1,
                 "enable_external_tools": bool(arguments.get("enable_external_tools", True)),
                 "auto_index_tools": bool(arguments.get("auto_index_tools", False)),
-                "agentic_atlas": bool(arguments.get("agentic_atlas", True)),
-                "agentic_atlas_direct": bool(arguments.get("agentic_atlas_direct", False)),
+                "atlas_mode": "agentic_only",
                 "enable_llm": False,
                 "languages": list(indexer.languages),
             },
@@ -217,6 +221,7 @@ class JudgerMCPServer:
             "source_locations": report_payload.get("source_locations", []),
             "recommended_next_steps": report_payload.get("recommended_next_steps", []),
             "disputed_points": report_payload.get("disputed_points", []),
+            "agent_configs": run_payload["agent_configs"],
             "debate": report_payload.get("debate", []),
             "diagnostics": run_payload["diagnostics"],
         }
@@ -323,8 +328,6 @@ class JudgerMCPServer:
             analyzer_settings=AnalyzerSettings(
                 enabled=bool(arguments.get("enable_external_tools", True)),
                 auto_index=bool(arguments.get("auto_index_tools", False)),
-                agentic_atlas=bool(arguments.get("agentic_atlas", True)),
-                agentic_atlas_direct=bool(arguments.get("agentic_atlas_direct", False)),
                 mcp_servers_file=_optional_path(arguments.get("mcp_servers_file")) or self.settings.mcp_servers_file,
             ),
             languages=languages,
@@ -345,6 +348,7 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "report_path": {"type": "string", "description": "SARIF/JSON/Markdown report path."},
                 "source_path": {"type": "string", "description": "Source tree root path."},
                 "skills_path": {"type": "string", "description": "Optional project skills directory."},
+                "mcp_servers_file": {"type": "string"},
                 "max_rounds": {"type": "integer", "minimum": 1, "default": 4},
                 "enable_external_tools": {"type": "boolean", "default": True},
                 "auto_index_tools": {
@@ -352,17 +356,14 @@ def _tool_specs() -> List[Dict[str, Any]]:
                     "default": False,
                     "description": "Automatically build an Atlas index when .atlas/atlas.db is missing.",
                 },
-                "agentic_atlas": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Use agentic Atlas MCP fallback when fixed location-based Atlas calls cannot produce enough evidence.",
-                },
-                "agentic_atlas_direct": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Run agentic Atlas MCP evidence collection directly instead of waiting for fixed Atlas calls to fail.",
-                },
                 "enable_llm": {"type": "boolean", "default": False},
+                "providers_file": {"type": "string"},
+                "affirmative_provider_id": {"type": "string"},
+                "negative_provider_id": {"type": "string"},
+                "moderator_provider_id": {"type": "string"},
+                "affirmative_agent_profile": {"type": "string"},
+                "negative_agent_profile": {"type": "string"},
+                "moderator_agent_profile": {"type": "string"},
                 "save": {"type": "boolean", "default": True},
                 "include_report": {"type": "boolean", "default": False},
                 "run_id": {"type": "string"},
@@ -385,17 +386,10 @@ def _tool_specs() -> List[Dict[str, Any]]:
                     "default": False,
                     "description": "Automatically build an Atlas index when .atlas/atlas.db is missing.",
                 },
-                "agentic_atlas": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Use agentic Atlas MCP fallback when fixed location-based Atlas calls cannot produce enough evidence.",
-                },
-                "agentic_atlas_direct": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Run agentic Atlas MCP evidence collection directly instead of waiting for fixed Atlas calls to fail.",
-                },
                 "mcp_servers_file": {"type": "string"},
+                "affirmative_agent_profile": {"type": "string"},
+                "negative_agent_profile": {"type": "string"},
+                "moderator_agent_profile": {"type": "string"},
                 "include_evidence": {"type": "boolean", "default": True},
                 "evidence_limit": {"type": "integer", "minimum": 0, "default": 40},
                 "include_report": {"type": "boolean", "default": False},
@@ -460,16 +454,6 @@ def _analysis_properties() -> Dict[str, Any]:
             "type": "boolean",
             "default": False,
             "description": "Automatically build an Atlas index when .atlas/atlas.db is missing.",
-        },
-        "agentic_atlas": {
-            "type": "boolean",
-            "default": True,
-            "description": "Use agentic Atlas MCP fallback when fixed location-based Atlas calls cannot produce enough evidence.",
-        },
-        "agentic_atlas_direct": {
-            "type": "boolean",
-            "default": False,
-            "description": "Run agentic Atlas MCP evidence collection directly instead of waiting for fixed Atlas calls to fail.",
         },
         "mcp_servers_file": {"type": "string"},
     }

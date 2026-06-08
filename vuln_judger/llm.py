@@ -169,17 +169,19 @@ def build_llm_clients(
     enabled: bool,
     affirmative_provider: Optional[ProviderConfig] = None,
     negative_provider: Optional[ProviderConfig] = None,
+    moderator_provider: Optional[ProviderConfig] = None,
     legacy_model: Optional[str] = None,
     legacy_endpoint: Optional[str] = None,
-) -> tuple[Optional[LLMClient], Optional[LLMClient]]:
+) -> tuple[Optional[LLMClient], Optional[LLMClient], Optional[LLMClient]]:
     if not enabled:
-        return None, None
-    if affirmative_provider or negative_provider:
+        return None, None, None
+    if affirmative_provider or negative_provider or moderator_provider:
         affirmative = build_client_from_provider(affirmative_provider) if affirmative_provider else None
         negative = build_client_from_provider(negative_provider) if negative_provider else None
-        return affirmative, negative
+        moderator = build_client_from_provider(moderator_provider) if moderator_provider else None
+        return affirmative, negative, moderator
     legacy = build_legacy_llm_client(legacy_model, legacy_endpoint)
-    return legacy, legacy
+    return legacy, legacy, legacy
 
 
 def build_client_from_provider(provider: Optional[ProviderConfig], api_key_override: Optional[str] = None) -> Optional[LLMClient]:

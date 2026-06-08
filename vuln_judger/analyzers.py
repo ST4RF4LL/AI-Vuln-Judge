@@ -18,8 +18,6 @@ from .source import ResolvedLocation, SourceIndexer, detect_language, evidence_i
 class AnalyzerSettings:
     enabled: bool = True
     auto_index: bool = False
-    agentic_atlas: bool = True
-    agentic_atlas_direct: bool = False
     timeout_seconds: int = 30
     mcp_servers_file: Optional[Path] = None
 
@@ -65,15 +63,10 @@ class AtlasAnalyzer(Analyzer):
         primary = finding.primary_location
         if primary is None:
             return []
-        agentic_enabled = settings.agentic_atlas or settings.agentic_atlas_direct
         if not self.binary and not self._configured_mcp_server(settings):
             diagnostics = [_tool_unavailable(finding, self.name, "未找到 atlas 命令")]
-            if agentic_enabled:
-                return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
-            return diagnostics
+            return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
         resolved_locations = self._resolved_locations(finding, indexer)
-        if not resolved_locations and not agentic_enabled:
-            return []
         atlas_db = indexer.source_root / ".atlas" / "atlas.db"
         diagnostics: List[CodeEvidence] = []
         if not atlas_db.exists():
@@ -87,20 +80,16 @@ class AtlasAnalyzer(Analyzer):
                         source=self.name,
                     )
                 ]
-                if agentic_enabled:
-                    return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
-                return diagnostics
+                return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
             diagnostics.extend(self._index_project(finding, indexer, settings))
         if not atlas_db.exists():
-            return diagnostics + self._direct_source_evidence(finding, indexer) + (
-                self._agentic_source_reading_evidence(finding, indexer) if agentic_enabled else []
-            )
+            return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
         diagnostics.append(
             CodeEvidence(
                 evidence_id=evidence_id(finding.finding_id, self.name, "database-present"),
                 kind=EvidenceKind.TOOL_DIAGNOSTIC,
                 strength=EvidenceStrength.MEDIUM,
-                summary="检测到 Atlas 数据库 .atlas/atlas.db，将通过 Atlas MCP 输出数据流、调用图和源码上下文",
+                summary="检测到 Atlas 数据库 .atlas/atlas.db，将通过 AI 自主 Atlas MCP 输出数据流、调用图和源码上下文",
                 source=self.name,
                 data={"database": str(atlas_db), "mcp_preferred": True},
             )
@@ -116,31 +105,9 @@ class AtlasAnalyzer(Analyzer):
                     data={"database": str(atlas_db), "mcp_supported": False},
                 )
             )
-            return diagnostics + self._direct_source_evidence(finding, indexer) + (
-                self._agentic_source_reading_evidence(finding, indexer) if agentic_enabled else []
-            )
-        direct_source = self._direct_source_evidence(finding, indexer)
-        if settings.agentic_atlas_direct:
-            agentic_evidence = self._agentic_mcp_evidence(finding, indexer, settings, resolved_locations)
-            if _has_substantive_mcp_evidence(agentic_evidence):
-                return diagnostics + agentic_evidence + direct_source
-            return diagnostics + agentic_evidence + direct_source + self._agentic_source_reading_evidence(finding, indexer)
-        if not resolved_locations:
-            agentic_evidence = self._agentic_mcp_evidence(finding, indexer, settings, resolved_locations)
-            if _has_substantive_mcp_evidence(agentic_evidence):
-                return diagnostics + agentic_evidence + direct_source
-            return diagnostics + agentic_evidence + direct_source + self._agentic_source_reading_evidence(finding, indexer)
-        mcp_evidence = self._mcp_evidence(finding, indexer, settings, resolved_locations)
-        if not _has_complete_semantic_mcp_evidence(mcp_evidence):
-            diagnostics.extend(mcp_evidence)
-            if settings.agentic_atlas:
-                agentic_evidence = self._agentic_mcp_evidence(finding, indexer, settings, resolved_locations)
-                if _has_substantive_mcp_evidence(agentic_evidence):
-                    return diagnostics + agentic_evidence + direct_source
-                return diagnostics + agentic_evidence + direct_source + self._agentic_source_reading_evidence(finding, indexer)
-            diagnostics.extend(direct_source)
-            return diagnostics
-        return diagnostics + mcp_evidence + direct_source
+            return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
+        agentic_evidence = self._agentic_mcp_evidence(finding, indexer, settings, resolved_locations)
+        return diagnostics + agentic_evidence + self._agentic_source_reading_evidence(finding, indexer)
 
     def _resolved_locations(self, finding: Finding, indexer: SourceIndexer) -> List[ResolvedLocation]:
         resolved: List[ResolvedLocation] = []
@@ -306,7 +273,7 @@ class AtlasAnalyzer(Analyzer):
                         client.call_tool("project", {"action": "status", "verbose": True})
                     )
                     evidence.append(self._agentic_status_evidence(finding, status_payload, status_text, status_error))
-                    evidence.extend(self._agentic_file_evidence(client, finding, path_prefixes))
+                    evidence.extend(self._agentic_file_evidence(client, finding, indexer, path_prefixes))
                 if "search" in tools:
                     search_results = self._agentic_search_results(client, terms)
                     if search_results:
@@ -375,7 +342,7 @@ class AtlasAnalyzer(Analyzer):
         )
 
     def _agentic_file_evidence(
-        self, client: MCPStdioClient, finding: Finding, path_prefixes: Sequence[str]
+        self, client: MCPStdioClient, finding: Finding, indexer: SourceIndexer, path_prefixes: Sequence[str]
     ) -> List[CodeEvidence]:
         matched: Dict[str, Dict[str, Any]] = {}
         for prefix in path_prefixes[:12]:
@@ -387,6 +354,8 @@ class AtlasAnalyzer(Analyzer):
             for item in payload.get("files") or []:
                 path = str(item.get("path") or "")
                 if not path:
+                    continue
+                if not (indexer.source_root / path).exists():
                     continue
                 if _path_candidate_matches(path, prefix):
                     matched[path] = item
@@ -1167,21 +1136,6 @@ def _locations_from_mcp_entries(entries: Sequence[Dict[str, Any]], limit: int) -
             continue
         locations.append(SourceLocation(file=str(file), line=_optional_int(item.get("line"))))
     return locations
-
-
-def _has_substantive_mcp_evidence(evidence: Sequence[CodeEvidence]) -> bool:
-    return any(
-        item.data.get("mcp_success")
-        and item.kind in {EvidenceKind.SOURCE_LOCATION, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN}
-        for item in evidence
-    )
-
-
-def _has_complete_semantic_mcp_evidence(evidence: Sequence[CodeEvidence]) -> bool:
-    return all(
-        any(item.data.get("mcp_success") and item.kind == kind for item in evidence)
-        for kind in (EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN)
-    )
 
 
 def _agentic_query_terms(finding: Finding, limit: int = 24) -> List[str]:

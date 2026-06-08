@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_NEGATIVE_AGENT
+from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_NEGATIVE_AGENT
 from .evidence import EvidenceBundle
 from .llm import LLMClient
 from .models import (
@@ -43,15 +43,19 @@ class DebateOrchestrator:
         llm_client: Optional[LLMClient] = None,
         affirmative_client: Optional[LLMClient] = None,
         negative_client: Optional[LLMClient] = None,
+        moderator_client: Optional[LLMClient] = None,
         affirmative_agent: Optional[AgentConfig] = None,
         negative_agent: Optional[AgentConfig] = None,
+        moderator_agent: Optional[AgentConfig] = None,
         progress_callback: Optional[Callable[[VerdictReport], None]] = None,
     ):
         self.max_rounds = max_rounds
         self.affirmative_client = affirmative_client or llm_client
         self.negative_client = negative_client or llm_client
+        self.moderator_client = moderator_client or llm_client
         self.affirmative_agent = _agent_or_default(affirmative_agent, DEFAULT_AFFIRMATIVE_AGENT)
         self.negative_agent = _agent_or_default(negative_agent, DEFAULT_NEGATIVE_AGENT)
+        self.moderator_agent = _agent_or_default(moderator_agent, DEFAULT_MODERATOR_AGENT)
         self.progress_callback = progress_callback
 
     def adjudicate(self, bundle: EvidenceBundle) -> VerdictReport:
@@ -92,6 +96,11 @@ class DebateOrchestrator:
                 "提交完整正方证据报告。目标固定为：证明报告发现能否由外部接口或内部接口调用触发，"
                 "给出准确函数调用链、源到汇数据流、攻击链、攻击前提、直接影响和必要限制。"
                 "所有 Atlas、rg/grep 和源码阅读都必须围绕报告位置、报告符号、codeFlow 或其调用邻域验证，不得用全项目无关命中混充证据。"
+                "调用链分析必须优先使用 Atlas search/trace/calls 向上游追溯，直到到达外部输入源头（用户输入、文件输入、网络报文输入、命令行参数、标准输入、请求参数或消息队列载荷等）。"
+                "当 Atlas 无法继续追溯、trace partial/empty/No data node、calls 缺边、search 未命中或疑似无法解析间接调用时，不得直接判为证据不足或误报；"
+                "应合理怀疑 Atlas 未正确处理调用链关系，转用源码阅读和 grep/ripgrep 围绕报告路径、符号、调用邻域、入口函数名、参数名、源点词和汇点词补证。"
+                "一旦源码阅读或 grep/ripgrep 找到当前调用链、上游调用者或数据流节点，必须转回 Atlas 对新发现上游符号继续追溯。"
+                "只有 Atlas、源码阅读、grep/ripgrep 与交叉验证均失败时，才可怀疑报告为误报、不可利用漏洞或证据不足。"
                 "如有证据缺口，应主动从已有证据中交叉验证补强（如从 calls 调用图反查数据流、从源码片段拼接路径、用报告附近符号补全 search 遗漏），"
                 "只有在穷尽补强手段后才可标注为证据限制，并说明尝试过哪些补强方法。"
                 "防护消减只在源码或 Skill/项目上下文存在明确防护证据时分析；没有证据就不要引入防护消减假设。"
@@ -100,10 +109,11 @@ class DebateOrchestrator:
             extra=_stage_context(
                 "正方第一回合",
                 (
-                    "优先使用 Atlas MCP 证据。若证据显示 Atlas 数据库缺失，才可说明需要执行 "
+                    "优先使用 Atlas MCP 证据向上游追溯到外部输入源头。若证据显示 Atlas 数据库缺失，才可说明需要执行 "
                     "`atlas index --analysis full`；若证据显示 Atlas MCP 已返回 project/status、project/files、trace 或 calls，"
-                    "必须引用这些证据判断源码真实性、调用图和数据流。只有在 MCP 不可用且 CLI trace 子命令不可用时，"
-                    "才可表述为“Atlas 已索引但当前工具无法导出数据流 trace”，不得说 .atlas 缺失或未构建。"
+                    "必须引用这些证据判断源码真实性、调用图和数据流。Atlas 缺边、未命中或 trace 不完整时，先合理怀疑工具未正确处理调用链，"
+                    "转用源码阅读和 grep/ripgrep 定位调用链或数据流；找到新上游节点后再回到 Atlas 继续追溯。只有这些路径均失败时，"
+                    "才可怀疑误报、不可利用漏洞或证据不足。不得说 .atlas 缺失或未构建，除非证据明确显示数据库缺失。"
                 ),
                 challenges,
                 _affirmative_evidence_hunting_context(bundle),
@@ -149,8 +159,9 @@ class DebateOrchestrator:
                 "AFFIRMATIVE",
                 (
                     "逐项回应反方质疑。每个质疑点都要给出：可被证据支持的澄清、用交叉验证补强的论证、仍未闭环的限制。"
-                    "不要直接承认证据不足——先从调用图反查、源码片段分析、附近符号搜索、调用方/被调用方拼接等手段尝试补证。"
-                    "只有当所有补强方法均无法闭合时，才明确说明尝试过的手段及剩余缺口。"
+                    "不要直接承认证据不足——先用 Atlas 向上游追到外部输入源头；Atlas 无法推进时，转用源码阅读和 grep/ripgrep 搜索调用邻域、入口函数、源点词和汇点词。"
+                    "如果源码阅读或 grep/ripgrep 找到新的上游调用者或数据流节点，必须回到 Atlas 对该节点继续追溯。"
+                    "只有当 Atlas、源码阅读、grep/ripgrep 和交叉验证均无法闭合时，才明确说明尝试过的手段及剩余缺口，并考虑误报或不可利用。"
                     "对攻击链/前提/影响结论如有修正必须给出新的证据引用。"
                 ),
                 bundle,
@@ -213,7 +224,17 @@ class DebateOrchestrator:
         )
         self._emit_progress(bundle, base_decision, turns)
         negative_final = self._side_conclusion("NEGATIVE", bundle, base_decision, challenges, last_negative)
-        final_conclusion = _final_conclusion(affirmative_final, negative_final)
+        side_final_conclusion = _final_conclusion(affirmative_final, negative_final)
+        moderator_summary = self._moderator_summary(
+            bundle,
+            base_decision,
+            challenges,
+            affirmative_final,
+            negative_final,
+            side_final_conclusion,
+            turns,
+        )
+        final_conclusion = moderator_summary or side_final_conclusion
         decision = _decision_from_conclusions(base_decision, affirmative_final, negative_final, final_conclusion)
         turns.append(
             DebateTurn(
@@ -281,10 +302,10 @@ class DebateOrchestrator:
         return challenges
 
     def _llm_claim(self, role: str, task: str, bundle: EvidenceBundle, extra: str) -> Optional[str]:
-        client = self.affirmative_client if role == "AFFIRMATIVE" else self.negative_client
+        client = self._client_for_role(role)
         if client is None:
             return None
-        agent = self.affirmative_agent if role == "AFFIRMATIVE" else self.negative_agent
+        agent = self._agent_for_role(role)
         role_label = _role_label(role)
         agent_name = agent.name.strip() or role_label
         agent_instructions = agent.instructions.strip()
@@ -302,13 +323,27 @@ class DebateOrchestrator:
             f"证据：\n" + _evidence_prompt(bundle.evidence) + "\n"
             "证据解释约束：SOURCE_ROOT 只能证明任务已配置源码根目录，不能替代具体 SOURCE_LOCATION、CALL_CHAIN 或 DATA_FLOW；"
             "rg/grep 证据必须围绕报告位置、报告符号、codeFlow 或调用邻域解释，只能作为候选补证，不能单独证明源汇可达；"
-            "若存在 atlas-mcp 证据，应优先按 MCP 的 project/status、project/files、trace、calls 结果研判；"
+            "若存在 atlas-agent-mcp 证据，应优先按 MCP 的 project/status、project/files、trace、calls 结果研判；"
             "若 Atlas 数据库存在但 trace 结果为 empty/partial/No data node，应转而从 calls 调用图和源码片段交叉验证重构数据流；"
             "若 Atlas 数据库存在但 trace_supported=false，只能说明当前工具无法导出 trace，不得说 .atlas 缺失或未构建。\n"
             f"补充上下文或质疑：\n{extra}\n"
             "请用中文写一个可审计的辩论回合，不要使用 Markdown 表格。"
         )
         return client.complete(system, user)
+
+    def _client_for_role(self, role: str) -> Optional[LLMClient]:
+        if role == "AFFIRMATIVE":
+            return self.affirmative_client
+        if role == "NEGATIVE":
+            return self.negative_client
+        return self.moderator_client
+
+    def _agent_for_role(self, role: str) -> AgentConfig:
+        if role == "AFFIRMATIVE":
+            return self.affirmative_agent
+        if role == "NEGATIVE":
+            return self.negative_agent
+        return self.moderator_agent
 
     def _affirmative_reply(self, bundle: EvidenceBundle, challenges: Sequence[str]) -> str:
         evidence = bundle.evidence
@@ -346,6 +381,44 @@ class DebateOrchestrator:
         if llm_statement:
             statement = _clean_final_statement(llm_statement, label) or statement
         return SideConclusion(label=label, verdict=verdict, statement=statement)
+
+    def _moderator_summary(
+        self,
+        bundle: EvidenceBundle,
+        decision: DebateDecision,
+        challenges: Sequence[str],
+        affirmative_final: SideConclusion,
+        negative_final: SideConclusion,
+        side_final_conclusion: str,
+        turns: Sequence[DebateTurn],
+    ) -> Optional[str]:
+        turn_context = "\n\n".join(
+            f"{_role_label(turn.role.value)}第 {turn.round_index} 回合：\n{turn.claim}" for turn in turns[-6:]
+        )
+        llm_summary = self._llm_claim(
+            "MODERATOR",
+            (
+                "作为中立 Moderator，总结正反方核心观点、双方一致点、主要分歧、证据闭环状态和最终研判。"
+                "不得新增证据链之外的新事实；不得替任一方辩护；只基于双方陈述和证据 ID 做客观归纳。"
+                "输出 2 到 5 句话，不要使用 Markdown 表格。"
+            ),
+            bundle,
+            extra=_stage_context(
+                "主持人总结",
+                (
+                    f"正方结案：【{affirmative_final.label}】，{affirmative_final.statement}\n"
+                    f"反方结案：【{negative_final.label}】，{negative_final.statement}\n"
+                    f"自动裁决摘要：{decision.reasoning_summary}\n"
+                    f"当前合成结论：{side_final_conclusion}\n"
+                    f"最近回合：\n{turn_context}"
+                ),
+                challenges,
+                "",
+            ),
+        )
+        if not llm_summary:
+            return None
+        return _clean_moderator_summary(llm_summary)
 
     def _decide(self, bundle: EvidenceBundle) -> DebateDecision:
         evidence = bundle.evidence
@@ -566,8 +639,7 @@ def _data_excerpt(item: CodeEvidence) -> str:
         "code_flow_count",
         "missing_evidence",
         "suggested_actions",
-        "agentic_atlas_enabled",
-        "agentic_atlas_direct",
+        "atlas_mode",
         "auto_index_tools",
         "indexed_files",
         "indexed_file_count",
@@ -673,7 +745,11 @@ def _affirmative_evidence_hunting_context(bundle: EvidenceBundle) -> str:
         lines.append(f"- 引用 `{item.evidence_id}`：{item.summary}")
         for action in (item.data.get("suggested_actions") or [])[:5]:
             lines.append(f"  - {action}")
-    lines.append("执行要求：优先补充 SOURCE_LOCATION、DATA_FLOW、CALL_CHAIN 和 TOOL_DIAGNOSTIC 证据引用；如果仍失败，必须说明已尝试的源码分析、Atlas 检查和交叉验证路径。")
+    lines.append(
+        "执行要求：优先补充 SOURCE_LOCATION、DATA_FLOW、CALL_CHAIN 和 TOOL_DIAGNOSTIC 证据引用；"
+        "调用链应先用 Atlas 追到外部输入源头，Atlas 无法推进时转用源码分析和 grep/ripgrep，"
+        "找到新上游节点后再回到 Atlas 继续追溯；如果仍失败，必须说明已尝试的源码分析、Atlas 检查和交叉验证路径。"
+    )
     return "\n".join(lines)
 
 
@@ -821,6 +897,16 @@ def _clean_final_statement(text: str, label: str) -> str:
     return statement[:500]
 
 
+def _clean_moderator_summary(text: str) -> str:
+    lines = [line.strip("# -*\t ") for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        return ""
+    statement = " ".join(lines[:5]).strip()
+    if _looks_like_task_echo(statement):
+        return ""
+    return statement[:1000]
+
+
 def _looks_like_task_echo(statement: str) -> bool:
     normalized = re.sub(r"\s+", "", statement.lower())
     markers = (
@@ -835,8 +921,11 @@ def _looks_like_task_echo(statement: str) -> bool:
         "markdown表格",
         "作为正方",
         "作为反方",
+        "作为中立moderator",
+        "作为主持人",
         "affirmative_default",
         "negative_default",
+        "moderator_default",
         "给出最终结案陈述",
         "给出唯一结论标签",
     )

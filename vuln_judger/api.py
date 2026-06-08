@@ -120,7 +120,13 @@ def make_handler(
                     return
                 if parts == ["providers", "defaults"]:
                     payload = self._read_json()
-                    self._json(provider_store.set_defaults(payload.get("affirmative"), payload.get("negative")))
+                    self._json(
+                        provider_store.set_defaults(
+                            payload.get("affirmative"),
+                            payload.get("negative"),
+                            payload.get("moderator"),
+                        )
+                    )
                     return
                 if parts == ["agent-prompts"]:
                     payload = self._read_json()
@@ -394,11 +400,14 @@ def _config_from_payload(
         raise ValueError("report_path 或 sarif_path 不能为空")
     affirmative_agent = _agent_config_from_payload(payload, "affirmative")
     negative_agent = _agent_config_from_payload(payload, "negative")
+    moderator_agent = _agent_config_from_payload(payload, "moderator")
     if agent_store is not None:
         if affirmative_agent is None:
             affirmative_agent = agent_store.agent("affirmative", payload.get("affirmative_agent_profile"))
         if negative_agent is None:
             negative_agent = agent_store.agent("negative", payload.get("negative_agent_profile"))
+        if moderator_agent is None:
+            moderator_agent = agent_store.agent("moderator", payload.get("moderator_agent_profile"))
     return RunConfig(
         sarif_path=Path(report_path),
         source_path=Path(payload["source_path"]),
@@ -408,16 +417,16 @@ def _config_from_payload(
         run_id=run_id,
         max_rounds=int(payload.get("max_rounds") or 4),
         auto_index_tools=bool(payload.get("auto_index_tools") or False),
-        agentic_atlas=bool(payload.get("agentic_atlas", True)),
-        agentic_atlas_direct=bool(payload.get("agentic_atlas_direct", False)),
         enable_external_tools=bool(payload.get("enable_external_tools", True)),
         enable_llm=bool(payload.get("enable_llm", False)),
         llm_model=payload.get("llm_model"),
         llm_endpoint=payload.get("llm_endpoint"),
         affirmative_provider_id=payload.get("affirmative_provider_id"),
         negative_provider_id=payload.get("negative_provider_id"),
+        moderator_provider_id=payload.get("moderator_provider_id"),
         affirmative_agent=affirmative_agent,
         negative_agent=negative_agent,
+        moderator_agent=moderator_agent,
     )
 
 
@@ -630,6 +639,7 @@ def _agent_task_metadata(config: RunConfig) -> dict:
     return {
         "affirmative": to_jsonable(config.affirmative_agent) if config.affirmative_agent else None,
         "negative": to_jsonable(config.negative_agent) if config.negative_agent else None,
+        "moderator": to_jsonable(config.moderator_agent) if config.moderator_agent else None,
     }
 
 
@@ -957,9 +967,17 @@ def app_html() -> str:
       height: auto;
       overflow: visible;
     }}
-    #mcp-server-panel,
-    #skill-source-panel {{
-      overflow: visible;
+    #integrations-modal .settings-body {{
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      align-content: stretch;
+    }}
+    #integrations-modal .detail {{
+      flex: 0 0 auto;
+      min-width: 0;
+      overflow: hidden;
+      position: relative;
     }}
     #agent-affirmative-profile-panel .detail-body,
     #agent-negative-profile-panel .detail-body {{
@@ -970,12 +988,10 @@ def app_html() -> str:
     #mcp-server-panel {{
       min-height: 0;
       height: auto;
-      overflow: visible;
     }}
     #skill-source-panel {{
-      min-height: 520px;
+      min-height: 0;
       height: auto;
-      overflow: visible;
     }}
     #mcp-server-panel .detail-body,
     #skill-source-panel .detail-body {{
@@ -1200,7 +1216,7 @@ def app_html() -> str:
       <div class="settings-head">
         <div>
           <h2 id="providers-title">LLM 提供商</h2>
-          <div class="muted">为正方和反方 Agent 配置 OpenAI 兼容 API。</div>
+          <div class="muted">为正方、反方和主持人 Agent 配置 OpenAI 兼容 API。</div>
         </div>
         <button id="close-providers" type="button" title="关闭提供商设置">关闭</button>
       </div>
@@ -1219,6 +1235,7 @@ def app_html() -> str:
               <label class="wide">额外 JSON<textarea id="provider-extra" placeholder='{{"temperature":0.1,"max_tokens":1200}}'></textarea></label>
               <label>正方默认提供商<select id="default-affirmative"></select></label>
               <label>反方默认提供商<select id="default-negative"></select></label>
+              <label>主持人默认提供商<select id="default-moderator"></select></label>
             </div>
             <div class="toolbar">
               <button id="save-provider" type="button">保存提供商</button>
@@ -1238,7 +1255,7 @@ def app_html() -> str:
       <div class="settings-head">
         <div>
           <h2 id="agent-prompts-title">Agent 配置</h2>
-          <div class="muted">配置正方/反方配置档案目录和 AGENT.md 提示词。</div>
+          <div class="muted">配置正方、反方和主持人配置档案目录和 AGENT.md 提示词。</div>
         </div>
         <button id="close-agent-prompts" type="button" title="关闭 Agent 提示词设置">关闭</button>
       </div>
@@ -1270,6 +1287,21 @@ def app_html() -> str:
             <div class="toolbar">
               <button id="new-negative-agent" type="button">新增反方 Agent</button>
               <button id="save-negative-agent" type="button">保存反方 Agent</button>
+            </div>
+          </div>
+        </div>
+        <div class="detail" id="agent-moderator-profile-panel">
+          <h3>主持人配置档案</h3>
+          <div class="detail-body">
+            <div class="profile-grid" id="agent-moderator-profile-list"></div>
+            <div class="form-grid">
+              <label>主持人配置档案<select id="agent-moderator-profile"></select></label>
+              <label>主持人配置档案 ID<input id="agent-moderator-profile-id" placeholder="Moderator_default"></label>
+              <label class="wide">主持人 AGENT.md<textarea id="agent-moderator-instructions"></textarea></label>
+            </div>
+            <div class="toolbar">
+              <button id="new-moderator-agent" type="button">新增主持人 Agent</button>
+              <button id="save-moderator-agent" type="button">保存主持人 Agent</button>
             </div>
           </div>
         </div>
@@ -1372,13 +1404,13 @@ def app_html() -> str:
                 <label>正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
                 <label>反方提供商<select id="run-negative-provider"></select></label>
                 <label>反方 Agent 配置档案<select id="run-negative-agent-profile"></select></label>
+                <label>主持人提供商<select id="run-moderator-provider"></select></label>
+                <label>主持人 Agent 配置档案<select id="run-moderator-agent-profile"></select></label>
               </div>
             </div>
             <div class="chips">
               <label><input id="run-external-tools" type="checkbox" checked> 启用外部工具</label>
               <label><input id="run-auto-index" type="checkbox"> 自动 Atlas 构建索引</label>
-              <label><input id="run-agentic-atlas" type="checkbox" checked> AI 自主 Atlas 补证</label>
-              <label><input id="run-agentic-atlas-direct" type="checkbox"> 直接 AI 自主运行 Atlas MCP</label>
               <label><input id="run-llm" type="checkbox"> 使用 LLM 博弈</label>
             </div>
             <div class="toolbar">
@@ -1420,6 +1452,7 @@ def app_html() -> str:
       providerExtra: document.getElementById('provider-extra'),
       defaultAffirmative: document.getElementById('default-affirmative'),
       defaultNegative: document.getElementById('default-negative'),
+      defaultModerator: document.getElementById('default-moderator'),
       mcpList: document.getElementById('mcp-list'),
       mcpId: document.getElementById('mcp-id'),
       mcpName: document.getElementById('mcp-name'),
@@ -1442,12 +1475,16 @@ def app_html() -> str:
       defaultSkillSource: document.getElementById('default-skill-source'),
       agentAffirmativeProfileList: document.getElementById('agent-affirmative-profile-list'),
       agentNegativeProfileList: document.getElementById('agent-negative-profile-list'),
+      agentModeratorProfileList: document.getElementById('agent-moderator-profile-list'),
       agentAffirmativeProfile: document.getElementById('agent-affirmative-profile'),
       agentNegativeProfile: document.getElementById('agent-negative-profile'),
+      agentModeratorProfile: document.getElementById('agent-moderator-profile'),
       agentAffirmativeProfileId: document.getElementById('agent-affirmative-profile-id'),
       agentNegativeProfileId: document.getElementById('agent-negative-profile-id'),
+      agentModeratorProfileId: document.getElementById('agent-moderator-profile-id'),
       agentAffirmativeInstructions: document.getElementById('agent-affirmative-instructions'),
       agentNegativeInstructions: document.getElementById('agent-negative-instructions'),
+      agentModeratorInstructions: document.getElementById('agent-moderator-instructions'),
       runSarif: document.getElementById('run-sarif'),
       runSource: document.getElementById('run-source'),
       runSkillSource: document.getElementById('run-skill-source'),
@@ -1455,12 +1492,12 @@ def app_html() -> str:
       runMaxRounds: document.getElementById('run-max-rounds'),
       runAffirmativeProvider: document.getElementById('run-affirmative-provider'),
       runNegativeProvider: document.getElementById('run-negative-provider'),
+      runModeratorProvider: document.getElementById('run-moderator-provider'),
       runAffirmativeAgentProfile: document.getElementById('run-affirmative-agent-profile'),
       runNegativeAgentProfile: document.getElementById('run-negative-agent-profile'),
+      runModeratorAgentProfile: document.getElementById('run-moderator-agent-profile'),
       runExternalTools: document.getElementById('run-external-tools'),
       runAutoIndex: document.getElementById('run-auto-index'),
-      runAgenticAtlas: document.getElementById('run-agentic-atlas'),
-      runAgenticAtlasDirect: document.getElementById('run-agentic-atlas-direct'),
       runLlm: document.getElementById('run-llm'),
       runResult: document.getElementById('run-result'),
     }};
@@ -1519,8 +1556,10 @@ def app_html() -> str:
     document.getElementById('save-defaults').addEventListener('click', saveDefaults);
     document.getElementById('new-affirmative-agent').addEventListener('click', () => newAgentProfile('affirmative'));
     document.getElementById('new-negative-agent').addEventListener('click', () => newAgentProfile('negative'));
+    document.getElementById('new-moderator-agent').addEventListener('click', () => newAgentProfile('moderator'));
     document.getElementById('save-affirmative-agent').addEventListener('click', () => saveAgentProfile('affirmative'));
     document.getElementById('save-negative-agent').addEventListener('click', () => saveAgentProfile('negative'));
+    document.getElementById('save-moderator-agent').addEventListener('click', () => saveAgentProfile('moderator'));
     document.getElementById('reset-agent-prompts').addEventListener('click', resetAgentPrompts);
     document.getElementById('save-mcp').addEventListener('click', saveMcpServer);
     document.getElementById('test-mcp').addEventListener('click', testMcpServer);
@@ -1535,9 +1574,11 @@ def app_html() -> str:
     document.getElementById('fill-markdown-demo-run').addEventListener('click', fillMarkdownDemoRun);
     el.runAffirmativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
     el.runNegativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
+    el.runModeratorProvider.addEventListener('change', enableRunLlmForSelectedProviders);
     el.runSkillSource.addEventListener('change', fillRunSkillSource);
     el.agentAffirmativeProfile.addEventListener('change', () => fillAgentProfileEditor('affirmative'));
     el.agentNegativeProfile.addEventListener('change', () => fillAgentProfileEditor('negative'));
+    el.agentModeratorProfile.addEventListener('change', () => fillAgentProfileEditor('moderator'));
 
     function esc(value) {{
       return String(value ?? '').replace(/[&<>"']/g, ch => ({{
@@ -1754,8 +1795,10 @@ def app_html() -> str:
         MODERATOR: '主持人',
         affirmative: '正方',
         negative: '反方',
+        moderator: '主持人',
         Affirmative: '正方',
-        Negative: '反方'
+        Negative: '反方',
+        Moderator: '主持人'
       }};
       return labels[role] || role || '未知角色';
     }}
@@ -2025,22 +2068,31 @@ def app_html() -> str:
     function renderAgentPrompts() {{
       const currentAffirmative = el.agentAffirmativeProfile.value;
       const currentNegative = el.agentNegativeProfile.value;
+      const currentModerator = el.agentModeratorProfile.value;
       const currentRunAffirmative = el.runAffirmativeAgentProfile.value;
       const currentRunNegative = el.runNegativeAgentProfile.value;
+      const currentRunModerator = el.runModeratorAgentProfile.value;
       const affirmativeOptions = profileOptions('affirmative');
       const negativeOptions = profileOptions('negative');
+      const moderatorOptions = profileOptions('moderator');
       el.agentAffirmativeProfile.innerHTML = affirmativeOptions;
       el.agentNegativeProfile.innerHTML = negativeOptions;
+      el.agentModeratorProfile.innerHTML = moderatorOptions;
       el.runAffirmativeAgentProfile.innerHTML = affirmativeOptions;
       el.runNegativeAgentProfile.innerHTML = negativeOptions;
+      el.runModeratorAgentProfile.innerHTML = moderatorOptions;
       el.agentAffirmativeProfile.value = profileExists('affirmative', currentAffirmative) ? currentAffirmative : defaultProfileId('affirmative');
       el.agentNegativeProfile.value = profileExists('negative', currentNegative) ? currentNegative : defaultProfileId('negative');
+      el.agentModeratorProfile.value = profileExists('moderator', currentModerator) ? currentModerator : defaultProfileId('moderator');
       el.runAffirmativeAgentProfile.value = profileExists('affirmative', currentRunAffirmative) ? currentRunAffirmative : defaultProfileId('affirmative');
       el.runNegativeAgentProfile.value = profileExists('negative', currentRunNegative) ? currentRunNegative : defaultProfileId('negative');
+      el.runModeratorAgentProfile.value = profileExists('moderator', currentRunModerator) ? currentRunModerator : defaultProfileId('moderator');
       renderAgentProfileCards('affirmative');
       renderAgentProfileCards('negative');
+      renderAgentProfileCards('moderator');
       fillAgentProfileEditor('affirmative');
       fillAgentProfileEditor('negative');
+      fillAgentProfileEditor('moderator');
     }}
 
     function profileOptions(role) {{
@@ -2067,13 +2119,43 @@ def app_html() -> str:
       return profilesFor(role).find(profile => profile.profile_id === profileId) || profilesFor(role)[0] || null;
     }}
 
+    function agentProfileListEl(role) {{
+      return role === 'affirmative' ? el.agentAffirmativeProfileList
+        : role === 'negative' ? el.agentNegativeProfileList
+        : el.agentModeratorProfileList;
+    }}
+
+    function agentProfileSelectEl(role) {{
+      return role === 'affirmative' ? el.agentAffirmativeProfile
+        : role === 'negative' ? el.agentNegativeProfile
+        : el.agentModeratorProfile;
+    }}
+
+    function agentProfileIdEl(role) {{
+      return role === 'affirmative' ? el.agentAffirmativeProfileId
+        : role === 'negative' ? el.agentNegativeProfileId
+        : el.agentModeratorProfileId;
+    }}
+
+    function agentInstructionsEl(role) {{
+      return role === 'affirmative' ? el.agentAffirmativeInstructions
+        : role === 'negative' ? el.agentNegativeInstructions
+        : el.agentModeratorInstructions;
+    }}
+
+    function runAgentProfileSelectEl(role) {{
+      return role === 'affirmative' ? el.runAffirmativeAgentProfile
+        : role === 'negative' ? el.runNegativeAgentProfile
+        : el.runModeratorAgentProfile;
+    }}
+
     function renderAgentProfileCards(role) {{
-      const container = role === 'affirmative' ? el.agentAffirmativeProfileList : el.agentNegativeProfileList;
+      const container = agentProfileListEl(role);
       const profiles = profilesFor(role);
       container.innerHTML = profiles.map(profile => profileCard(role, profile)).join('') || '<div class="muted">未找到配置档案。</div>';
       for (const button of container.querySelectorAll('button[data-agent-edit]')) {{
         button.addEventListener('click', () => {{
-          const select = role === 'affirmative' ? el.agentAffirmativeProfile : el.agentNegativeProfile;
+          const select = agentProfileSelectEl(role);
           select.value = button.dataset.profileId;
           fillAgentProfileEditor(role);
         }});
@@ -2110,18 +2192,18 @@ def app_html() -> str:
     }}
 
     function fillAgentProfileEditor(role) {{
-      const select = role === 'affirmative' ? el.agentAffirmativeProfile : el.agentNegativeProfile;
-      const idInput = role === 'affirmative' ? el.agentAffirmativeProfileId : el.agentNegativeProfileId;
-      const promptInput = role === 'affirmative' ? el.agentAffirmativeInstructions : el.agentNegativeInstructions;
+      const select = agentProfileSelectEl(role);
+      const idInput = agentProfileIdEl(role);
+      const promptInput = agentInstructionsEl(role);
       const profile = findAgentProfile(role, select.value);
       idInput.value = profile ? profile.profile_id : '';
       promptInput.value = profile ? profile.instructions : '';
     }}
 
     function newAgentProfile(role) {{
-      const idInput = role === 'affirmative' ? el.agentAffirmativeProfileId : el.agentNegativeProfileId;
-      const promptInput = role === 'affirmative' ? el.agentAffirmativeInstructions : el.agentNegativeInstructions;
-      const prefix = role === 'affirmative' ? 'Affirmative_custom' : 'Negative_custom';
+      const idInput = agentProfileIdEl(role);
+      const promptInput = agentInstructionsEl(role);
+      const prefix = role === 'affirmative' ? 'Affirmative_custom' : role === 'negative' ? 'Negative_custom' : 'Moderator_custom';
       const profileId = nextAgentProfileId(role, prefix);
       const baseProfile = findAgentProfile(role, defaultProfileId(role)) || findAgentProfile(role, '');
       idInput.value = profileId;
@@ -2143,12 +2225,12 @@ def app_html() -> str:
 
     async function saveAgentProfile(role) {{
       try {{
-        const profileId = role === 'affirmative' ? el.agentAffirmativeProfileId.value.trim() : el.agentNegativeProfileId.value.trim();
-        const instructions = role === 'affirmative' ? el.agentAffirmativeInstructions.value.trim() : el.agentNegativeInstructions.value.trim();
+        const profileId = agentProfileIdEl(role).value.trim();
+        const instructions = agentInstructionsEl(role).value.trim();
         const saved = await fetchJson('/agent-prompts', jsonPost({{ role, profile_id: profileId, instructions }}));
         await loadAgentPrompts();
-        const select = role === 'affirmative' ? el.agentAffirmativeProfile : el.agentNegativeProfile;
-        const runSelect = role === 'affirmative' ? el.runAffirmativeAgentProfile : el.runNegativeAgentProfile;
+        const select = agentProfileSelectEl(role);
+        const runSelect = runAgentProfileSelectEl(role);
         select.value = saved.profile_id;
         runSelect.value = saved.profile_id;
         fillAgentProfileEditor(role);
@@ -2201,17 +2283,21 @@ def app_html() -> str:
       )).join('');
       el.defaultAffirmative.innerHTML = options;
       el.defaultNegative.innerHTML = options;
+      el.defaultModerator.innerHTML = options;
       el.runAffirmativeProvider.innerHTML = options;
       el.runNegativeProvider.innerHTML = options;
+      el.runModeratorProvider.innerHTML = options;
       el.defaultAffirmative.value = state.defaults.affirmative || '';
       el.defaultNegative.value = state.defaults.negative || '';
+      el.defaultModerator.value = state.defaults.moderator || '';
       el.runAffirmativeProvider.value = state.defaults.affirmative || '';
       el.runNegativeProvider.value = state.defaults.negative || '';
+      el.runModeratorProvider.value = state.defaults.moderator || '';
       enableRunLlmForSelectedProviders();
     }}
 
     function enableRunLlmForSelectedProviders() {{
-      if (el.runAffirmativeProvider.value || el.runNegativeProvider.value) {{
+      if (el.runAffirmativeProvider.value || el.runNegativeProvider.value || el.runModeratorProvider.value) {{
         el.runLlm.checked = true;
       }}
     }}
@@ -2276,7 +2362,8 @@ def app_html() -> str:
       try {{
         const defaults = await fetchJson('/providers/defaults', jsonPost({{
           affirmative: el.defaultAffirmative.value || null,
-          negative: el.defaultNegative.value || null
+          negative: el.defaultNegative.value || null,
+          moderator: el.defaultModerator.value || null
         }}));
         state.defaults = defaults;
         el.providerResult.textContent = JSON.stringify(defaults, null, 2);
@@ -2293,8 +2380,6 @@ def app_html() -> str:
       el.runMaxRounds.value = '4';
       el.runExternalTools.checked = false;
       el.runAutoIndex.checked = false;
-      el.runAgenticAtlas.checked = true;
-      el.runAgenticAtlasDirect.checked = false;
       enableRunLlmForSelectedProviders();
       el.runResult.textContent = '已填入 SARIF 示例路径。';
     }}
@@ -2307,8 +2392,6 @@ def app_html() -> str:
       el.runMaxRounds.value = '4';
       el.runExternalTools.checked = false;
       el.runAutoIndex.checked = false;
-      el.runAgenticAtlas.checked = true;
-      el.runAgenticAtlasDirect.checked = false;
       enableRunLlmForSelectedProviders();
       el.runResult.textContent = '已填入 Markdown 示例路径。';
     }}
@@ -2323,13 +2406,13 @@ def app_html() -> str:
           max_rounds: Number(el.runMaxRounds.value || 4),
           enable_external_tools: el.runExternalTools.checked,
           auto_index_tools: el.runAutoIndex.checked,
-          agentic_atlas: el.runAgenticAtlas.checked,
-          agentic_atlas_direct: el.runAgenticAtlasDirect.checked,
           enable_llm: el.runLlm.checked,
           affirmative_provider_id: el.runAffirmativeProvider.value || null,
           negative_provider_id: el.runNegativeProvider.value || null,
+          moderator_provider_id: el.runModeratorProvider.value || null,
           affirmative_agent_profile: el.runAffirmativeAgentProfile.value || null,
-          negative_agent_profile: el.runNegativeAgentProfile.value || null
+          negative_agent_profile: el.runNegativeAgentProfile.value || null,
+          moderator_agent_profile: el.runModeratorAgentProfile.value || null
         }};
         if (!payload.report_path || !payload.source_path) {{
           throw new Error('报告路径和源码路径不能为空。');
@@ -2567,8 +2650,10 @@ def app_html() -> str:
             <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
             <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
             <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
+            <div><strong>主持人 LLM：</strong> ${{esc(providerLabel(providers.moderator, providers.enabled))}}</div>
             <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
             <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
+            <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
             ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}
             ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : `<div class="muted">${{esc(runningMessage)}}</div>`}}
             ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
@@ -2600,8 +2685,10 @@ def app_html() -> str:
             <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
             <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
             <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
+            <div><strong>主持人 LLM：</strong> ${{esc(providerLabel(providers.moderator, providers.enabled))}}</div>
             <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
             <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
+            <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
             ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}
             ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
           </div>
@@ -2696,6 +2783,9 @@ def app_html() -> str:
       }}
       if (agents.negative && agents.negative.instructions) {{
         lines.push(`反方 / ${{agentLabel(agents.negative)}}：\\n${{agents.negative.instructions}}`);
+      }}
+      if (agents.moderator && agents.moderator.instructions) {{
+        lines.push(`主持人 / ${{agentLabel(agents.moderator)}}：\\n${{agents.moderator.instructions}}`);
       }}
       return lines.join('\\n\\n');
     }}

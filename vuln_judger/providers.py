@@ -95,6 +95,8 @@ class ProviderStore:
             defaults["affirmative"] = None
         if defaults.get("negative") == provider_id:
             defaults["negative"] = None
+        if defaults.get("moderator") == provider_id:
+            defaults["moderator"] = None
         if removed:
             self._save(data)
         return removed
@@ -104,16 +106,24 @@ class ProviderStore:
         return {
             "affirmative": defaults.get("affirmative"),
             "negative": defaults.get("negative"),
+            "moderator": defaults.get("moderator"),
         }
 
-    def set_defaults(self, affirmative: Optional[str], negative: Optional[str]) -> Dict[str, Optional[str]]:
+    def set_defaults(
+        self,
+        affirmative: Optional[str],
+        negative: Optional[str],
+        moderator: Optional[str] = None,
+    ) -> Dict[str, Optional[str]]:
         providers = self._providers()
         if affirmative and affirmative not in providers:
             raise ValueError(f"未知正方提供商：{affirmative}")
         if negative and negative not in providers:
             raise ValueError(f"未知反方提供商：{negative}")
+        if moderator and moderator not in providers:
+            raise ValueError(f"未知主持人提供商：{moderator}")
         data = self._load()
-        data["defaults"] = {"affirmative": affirmative, "negative": negative}
+        data["defaults"] = {"affirmative": affirmative, "negative": negative, "moderator": moderator}
         self._save(data)
         return self.defaults()
 
@@ -130,6 +140,27 @@ class ProviderStore:
         negative = providers.get(negative_id) if negative_id else None
         return affirmative, negative
 
+    def resolve_trio(
+        self,
+        affirmative_provider_id: Optional[str],
+        negative_provider_id: Optional[str],
+        moderator_provider_id: Optional[str],
+    ) -> tuple[Optional[ProviderConfig], Optional[ProviderConfig], Optional[ProviderConfig]]:
+        defaults = self.defaults()
+        affirmative_id = affirmative_provider_id or defaults.get("affirmative") or defaults.get("negative")
+        negative_id = negative_provider_id or defaults.get("negative") or defaults.get("affirmative")
+        moderator_id = (
+            moderator_provider_id
+            or defaults.get("moderator")
+            or defaults.get("affirmative")
+            or defaults.get("negative")
+        )
+        providers = self._providers()
+        affirmative = providers.get(affirmative_id) if affirmative_id else None
+        negative = providers.get(negative_id) if negative_id else None
+        moderator = providers.get(moderator_id) if moderator_id else None
+        return affirmative, negative, moderator
+
     def _providers(self) -> Dict[str, ProviderConfig]:
         result = {}
         for item in self._load().get("providers", []):
@@ -139,10 +170,13 @@ class ProviderStore:
 
     def _load(self) -> Dict[str, Any]:
         if not self.path.exists():
-            return {"version": 1, "defaults": {"affirmative": None, "negative": None}, "providers": []}
+            return {"version": 1, "defaults": {"affirmative": None, "negative": None, "moderator": None}, "providers": []}
         data = json.loads(self.path.read_text(encoding="utf-8"))
         data.setdefault("version", 1)
         data.setdefault("defaults", {"affirmative": None, "negative": None})
+        data["defaults"].setdefault("affirmative", None)
+        data["defaults"].setdefault("negative", None)
+        data["defaults"].setdefault("moderator", None)
         data.setdefault("providers", [])
         return data
 

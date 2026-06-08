@@ -158,16 +158,16 @@ class RunConfig:
     languages: List[str] = field(default_factory=list)
     max_rounds: int = 4
     auto_index_tools: bool = False
-    agentic_atlas: bool = True
-    agentic_atlas_direct: bool = False
     enable_external_tools: bool = True
     enable_llm: bool = False
     llm_model: Optional[str] = None
     llm_endpoint: Optional[str] = None
     affirmative_provider_id: Optional[str] = None
     negative_provider_id: Optional[str] = None
+    moderator_provider_id: Optional[str] = None
     affirmative_agent: Optional[AgentConfig] = None
     negative_agent: Optional[AgentConfig] = None
+    moderator_agent: Optional[AgentConfig] = None
 
 
 @dataclass

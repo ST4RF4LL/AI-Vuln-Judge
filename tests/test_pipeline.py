@@ -357,10 +357,12 @@ class PipelineTests(unittest.TestCase):
             )
             summaries = "\n".join(item.summary for item in evidence)
             self.assertIn("检测到 Atlas 数据库", summaries)
-            self.assertIn("Atlas MCP project/status 确认索引可用", summaries)
-            self.assertIn("Atlas MCP project/files 确认索引中包含报告源码文件", summaries)
+            self.assertIn("AI 自主 Atlas MCP project/status 确认索引状态", summaries)
+            self.assertIn("AI 自主 Atlas MCP project/files 找到报告路径候选", summaries)
             self.assertNotIn("缺少 .atlas/atlas.db", summaries)
             self.assertTrue(any(item.data.get("mcp_success") for item in evidence))
+            self.assertTrue(any(item.source == "agentic-source-reader" for item in evidence))
+            self.assertFalse(any(item.source == "atlas-mcp" for item in evidence))
 
     def test_mcp_stdio_client_reads_utf8_tool_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -439,12 +441,14 @@ for raw in sys.stdin.buffer:
                 AnalyzerSettings(enabled=True),
             )
             summaries = "\n".join(item.summary for item in evidence)
-            self.assertIn("Atlas MCP project/status 确认索引可用", summaries)
-            self.assertIn("Atlas MCP project/files 确认索引中包含报告源码文件", summaries)
-            self.assertIn("Atlas MCP trace variable 返回 ok=True", summaries)
-            self.assertIn("Atlas MCP calls 提取 `handler` 调用图", summaries)
-            self.assertTrue(any(item.kind == EvidenceKind.DATA_FLOW and item.source == "atlas-mcp" for item in evidence))
-            self.assertTrue(any(item.kind == EvidenceKind.CALL_CHAIN and item.source == "atlas-mcp" for item in evidence))
+            self.assertIn("AI 自主 Atlas MCP project/status 确认索引状态", summaries)
+            self.assertIn("AI 自主 Atlas MCP project/files 找到报告路径候选", summaries)
+            self.assertIn("AI 自主 Atlas MCP trace variable 返回 ok=True", summaries)
+            self.assertIn("AI 自主 Atlas MCP calls 提取 `handler` 调用图", summaries)
+            self.assertTrue(any(item.kind == EvidenceKind.DATA_FLOW and item.source == "atlas-agent-mcp" for item in evidence))
+            self.assertTrue(any(item.kind == EvidenceKind.CALL_CHAIN and item.source == "atlas-agent-mcp" for item in evidence))
+            self.assertTrue(any(item.source == "agentic-source-reader" for item in evidence))
+            self.assertFalse(any(item.source == "atlas-mcp" for item in evidence))
             self.assertNotIn("当前 Atlas CLI 未提供 trace 子命令", summaries)
 
     def test_atlas_mcp_uses_resolved_sarif_suffix_path(self):
@@ -482,8 +486,8 @@ for raw in sys.stdin.buffer:
             )
             summaries = "\n".join(item.summary for item in evidence)
             indexed = next(item for item in evidence if item.data.get("mcp_tool") == "project/files")
-            self.assertIn("Atlas MCP project/files 确认索引中包含报告源码文件", summaries)
-            self.assertEqual(indexed.data["indexed_files"], ["faiss/impl/index_read.cpp"])
+            self.assertIn("AI 自主 Atlas MCP project/files 找到报告路径候选", summaries)
+            self.assertEqual(indexed.data["matched_files"], ["faiss/impl/index_read.cpp"])
             self.assertTrue(any(item.data.get("trace_file") == "faiss/impl/index_read.cpp" for item in evidence))
             self.assertFalse(any("faiss/faiss/impl/index_read.cpp" in location.file for item in evidence for location in item.locations))
 
@@ -523,7 +527,7 @@ for raw in sys.stdin.buffer:
             self.assertTrue(any(item.source == "atlas-agent-mcp" for item in evidence))
             self.assertTrue(any(item.kind == EvidenceKind.CALL_CHAIN and item.source == "atlas-agent-mcp" for item in evidence))
 
-    def test_agentic_atlas_direct_skips_fixed_location_flow(self):
+    def test_agentic_atlas_is_the_only_mcp_flow(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / ".atlas").mkdir()
@@ -542,7 +546,7 @@ for raw in sys.stdin.buffer:
             evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
                 finding,
                 SourceIndexer(root, ["python"]),
-                AnalyzerSettings(enabled=True, agentic_atlas_direct=True),
+                AnalyzerSettings(enabled=True),
             )
             self.assertTrue(any(item.source == "atlas-agent-mcp" for item in evidence))
             self.assertFalse(any(item.source == "atlas-mcp" for item in evidence))
@@ -943,12 +947,14 @@ for raw in sys.stdin.buffer:
         self.assertIn('id="mcp-server-panel"', html)
         self.assertIn('id="skill-source-panel"', html)
         self.assertIn('#mcp-server-panel', html)
+        self.assertIn('#integrations-modal .settings-body', html)
+        self.assertIn('flex-direction: column', html)
         self.assertIn('flex: 1 1 auto', html)
         self.assertIn('class="wide checkbox-row"', html)
         self.assertIn('启用 MCP Server', html)
         self.assertNotIn('min-height: 720px', html)
         self.assertIn('#skill-source-panel', html)
-        self.assertIn('min-height: 520px', html)
+        self.assertNotIn('min-height: 520px', html)
         self.assertIn('id="mcp-list"', html)
         self.assertIn('id="skill-list"', html)
         self.assertIn('id="default-atlas-mcp"', html)
@@ -957,25 +963,31 @@ for raw in sys.stdin.buffer:
         self.assertNotIn('id="run-languages"', html)
         self.assertIn('自动 Atlas 构建索引', html)
         self.assertNotIn('自动索引工具', html)
-        self.assertIn('id="run-agentic-atlas"', html)
-        self.assertIn('id="run-agentic-atlas-direct"', html)
-        self.assertIn('AI 自主 Atlas 补证', html)
-        self.assertIn('直接 AI 自主运行 Atlas MCP', html)
+        self.assertNotIn('id="run-agentic-atlas"', html)
+        self.assertNotIn('id="run-agentic-atlas-direct"', html)
+        self.assertNotIn('直接 AI 自主运行 Atlas MCP', html)
         self.assertIn('class="run-agent-grid"', html)
         self.assertLess(html.index('id="run-affirmative-provider"'), html.index('id="run-affirmative-agent-profile"'))
         self.assertLess(html.index('id="run-negative-provider"'), html.index('id="run-negative-agent-profile"'))
+        self.assertLess(html.index('id="run-moderator-provider"'), html.index('id="run-moderator-agent-profile"'))
         self.assertIn('id="agent-affirmative-profile-panel"', html)
         self.assertIn('id="agent-negative-profile-panel"', html)
+        self.assertIn('id="agent-moderator-profile-panel"', html)
         self.assertIn('#agent-affirmative-profile-panel', html)
         self.assertIn('min-height: 560px', html)
         self.assertIn('overflow: visible', html)
         self.assertIn('id="agent-affirmative-profile-list"', html)
         self.assertIn('id="agent-negative-profile-list"', html)
+        self.assertIn('id="agent-moderator-profile-list"', html)
         self.assertIn('id="new-affirmative-agent"', html)
         self.assertIn('id="new-negative-agent"', html)
+        self.assertIn('id="new-moderator-agent"', html)
         self.assertIn('id="agent-profile-actions"', html)
         self.assertIn('id="run-affirmative-agent-profile"', html)
         self.assertIn('id="run-negative-agent-profile"', html)
+        self.assertIn('id="run-moderator-agent-profile"', html)
+        self.assertIn('id="default-moderator"', html)
+        self.assertIn('id="run-moderator-provider"', html)
         self.assertIn('function renderMarkdown(value)', html)
         self.assertIn('class="markdown-body"', html)
         self.assertIn('renderMarkdown(turn.claim)', html)
@@ -1028,6 +1040,13 @@ for raw in sys.stdin.buffer:
             affirmative, negative = store.resolve_pair(None, None)
             self.assertEqual(affirmative.id, "main")
             self.assertEqual(negative.id, "main")
+            affirmative, negative, moderator = store.resolve_trio(None, None, None)
+            self.assertEqual(affirmative.id, "main")
+            self.assertEqual(negative.id, "main")
+            self.assertEqual(moderator.id, "main")
+            self.assertIsNone(store.defaults()["moderator"])
+            store.set_defaults("main", "main", "main")
+            self.assertEqual(store.defaults()["moderator"], "main")
             raw = json.loads((Path(tmp) / "providers.json").read_text(encoding="utf-8"))
             self.assertEqual(raw["providers"][0]["api_key"], "secret")
 
@@ -1083,8 +1102,12 @@ for raw in sys.stdin.buffer:
                     },
                 )
                 self.assertEqual(created["api_key"], "********")
-                defaults = post_json(f"{base}/providers/defaults", {"affirmative": "fake", "negative": "fake"})
+                defaults = post_json(
+                    f"{base}/providers/defaults",
+                    {"affirmative": "fake", "negative": "fake", "moderator": "fake"},
+                )
                 self.assertEqual(defaults["affirmative"], "fake")
+                self.assertEqual(defaults["moderator"], "fake")
                 test = post_json(f"{base}/providers/fake/test", {})
                 self.assertTrue(test["ok"])
                 self.assertEqual(test["response_excerpt"], "OK")
@@ -1115,6 +1138,13 @@ for raw in sys.stdin.buffer:
                 with urllib.request.urlopen(f"{base}/agent-prompts", timeout=5) as response:
                     defaults = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(defaults["defaults"]["affirmative"], "Affirmative_default")
+                self.assertEqual(defaults["defaults"]["moderator"], "Moderator_default")
+                affirmative_default = next(
+                    profile for profile in defaults["roles"]["affirmative"] if profile["profile_id"] == "Affirmative_default"
+                )
+                self.assertIn("外部输入源头", affirmative_default["instructions"])
+                self.assertIn("grep/ripgrep", affirmative_default["instructions"])
+                self.assertIn("转回 Atlas", affirmative_default["instructions"])
                 saved = post_json(
                     f"{base}/agent-prompts",
                     {
@@ -1151,6 +1181,14 @@ for raw in sys.stdin.buffer:
                         "instructions": "质疑可达性和防护条件。",
                     },
                 )
+                post_json(
+                    f"{base}/agent-prompts",
+                    {
+                        "role": "moderator",
+                        "profile_id": "Moderator_default",
+                        "instructions": "中立总结双方核心争议。",
+                    },
+                )
                 created = post_json(
                     f"{base}/runs",
                     {
@@ -1166,6 +1204,8 @@ for raw in sys.stdin.buffer:
                 self.assertFalse(run["agent_configs"]["affirmative"]["deletable"])
                 self.assertEqual(run["agent_configs"]["affirmative"]["instructions"], "优先关注价值资产影响。")
                 self.assertEqual(run["agent_configs"]["negative"]["instructions"], "质疑可达性和防护条件。")
+                self.assertEqual(run["agent_configs"]["moderator"]["profile_id"], "Moderator_default")
+                self.assertEqual(run["agent_configs"]["moderator"]["instructions"], "中立总结双方核心争议。")
                 delete_request = urllib.request.Request(
                     f"{base}/agent-prompts/affirmative/Affirmative_custom",
                     method="DELETE",
@@ -1184,6 +1224,7 @@ for raw in sys.stdin.buffer:
                 self.assertEqual(error.exception.code, 400)
                 reset = post_json(f"{base}/agent-prompts", {"reset": True})
                 self.assertEqual(reset["defaults"]["negative"], "Negative_default")
+                self.assertEqual(reset["defaults"]["moderator"], "Moderator_default")
             finally:
                 api_server.shutdown()
                 api_server.server_close()
@@ -1343,11 +1384,15 @@ for raw in sys.stdin.buffer:
                 str(root / "agents"),
             ]
             with MCPStdioClient(command, cwd=Path.cwd(), timeout=10) as client:
-                tools = {tool.get("name") for tool in client.list_tools()}
+                tool_specs = client.list_tools()
+                tools = {tool.get("name") for tool in tool_specs}
                 self.assertIn("judge_report", tools)
                 self.assertIn("one_round_judge", tools)
                 self.assertIn("collect_evidence", tools)
                 self.assertIn("export_run_markdown", tools)
+                tool_schema_text = json.dumps(tool_specs, ensure_ascii=False)
+                self.assertNotIn("agentic_atlas", tool_schema_text)
+                self.assertNotIn("agentic_atlas_direct", tool_schema_text)
 
                 resolved = mcp_tool_json(
                     client.call_tool(
@@ -1392,6 +1437,7 @@ for raw in sys.stdin.buffer:
                 self.assertEqual(quick["judged_finding_count"], 1)
                 self.assertEqual(quick["selected_finding"]["rule_id"], "python-command-injection")
                 self.assertEqual(quick["verdict"]["verdict"], "TRUE_POSITIVE")
+                self.assertEqual(quick["agent_configs"]["moderator"]["profile_id"], "Moderator_default")
                 self.assertIn("evidence_summary", quick)
                 self.assertIn("missing_evidence", quick)
                 self.assertLessEqual(len(quick["evidence"]), 5)
@@ -1484,7 +1530,7 @@ for raw in sys.stdin.buffer:
                         except OSError:
                             pass
 
-    def test_affirmative_and_negative_use_independent_clients(self):
+    def test_affirmative_negative_and_moderator_use_independent_clients(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sarif, _skills = write_python_fixture(root)
@@ -1506,11 +1552,19 @@ for raw in sys.stdin.buffer:
             bundle.finding.locations = finding.source_locations
             affirmative = FakeLLM("AFFIRMATIVE_FROM_CLIENT")
             negative = FakeLLM("NEGATIVE_FROM_CLIENT")
-            report = DebateOrchestrator(affirmative_client=affirmative, negative_client=negative).adjudicate(bundle)
+            moderator = FakeLLM("MODERATOR_FROM_CLIENT")
+            report = DebateOrchestrator(
+                affirmative_client=affirmative,
+                negative_client=negative,
+                moderator_client=moderator,
+            ).adjudicate(bundle)
             self.assertIn("AFFIRMATIVE_FROM_CLIENT", report.debate[0].claim)
             self.assertIn("NEGATIVE_FROM_CLIENT", report.debate[1].claim)
+            self.assertIn("MODERATOR_FROM_CLIENT", report.final_conclusion)
+            self.assertIn("MODERATOR_FROM_CLIENT", report.debate[-1].claim)
             self.assertTrue(affirmative.calls)
             self.assertTrue(negative.calls)
+            self.assertTrue(moderator.calls)
 
     def test_agent_config_is_used_by_llm_prompts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1534,18 +1588,27 @@ for raw in sys.stdin.buffer:
             bundle.finding.locations = finding.source_locations
             affirmative = FakeLLM("AFFIRMATIVE_FROM_CLIENT")
             negative = FakeLLM("NEGATIVE_FROM_CLIENT")
+            moderator = FakeLLM("MODERATOR_FROM_CLIENT")
             DebateOrchestrator(
                 affirmative_client=affirmative,
                 negative_client=negative,
+                moderator_client=moderator,
                 affirmative_agent=AgentConfig("利用证据指证员", "优先关注资产窃取证据。"),
                 negative_agent=AgentConfig("可达性复核员", "质疑死代码和缓解措施。"),
+                moderator_agent=AgentConfig("中立主持人", "只总结双方核心观点。"),
             ).adjudicate(bundle)
             self.assertIn("利用证据指证员", affirmative.calls[0][0])
             self.assertIn("优先关注资产窃取证据。", affirmative.calls[0][0])
             self.assertIn("正方证据不足补强策略", affirmative.calls[0][1])
             self.assertIn("源码分析、Atlas 检查和交叉验证路径", affirmative.calls[0][1])
+            self.assertIn("外部输入源头", affirmative.calls[0][1])
+            self.assertIn("grep/ripgrep", affirmative.calls[0][1])
+            self.assertIn("回到 Atlas", affirmative.calls[0][1])
+            self.assertIn("误报、不可利用漏洞或证据不足", affirmative.calls[0][1])
             self.assertIn("可达性复核员", negative.calls[0][0])
             self.assertIn("质疑死代码和缓解措施。", negative.calls[0][0])
+            self.assertIn("中立主持人", moderator.calls[0][0])
+            self.assertIn("只总结双方核心观点。", moderator.calls[0][0])
 
     def test_final_conclusion_rejects_llm_task_echo(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1595,7 +1658,7 @@ for raw in sys.stdin.buffer:
                     "api_key": "secret",
                 }
             )
-            store.set_defaults("fake", "fake")
+            store.set_defaults("fake", "fake", "fake")
             report = run_judgement(
                 RunConfig(
                     sarif_path=sarif,
@@ -1608,7 +1671,9 @@ for raw in sys.stdin.buffer:
             )
             self.assertEqual(report.llm_providers["affirmative"]["provider_id"], "fake")
             self.assertEqual(report.llm_providers["negative"]["provider_id"], "fake")
+            self.assertEqual(report.llm_providers["moderator"]["provider_id"], "fake")
             self.assertTrue(report.llm_providers["affirmative"]["client_available"])
+            self.assertTrue(report.llm_providers["moderator"]["client_available"])
             self.assertEqual(report.llm_providers["affirmative"]["status"], "ready")
 
     def test_run_report_records_agent_config(self):
@@ -1623,10 +1688,12 @@ for raw in sys.stdin.buffer:
                     enable_external_tools=False,
                     affirmative_agent=AgentConfig("利用证据指证员", "关注价值资产。"),
                     negative_agent=AgentConfig("缓解措施复核员", "关注可达缓解措施。"),
+                    moderator_agent=AgentConfig("中立主持人", "总结双方核心观点。"),
                 )
             )
             self.assertEqual(report.agent_configs["affirmative"]["name"], "利用证据指证员")
             self.assertEqual(report.agent_configs["negative"]["instructions"], "关注可达缓解措施。")
+            self.assertEqual(report.agent_configs["moderator"]["instructions"], "总结双方核心观点。")
 
     def test_run_report_records_disabled_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1643,7 +1710,7 @@ for raw in sys.stdin.buffer:
                     "api_key": "secret",
                 }
             )
-            store.set_defaults("fake", "fake")
+            store.set_defaults("fake", "fake", "fake")
             report = run_judgement(
                 RunConfig(
                     sarif_path=sarif,
@@ -1656,8 +1723,11 @@ for raw in sys.stdin.buffer:
             )
             self.assertFalse(report.llm_providers["enabled"])
             self.assertEqual(report.llm_providers["affirmative"]["provider_id"], "fake")
+            self.assertEqual(report.llm_providers["moderator"]["provider_id"], "fake")
             self.assertEqual(report.llm_providers["affirmative"]["status"], "llm_disabled")
+            self.assertEqual(report.llm_providers["moderator"]["status"], "llm_disabled")
             self.assertFalse(report.llm_providers["affirmative"]["client_available"])
+            self.assertFalse(report.llm_providers["moderator"]["client_available"])
 
     def test_missing_source_location_becomes_false_positive(self):
         with tempfile.TemporaryDirectory() as tmp:

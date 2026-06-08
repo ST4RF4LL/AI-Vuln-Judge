@@ -16,10 +16,12 @@ AGENT_META_FILE = "AGENT.json"
 ROLE_DIRS = {
     "affirmative": "Affirmative",
     "negative": "Negative",
+    "moderator": "Moderator",
 }
 DEFAULT_PROFILE_IDS = {
     "affirmative": "Affirmative_default",
     "negative": "Negative_default",
+    "moderator": "Moderator_default",
 }
 
 DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
@@ -27,6 +29,12 @@ DEFAULT_AFFIRMATIVE_AGENT = AgentConfig(
     instructions=(
         "围绕报告收集证据，证明报告对应真实源码位置和真实代码片段，验证能否由外部接口或内部接口调用触发，"
         "给出准确调用链、数据流和最终影响。rg/grep、Atlas 和源码阅读都必须围绕报告位置、报告符号、codeFlow 或调用邻域。"
+        "调用链追溯必须优先使用 Atlas search/trace/calls 从报告位置、危险汇点或中间函数向上游追到外部输入源头"
+        "（用户输入、文件输入、网络报文输入、命令行参数、标准输入、请求参数或消息队列载荷等）。"
+        "当 Atlas 无法继续追溯、trace partial/empty/No data node、calls 缺边或 search 未命中时，不得直接承认证据不足或误报；"
+        "应合理怀疑 Atlas 漏掉或未正确解析调用关系，转用源码阅读和 grep/ripgrep 围绕报告路径、符号、调用邻域、入口函数、源点词和汇点词补证。"
+        "一旦源码阅读或 grep/ripgrep 拼出当前调用链、上游调用者或数据流节点，必须转回 Atlas 对新发现上游符号继续追溯。"
+        "只有 Atlas、源码阅读、grep/ripgrep 和交叉验证均无法证明从外部输入源头到危险汇点的可达路径时，才可怀疑误报、不可利用或证据不足。"
         "防护消减只在源码或 Skill/项目上下文存在明确证据时分析；没有证据就不引入防护消减假设。证据不足时，"
         "必须优先寻找新证据：重新阅读源码上下文、检查 Atlas project/status 和 project/files、"
         "用 search/trace/calls 补齐调用链与数据流，再说明仍未闭环的限制。"
@@ -50,6 +58,19 @@ DEFAULT_NEGATIVE_AGENT = AgentConfig(
     deletable=False,
     is_default=True,
 )
+DEFAULT_MODERATOR_AGENT = AgentConfig(
+    name="Moderator_default",
+    instructions=(
+        "作为中立主持人，总结正方和反方的核心观点、证据闭环状态、仍存在的分歧和最终结论。"
+        "不得新增双方没有提出或证据链没有支持的新事实；必须客观区分已证实证据、候选证据和未闭环缺口。"
+        "输出应简洁、可审计，重点帮助用户快速理解双方争议点和下一步验证方向。"
+    ),
+    role="Moderator",
+    profile_id="Moderator_default",
+    path=str(DEFAULT_AGENTS_DIR / "Moderator" / "Moderator_default" / AGENT_FILE),
+    deletable=False,
+    is_default=True,
+)
 
 
 class AgentDirectoryStore:
@@ -63,10 +84,12 @@ class AgentDirectoryStore:
             "defaults": {
                 "affirmative": DEFAULT_PROFILE_IDS["affirmative"],
                 "negative": DEFAULT_PROFILE_IDS["negative"],
+                "moderator": DEFAULT_PROFILE_IDS["moderator"],
             },
             "roles": {
                 "affirmative": [to_jsonable(profile) for profile in self.list_profiles("affirmative")],
                 "negative": [to_jsonable(profile) for profile in self.list_profiles("negative")],
+                "moderator": [to_jsonable(profile) for profile in self.list_profiles("moderator")],
             },
         }
 
@@ -75,6 +98,7 @@ class AgentDirectoryStore:
         return {
             "affirmative": to_jsonable(self.agent("affirmative", DEFAULT_PROFILE_IDS["affirmative"])),
             "negative": to_jsonable(self.agent("negative", DEFAULT_PROFILE_IDS["negative"])),
+            "moderator": to_jsonable(self.agent("moderator", DEFAULT_PROFILE_IDS["moderator"])),
         }
 
     def list_profiles(self, role: str) -> List[AgentConfig]:
@@ -145,6 +169,10 @@ class AgentDirectoryStore:
         if not negative_file.exists():
             negative_file.parent.mkdir(parents=True, exist_ok=True)
             negative_file.write_text(DEFAULT_NEGATIVE_AGENT.instructions + "\n", encoding="utf-8")
+        moderator_file = self._role_dir("moderator") / DEFAULT_PROFILE_IDS["moderator"] / AGENT_FILE
+        if not moderator_file.exists():
+            moderator_file.parent.mkdir(parents=True, exist_ok=True)
+            moderator_file.write_text(DEFAULT_MODERATOR_AGENT.instructions + "\n", encoding="utf-8")
 
     def _role_dir(self, role_key: str) -> Path:
         return self.root / ROLE_DIRS[role_key]
@@ -184,7 +212,9 @@ def _role_key(role: str) -> str:
         return "affirmative"
     if normalized in {"negative", "con", "反方"}:
         return "negative"
-    raise ValueError("role 必须是 affirmative/negative 或正方/反方")
+    if normalized in {"moderator", "host", "neutral", "中立", "中立方", "主持人"}:
+        return "moderator"
+    raise ValueError("role 必须是 affirmative/negative/moderator 或正方/反方/主持人")
 
 
 def _profile_id(value: str) -> str:

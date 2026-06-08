@@ -27,7 +27,7 @@ uv run vuln-judger run \
   --skills ./skills
 ```
 
-命令会输出 JSON 研判报告，包含每个发现的结论、置信度、证据链、正反方博弈回合、争议点、
+命令会输出 JSON 研判报告，包含每个发现的结论、置信度、证据链、正反方与主持人博弈回合、争议点、
 源码位置和建议下一步。项目语言构成会在分析源码目录时自动检测；默认语言为中文；
 机器接口字段名和枚举值保持稳定。
 
@@ -50,27 +50,21 @@ uv run vuln-judger run \
 
 Atlas 证据优先检查 `.atlas/atlas.db`。缺少数据库时，报告会提示执行
 `atlas index --analysis full`；启用 `--auto-index-tools` 时会自动 Atlas 构建索引。
-检测到新版 Atlas 的 `mcp` 子命令后，平台会优先通过 `atlas mcp --project <源码目录>`
-调用 `project/status`、`project/files`、`trace`、`search` 和 `calls` 工具，生成
-`atlas-mcp` 来源的源码真实性、数据流和调用图证据。MCP 不可用时才回退到 CLI
-`status/files` 诊断；旧版 `atlas trace` CLI 不再作为主路径。
-
-当基于报告源码位置的固定 Atlas MCP 调用没有拿到数据流或调用链等实质证据时，默认会启用
-AI 自主 Atlas 补证路径：系统会从 finding 文本、路径片段和符号中生成查询计划，继续调用
-Atlas MCP 的 `project/status`、`project/files`、`search`、`trace` 和 `calls`，并输出
+检测到新版 Atlas 的 `mcp` 子命令后，平台只走 AI 自主 Atlas 补证路径：系统会从
+finding 文本、路径片段和符号中生成查询计划，调用 Atlas MCP 的 `project/status`、
+`project/files`、`search`、`trace` 和 `calls`，并输出
 `atlas-agent-mcp` 来源的 `SOURCE_LOCATION`、`DATA_FLOW`、`CALL_CHAIN`、
-`TOOL_DIAGNOSTIC` 证据。若该自主 MCP 路径仍无法产生实质证据，会降级为
-`agentic-source-reader` 来源的源码阅读证据。
+`TOOL_DIAGNOSTIC` 证据。平台不再提供基于报告行号的固定函数调用 Atlas 分支；
+AI 自主源码阅读会同时运行，输出 `agentic-source-reader` 来源的源码分析证据。MCP 不可用时
+也会保留该源码阅读路径。
 
 相关运行参数：
 
-- `--no-agentic-atlas`：关闭固定 Atlas MCP 失败后的 AI 自主补证 fallback。
-- `--agentic-atlas-direct`：跳过固定位置调用流程，直接运行 AI 自主 Atlas MCP 补证路径。
+- `--auto-index-tools`：缺少 `.atlas/atlas.db` 时自动 Atlas 构建索引。
 
-Web 端启动任务弹窗也提供 `AI 自主 Atlas 补证` 和 `直接 AI 自主运行 Atlas MCP` 两个开关。
-MCP Server 的 `judge_report`、`one_round_judge` 和 `collect_evidence` 工具同样支持
-`agentic_atlas` 与 `agentic_atlas_direct` 入参，便于 Codex/opencode 等 CLI 客户端直接获取
-自主 Atlas MCP 证据。
+Web 端启动任务弹窗不再提供 Atlas 执行分支开关。MCP Server 的 `judge_report`、
+`one_round_judge` 和 `collect_evidence` 工具同样固定使用 AI 自主 Atlas MCP 和
+AI 自主源码阅读路径。
 
 ## MCP 和 Skills 管理
 
@@ -206,7 +200,8 @@ Chat Completions API。建议优先使用 `api_key_env`，避免将明文密钥�
   "version": 1,
   "defaults": {
     "affirmative": "openai-main",
-    "negative": "qwen-fast"
+    "negative": "qwen-fast",
+    "moderator": "openai-main"
   },
   "providers": [
     {
@@ -236,7 +231,7 @@ uv run vuln-judger run \
   --providers-file .vuln-judger/providers.json
 ```
 
-显式指定正方/反方提供商：
+显式指定正方/反方/主持人提供商：
 
 ```bash
 uv run vuln-judger run \
@@ -245,21 +240,25 @@ uv run vuln-judger run \
   --skills ./skills \
   --llm \
   --affirmative-provider openai-main \
-  --negative-provider qwen-fast
+  --negative-provider qwen-fast \
+  --moderator-provider openai-main
 ```
 
 ## Agent 配置
 
-正方和反方 Agent 使用固定角色目录，每个配置档案都以 `AGENT.md` 保存提示词：
+正方、反方和主持人 Agent 使用固定角色目录，每个配置档案都以 `AGENT.md` 保存提示词：
 
 ```text
 agents/Affirmative/Affirmative_default/AGENT.md
 agents/Negative/Negative_default/AGENT.md
+agents/Moderator/Moderator_default/AGENT.md
 ```
 
 Web 界面右上角的“Agent 配置”按钮可以管理这些配置档案。新任务可以分别选择一个正方
-配置档案和一个反方配置档案。配置档案支持星标，非默认配置档案可以删除；内置默认配置档案
-`Affirmative_default` 和 `Negative_default` 不能删除。
+配置档案、一个反方配置档案和一个主持人配置档案。配置档案支持星标，非默认配置档案可以删除；
+内置默认配置档案 `Affirmative_default`、`Negative_default` 和 `Moderator_default` 不能删除。
+Moderator 是中立角色，主要总结双方核心观点、证据闭环状态、主要分歧和最终研判；它的
+AGENT.md 配置和 LLM provider 选择与正反方相互独立。
 
 命令行运行时也可以指定 Agent 配置档案：
 
@@ -269,7 +268,8 @@ uv run vuln-judger run \
   --source ./target-project \
   --agents-dir agents \
   --affirmative-agent-profile Affirmative_default \
-  --negative-agent-profile Negative_default
+  --negative-agent-profile Negative_default \
+  --moderator-agent-profile Moderator_default
 ```
 
 兼容旧路径：未选择提供商 ID 时，`--llm-model` / `--llm-endpoint` 仍可作为共享旧版
@@ -290,8 +290,8 @@ uv run vuln-judger api \
 ```
 
 打开 http://127.0.0.1:8765 查看保存的研判记录。页面提供运行历史、结论统计、发现摘要、
-证据链、博弈过程、防护分析、影响分析、LLM 提供商配置、正反方默认提供商选择、
-提供商连通性测试、正反方 Agent 配置管理，以及 MCP / Skill Source 配置管理。
+证据链、博弈过程、防护分析、影响分析、LLM 提供商配置、正反方和主持人默认提供商选择、
+提供商连通性测试、三方 Agent 配置管理，以及 MCP / Skill Source 配置管理。
 
 默认日志文件为 `.vuln-judger/logs/vuln-judger.log`，会记录 API 启动、任务创建、后台任务
 执行、LLM 请求状态、Provider 连通性测试和异常 traceback。日志文件会自动轮转，且已被
@@ -309,8 +309,10 @@ curl -X POST http://127.0.0.1:8765/runs \
     "enable_llm": true,
     "affirmative_provider_id": "openai-main",
     "negative_provider_id": "qwen-fast",
+    "moderator_provider_id": "openai-main",
     "affirmative_agent_profile": "Affirmative_default",
-    "negative_agent_profile": "Negative_default"
+    "negative_agent_profile": "Negative_default",
+    "moderator_agent_profile": "Moderator_default"
   }'
 ```
 

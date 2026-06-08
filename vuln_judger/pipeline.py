@@ -53,8 +53,6 @@ def run_judgement(
     analyzer_settings = AnalyzerSettings(
         enabled=config.enable_external_tools,
         auto_index=config.auto_index_tools,
-        agentic_atlas=config.agentic_atlas,
-        agentic_atlas_direct=config.agentic_atlas_direct,
         mcp_servers_file=config.mcp_servers_file,
     )
     collector = EvidenceCollector(
@@ -64,16 +62,18 @@ def run_judgement(
         analyzer_settings=analyzer_settings,
         languages=languages,
     )
-    affirmative_provider, negative_provider = _resolve_providers(config)
+    affirmative_provider, negative_provider, moderator_provider = _resolve_providers(config)
     LOG.info(
-        "Provider 解析完成 affirmative=%s negative=%s",
+        "Provider 解析完成 affirmative=%s negative=%s moderator=%s",
         affirmative_provider.id if affirmative_provider else None,
         negative_provider.id if negative_provider else None,
+        moderator_provider.id if moderator_provider else None,
     )
-    affirmative_client, negative_client = build_llm_clients(
+    affirmative_client, negative_client, moderator_client = build_llm_clients(
         enabled=config.enable_llm,
         affirmative_provider=affirmative_provider,
         negative_provider=negative_provider,
+        moderator_provider=moderator_provider,
         legacy_model=config.llm_model,
         legacy_endpoint=config.llm_endpoint,
     )
@@ -81,15 +81,19 @@ def run_judgement(
         max_rounds=config.max_rounds,
         affirmative_client=affirmative_client,
         negative_client=negative_client,
+        moderator_client=moderator_client,
         affirmative_agent=config.affirmative_agent,
         negative_agent=config.negative_agent,
+        moderator_agent=config.moderator_agent,
     )
     llm_providers = _llm_provider_metadata(
         config.enable_llm,
         affirmative_provider,
         negative_provider,
+        moderator_provider,
         affirmative_client,
         negative_client,
+        moderator_client,
     )
     agent_configs = _agent_config_metadata(orchestrator_template)
     reports = []
@@ -138,8 +142,10 @@ def run_judgement(
             max_rounds=config.max_rounds,
             affirmative_client=affirmative_client,
             negative_client=negative_client,
+            moderator_client=moderator_client,
             affirmative_agent=config.affirmative_agent,
             negative_agent=config.negative_agent,
+            moderator_agent=config.moderator_agent,
             progress_callback=on_finding_progress,
         )
         verdict = orchestrator.adjudicate(bundle)
@@ -186,27 +192,32 @@ def _run_id(sarif_path: Path, source_path: Path, languages: Sequence[str]) -> st
     return f"run-{digest[:12]}"
 
 
-def _resolve_providers(config: RunConfig) -> tuple[Optional[ProviderConfig], Optional[ProviderConfig]]:
+def _resolve_providers(config: RunConfig) -> tuple[Optional[ProviderConfig], Optional[ProviderConfig], Optional[ProviderConfig]]:
     providers_file = config.providers_file
-    if providers_file is None and (config.affirmative_provider_id or config.negative_provider_id):
+    if providers_file is None and (
+        config.affirmative_provider_id or config.negative_provider_id or config.moderator_provider_id
+    ):
         providers_file = DEFAULT_PROVIDERS_FILE
     if providers_file is None:
-        return None, None
+        return None, None, None
     store = ProviderStore(providers_file)
-    return store.resolve_pair(config.affirmative_provider_id, config.negative_provider_id)
+    return store.resolve_trio(config.affirmative_provider_id, config.negative_provider_id, config.moderator_provider_id)
 
 
 def _llm_provider_metadata(
     enabled: bool,
     affirmative_provider: Optional[ProviderConfig],
     negative_provider: Optional[ProviderConfig],
+    moderator_provider: Optional[ProviderConfig],
     affirmative_client: Optional[LLMClient],
     negative_client: Optional[LLMClient],
+    moderator_client: Optional[LLMClient],
 ) -> dict:
     return {
         "enabled": enabled,
         "affirmative": _role_provider_metadata(enabled, affirmative_provider, affirmative_client),
         "negative": _role_provider_metadata(enabled, negative_provider, negative_client),
+        "moderator": _role_provider_metadata(enabled, moderator_provider, moderator_client),
     }
 
 
@@ -214,6 +225,7 @@ def _agent_config_metadata(orchestrator: DebateOrchestrator) -> dict:
     return {
         "affirmative": to_jsonable(orchestrator.affirmative_agent),
         "negative": to_jsonable(orchestrator.negative_agent),
+        "moderator": to_jsonable(orchestrator.moderator_agent),
     }
 
 

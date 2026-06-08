@@ -189,12 +189,12 @@ class EvidenceCollector:
         if not has_meaningful_flow and not _has_strong_data_flow(evidence):
             missing.append("data_flow")
             actions.append(
-                "数据流不足：优先调用 Atlas trace point/variable；若 trace 为 partial、empty 或 No data node，应结合报告路径附近源码片段、报告范围内 agentic-rg 候选源点/汇点和 calls 调用图逐跳手动重构。"
+                "数据流不足：优先调用 Atlas trace point/variable 向上游追溯到外部输入源头；若 trace 为 partial、empty 或 No data node，应合理怀疑 Atlas 未正确处理调用链关系，转用报告路径附近源码片段和 agentic-rg 候选源点/汇点逐跳手动重构；一旦找到新的上游节点，再回到 Atlas trace/calls 继续追溯。"
             )
         if not has_meaningful_flow and not _has_call_chain(evidence):
             missing.append("call_chain")
             actions.append(
-                "调用链不足：使用报告符号、附近函数、文件 stem 和危险汇点作为 Atlas search 查询词，再对候选 qualified_name 调用 calls both，并从调用方/被调用方两端拼接路径。"
+                "调用链不足：使用报告符号、附近函数、文件 stem 和危险汇点作为 Atlas search 查询词，再对候选 qualified_name 调用 calls both 向上游追到外部输入源头；若 Atlas 缺边或无法解析间接调用，转用源码阅读和 grep/ripgrep 搜索入口函数、调用邻域、参数名、源点词和汇点词；定位到新调用者后再回到 Atlas 继续追溯。"
             )
         if (
             self.analyzer_settings.enabled
@@ -228,8 +228,7 @@ class EvidenceCollector:
                 data={
                     "missing_evidence": missing,
                     "suggested_actions": actions,
-                    "agentic_atlas_enabled": self.analyzer_settings.agentic_atlas,
-                    "agentic_atlas_direct": self.analyzer_settings.agentic_atlas_direct,
+                    "atlas_mode": "agentic_only",
                     "auto_index_tools": self.analyzer_settings.auto_index,
                     "atlas_database_exists": _atlas_database_exists(evidence),
                 },

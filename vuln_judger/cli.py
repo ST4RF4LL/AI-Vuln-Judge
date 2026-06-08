@@ -30,10 +30,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--skills", type=Path, help="项目知识库 skill 目录")
     run_parser.add_argument("--max-rounds", type=int, default=4, help="最大博弈回合数")
     run_parser.add_argument("--auto-index-tools", action="store_true", help="自动 Atlas 构建索引")
-    run_parser.add_argument("--no-agentic-atlas", action="store_true", help="禁用 AI 自主 Atlas MCP 补证后备路径")
-    run_parser.add_argument("--agentic-atlas-direct", action="store_true", help="直接使用 AI 自主 Atlas MCP 补证路径")
     run_parser.add_argument("--no-external-tools", action="store_true", help="禁用 Atlas/CodeQL 探测")
-    run_parser.add_argument("--llm", action="store_true", help="使用 OpenAI-compatible LLM 生成正反方回合")
+    run_parser.add_argument("--llm", action="store_true", help="使用 OpenAI-compatible LLM 生成正反方和主持人回合")
     run_parser.add_argument("--llm-model", help="--llm 使用的模型名；也可使用 VULN_JUDGER_LLM_MODEL")
     run_parser.add_argument("--llm-endpoint", help="--llm 使用的 Chat Completions endpoint")
     run_parser.add_argument("--providers-file", type=Path, default=DEFAULT_PROVIDERS_FILE, help="provider 配置文件路径")
@@ -42,13 +40,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--skill-source", help="Skill Source ID；未显式传 --skills 时使用该知识库路径")
     run_parser.add_argument("--affirmative-provider", help="正方 Agent 使用的 provider ID")
     run_parser.add_argument("--negative-provider", help="反方 Agent 使用的 provider ID")
+    run_parser.add_argument("--moderator-provider", help="主持人 Agent 使用的 provider ID")
     run_parser.add_argument("--affirmative-agent-name", help="正方 Agent 显示名称")
     run_parser.add_argument("--affirmative-agent-instructions", help="正方 Agent 自定义提示词")
     run_parser.add_argument("--negative-agent-name", help="反方 Agent 显示名称")
     run_parser.add_argument("--negative-agent-instructions", help="反方 Agent 自定义提示词")
+    run_parser.add_argument("--moderator-agent-name", help="主持人 Agent 显示名称")
+    run_parser.add_argument("--moderator-agent-instructions", help="主持人 Agent 自定义提示词")
     run_parser.add_argument("--agents-dir", type=Path, default=DEFAULT_AGENTS_DIR, help="包含角色 Agent 配置的目录")
     run_parser.add_argument("--affirmative-agent-profile", help="agents/Affirmative 下的正方 profile 目录")
     run_parser.add_argument("--negative-agent-profile", help="agents/Negative 下的反方 profile 目录")
+    run_parser.add_argument("--moderator-agent-profile", help="agents/Moderator 下的主持人 profile 目录")
     run_parser.add_argument("--out", type=Path, help="将 JSON 研判报告写入该路径")
     run_parser.add_argument("--record", action="store_true", help="将本次运行保存到 Web 记录目录")
     run_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="运行记录保存目录")
@@ -102,8 +104,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             skills_path=skills_path,
             max_rounds=args.max_rounds,
             auto_index_tools=args.auto_index_tools,
-            agentic_atlas=not args.no_agentic_atlas,
-            agentic_atlas_direct=args.agentic_atlas_direct,
             enable_external_tools=not args.no_external_tools,
             enable_llm=args.llm,
             llm_model=args.llm_model,
@@ -112,10 +112,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             mcp_servers_file=args.mcp_servers_file,
             affirmative_provider_id=args.affirmative_provider,
             negative_provider_id=args.negative_provider,
+            moderator_provider_id=args.moderator_provider,
             affirmative_agent=_agent_config(args.affirmative_agent_name, args.affirmative_agent_instructions)
             or agent_store.agent("affirmative", args.affirmative_agent_profile),
             negative_agent=_agent_config(args.negative_agent_name, args.negative_agent_instructions)
             or agent_store.agent("negative", args.negative_agent_profile),
+            moderator_agent=_agent_config(args.moderator_agent_name, args.moderator_agent_instructions)
+            or agent_store.agent("moderator", args.moderator_agent_profile),
         )
         report = run_judgement(config)
         if args.record:
