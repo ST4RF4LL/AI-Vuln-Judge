@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import dataclasses
+import copy
 import hashlib
 import json
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.parse import unquote, urlparse
 
 from .models import Finding, SourceLocation
+
+
+@dataclasses.dataclass
+class PreparedReport:
+    original_path: Path
+    effective_path: Path
+    diagnostics: List[str]
+    temporary: bool = False
 
 
 def load_report(path: Path) -> List[Finding]:
@@ -29,6 +39,172 @@ def load_sarif(path: Path) -> List[Finding]:
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
     return parse_sarif(data)
+
+
+def prepare_report_for_processing(path: Path) -> PreparedReport:
+    """Normalize report input to SARIF without modifying the original file."""
+    report_path = path.expanduser().resolve()
+    suffix = report_path.suffix.lower()
+    diagnostics: List[str] = []
+    if suffix in {".md", ".markdown"}:
+        text = report_path.read_text(encoding="utf-8", errors="replace")
+        sarif_data = markdown_to_sarif(text, source_name=str(report_path))
+        sarif_data, repairs = moderator_review_sarif(sarif_data)
+        diagnostics.extend(f"Moderator 修复 Markdown 转换结果：{item}" for item in repairs)
+        issues = validate_sarif_report(sarif_data)
+        temp_path = _write_temp_sarif(sarif_data, report_path)
+        diagnostics.append(f"Moderator 已将 Markdown 报告转换为临时 SARIF：{temp_path}")
+        diagnostics.append(_validation_diagnostic(issues))
+        return PreparedReport(report_path, temp_path, diagnostics, temporary=True)
+
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        text = report_path.read_text(encoding="utf-8", errors="replace")
+        sarif_data = markdown_to_sarif(text, source_name=str(report_path))
+        sarif_data, repairs = moderator_review_sarif(sarif_data)
+        diagnostics.extend(f"Moderator 修复 Markdown 转换结果：{item}" for item in repairs)
+        issues = validate_sarif_report(sarif_data)
+        temp_path = _write_temp_sarif(sarif_data, report_path)
+        diagnostics.append(f"Moderator 将非 JSON 文本报告转换为临时 SARIF：{temp_path}")
+        diagnostics.append(_validation_diagnostic(issues))
+        return PreparedReport(report_path, temp_path, diagnostics, temporary=True)
+
+    reviewed, repairs = moderator_review_sarif(data)
+    issues = validate_sarif_report(reviewed)
+    diagnostics.append(_validation_diagnostic(issues))
+    if repairs:
+        temp_path = _write_temp_sarif(reviewed, report_path)
+        diagnostics.extend(f"Moderator 修复 SARIF 读取异常：{item}" for item in repairs)
+        diagnostics.append(f"Moderator 已将修复后的 SARIF 写入临时文件：{temp_path}")
+        return PreparedReport(report_path, temp_path, diagnostics, temporary=True)
+    return PreparedReport(report_path, report_path, diagnostics, temporary=False)
+
+
+def markdown_to_sarif(text: str, source_name: str = "markdown-report") -> Dict[str, Any]:
+    findings = parse_markdown_report(text)
+    rules: Dict[str, Dict[str, Any]] = {}
+    results: List[Dict[str, Any]] = []
+    for finding in findings:
+        rules.setdefault(
+            finding.rule_id,
+            {
+                "id": finding.rule_id,
+                "name": finding.rule_id,
+                "shortDescription": {"text": finding.rule_id},
+                "fullDescription": {"text": finding.message},
+                "properties": {"sourceFormat": "markdown"},
+            },
+        )
+        result: Dict[str, Any] = {
+            "ruleId": finding.rule_id,
+            "level": finding.level or "warning",
+            "message": {"text": finding.message},
+            "locations": [_location_to_sarif(location) for location in finding.locations],
+            "properties": dict(finding.properties),
+        }
+        result["properties"].update(
+            {
+                "source_format": "markdown",
+                "source_report": source_name,
+                "moderator_converted": True,
+            }
+        )
+        if finding.code_flows:
+            result["codeFlows"] = [_code_flow_to_sarif(flow) for flow in finding.code_flows]
+        results.append(result)
+    return {
+        "version": "2.1.0",
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "vuln-judger-moderator",
+                        "informationUri": "https://github.com/ST4RF4LL/AI-Vuln-Judge",
+                        "rules": list(rules.values()),
+                    }
+                },
+                "invocations": [{"executionSuccessful": True, "properties": {"inputFormat": "markdown"}}],
+                "results": results,
+            }
+        ],
+    }
+
+
+def validate_sarif_report(data: Dict[str, Any]) -> List[str]:
+    issues: List[str] = []
+    if not isinstance(data, dict):
+        return ["SARIF 顶层不是 JSON object"]
+    if str(data.get("version") or "") != "2.1.0":
+        issues.append("SARIF version 不是 2.1.0")
+    runs = data.get("runs")
+    if not isinstance(runs, list) or not runs:
+        issues.append("SARIF 缺少 runs")
+        return issues
+    result_count = 0
+    for run_index, run in enumerate(runs):
+        if not isinstance(run, dict):
+            issues.append(f"runs[{run_index}] 不是 object")
+            continue
+        results = run.get("results")
+        if not isinstance(results, list):
+            issues.append(f"runs[{run_index}] 缺少 results 数组")
+            continue
+        result_count += len(results)
+        for result_index, result in enumerate(results):
+            if not isinstance(result, dict):
+                issues.append(f"runs[{run_index}].results[{result_index}] 不是 object")
+                continue
+            if not str(result.get("ruleId") or "").strip():
+                issues.append(f"runs[{run_index}].results[{result_index}] 缺少 ruleId")
+            message = _message_text(result.get("message"))
+            if _looks_like_bad_report_text(message):
+                issues.append(f"runs[{run_index}].results[{result_index}] message 为空或疑似 Markdown 表格分隔线")
+            locations = result.get("locations")
+            if locations is not None and not isinstance(locations, list):
+                issues.append(f"runs[{run_index}].results[{result_index}] locations 不是数组")
+    if result_count == 0:
+        issues.append("SARIF results 为空")
+    return issues
+
+
+def moderator_review_sarif(data: Dict[str, Any]) -> tuple[Dict[str, Any], List[str]]:
+    reviewed = copy.deepcopy(data)
+    repairs: List[str] = []
+    if not isinstance(reviewed, dict):
+        return reviewed, repairs
+    for run_index, run in enumerate(reviewed.get("runs") or []):
+        if not isinstance(run, dict):
+            continue
+        for result_index, result in enumerate(run.get("results") or []):
+            if not isinstance(result, dict):
+                continue
+            props = result.get("properties")
+            if not isinstance(props, dict):
+                props = {}
+                result["properties"] = props
+            message = _message_text(result.get("message"))
+            if _looks_like_bad_report_text(message):
+                replacement = _message_from_sarif_result(result)
+                result["message"] = {"text": replacement}
+                repairs.append(f"runs[{run_index}].results[{result_index}] message 修正为：{replacement}")
+            rule_id = str(result.get("ruleId") or "").strip()
+            if _looks_like_bad_report_text(rule_id) or rule_id in {"unknown-rule", "markdown-finding", "Markdown 报告"}:
+                replacement_rule = _rule_from_sarif_result(result)
+                if replacement_rule:
+                    result["ruleId"] = replacement_rule
+                    repairs.append(f"runs[{run_index}].results[{result_index}] ruleId 修正为：{replacement_rule}")
+            locations = result.get("locations")
+            if not locations:
+                repaired_locations = _locations_from_sarif_properties(props)
+                if repaired_locations:
+                    result["locations"] = repaired_locations
+                    repairs.append(f"runs[{run_index}].results[{result_index}] locations 从 Markdown 字段补齐")
+            props["moderator_reviewed"] = True
+            if repairs:
+                props["moderator_repairs"] = list(repairs)
+    return reviewed, repairs
 
 
 def parse_sarif(data: Dict[str, Any]) -> List[Finding]:
@@ -206,6 +382,14 @@ _LEVEL_KEYS = {"severity", "level", "priority", "risk"}
 _LOCATION_KEYS = {"location", "locations", "file", "path", "sourcefile", "source", "sink"}
 _LINE_KEYS = {"line", "linenumber", "startline"}
 _COLUMN_KEYS = {"column", "col", "startcolumn"}
+_CONTEXT_KEYS = {
+    "dangerousfunction",
+    "dangerousapi",
+    "sinkfunction",
+    "sinkapi",
+    "rootcause",
+    "impact",
+}
 _FLOW_KEYS = {
     "codeflow",
     "codeflows",
@@ -301,7 +485,20 @@ _MARKDOWN_KEY_ALIASES = {
     "检测规则": "rule",
     "检查项": "rule",
     "漏洞类型": "vulnerabilitytype",
+    "漏洞名称": "title",
+    "漏洞描述": "description",
     "漏洞": "vulnerabilitytype",
+    "危险函数": "dangerousfunction",
+    "危险方法": "dangerousfunction",
+    "危险调用": "dangerousfunction",
+    "危险api": "dangerousapi",
+    "危险API": "dangerousapi",
+    "汇点函数": "sinkfunction",
+    "汇点api": "sinkapi",
+    "汇点API": "sinkapi",
+    "根因": "rootcause",
+    "根本原因": "rootcause",
+    "影响": "impact",
     "消息": "message",
     "描述": "description",
     "摘要": "summary",
@@ -445,6 +642,52 @@ def _finding_from_markdown_section(
     explicit_finding_field = False
     in_flow = False
     in_reference_section = False
+    table_headers: List[str] = []
+
+    def apply_key_value(key: str, value: str) -> None:
+        nonlocal rule_id, message, level, locations, code_flows, current_flow, in_flow, explicit_finding_field
+        key = _clean_markdown_inline(key)
+        value = _clean_markdown_inline(value)
+        if not key or _is_markdown_table_separator_cell(key):
+            return
+        normalized_key = _normalize_markdown_key(key)
+        if not normalized_key:
+            return
+        fields[normalized_key] = value
+        if normalized_key in _RULE_KEYS:
+            rule_id = value.strip()
+            explicit_finding_field = True
+        elif normalized_key in _MESSAGE_KEYS:
+            message = value.strip()
+            explicit_finding_field = True
+        elif normalized_key in _LEVEL_KEYS:
+            level = value.strip().lower() or level
+            explicit_finding_field = True
+        elif normalized_key in _LINE_KEYS:
+            locations = _apply_line_to_last_location(locations, _optional_int(value))
+            explicit_finding_field = True
+        elif normalized_key in _COLUMN_KEYS:
+            locations = _apply_column_to_last_location(locations, _optional_int(value))
+            explicit_finding_field = True
+        elif normalized_key in _CONTEXT_KEYS:
+            explicit_finding_field = True
+
+        parsed_locations = _parse_markdown_locations(value)
+        if normalized_key in _FLOW_KEYS:
+            if current_flow:
+                code_flows.append(_dedupe_locations(current_flow))
+            current_flow = parsed_locations
+            in_flow = True
+            explicit_finding_field = True
+            return
+        if normalized_key in _LOCATION_KEYS:
+            locations.extend(parsed_locations)
+            if in_flow:
+                current_flow.extend(parsed_locations)
+            explicit_finding_field = True
+            return
+        if in_flow and parsed_locations:
+            current_flow.extend(parsed_locations)
 
     for line in section.lines:
         heading = _MARKDOWN_HEADING_RE.match(line)
@@ -458,44 +701,26 @@ def _finding_from_markdown_section(
                 in_flow = True
                 continue
             in_flow = False
+            table_headers = []
+
+        table_cells = _markdown_table_cells(line)
+        if table_cells is not None:
+            if _is_markdown_table_separator_row(table_cells):
+                continue
+            if table_headers:
+                for index, value in enumerate(table_cells):
+                    if index >= len(table_headers):
+                        break
+                    apply_key_value(table_headers[index], value)
+                continue
+            if _looks_like_markdown_table_header(table_cells):
+                table_headers = table_cells
+                continue
 
         key_value = _markdown_key_value(line)
         if key_value is not None:
             key, value = key_value
-            normalized_key = _normalize_markdown_key(key)
-            fields[normalized_key] = value
-            if normalized_key in _RULE_KEYS:
-                rule_id = value.strip()
-                explicit_finding_field = True
-            elif normalized_key in _MESSAGE_KEYS:
-                message = value.strip()
-                explicit_finding_field = True
-            elif normalized_key in _LEVEL_KEYS:
-                level = value.strip().lower() or level
-                explicit_finding_field = True
-            elif normalized_key in _LINE_KEYS:
-                locations = _apply_line_to_last_location(locations, _optional_int(value))
-                explicit_finding_field = True
-            elif normalized_key in _COLUMN_KEYS:
-                locations = _apply_column_to_last_location(locations, _optional_int(value))
-                explicit_finding_field = True
-
-            parsed_locations = _parse_markdown_locations(value)
-            if normalized_key in _FLOW_KEYS:
-                if current_flow:
-                    code_flows.append(_dedupe_locations(current_flow))
-                current_flow = parsed_locations
-                in_flow = True
-                explicit_finding_field = True
-                continue
-            if normalized_key in _LOCATION_KEYS:
-                locations.extend(parsed_locations)
-                if in_flow:
-                    current_flow.extend(parsed_locations)
-                explicit_finding_field = True
-                continue
-            if in_flow and parsed_locations:
-                current_flow.extend(parsed_locations)
+            apply_key_value(key, value)
             continue
 
         parsed_locations = _parse_markdown_locations(line)
@@ -513,9 +738,9 @@ def _finding_from_markdown_section(
         locations = [code_flows[-1][-1]]
 
     if not rule_id:
-        rule_id = _rule_id_from_markdown_title(section.title)
+        rule_id = fields.get("vulnerabilitytype") or fields.get("rule") or _rule_id_from_markdown_title(section.title)
     if not message:
-        message = _first_markdown_sentence(section.lines) or section.title or rule_id
+        message = _message_from_markdown_fields(fields) or _first_markdown_sentence(section.lines) or section.title or rule_id
     if not (locations or code_flows or explicit_finding_field or allow_loose):
         return None
     if not (locations or code_flows) and not explicit_finding_field:
@@ -548,8 +773,10 @@ def _finding_from_markdown_section(
 def _markdown_key_value(line: str) -> Optional[tuple[str, str]]:
     cleaned = line.strip()
     if cleaned.startswith("|") and cleaned.endswith("|"):
-        cells = [cell.strip() for cell in cleaned.strip("|").split("|")]
-        if len(cells) >= 2 and cells[0] and not set(cells[0]) <= {"-"}:
+        cells = _markdown_table_cells(cleaned) or []
+        if _is_markdown_table_separator_row(cells):
+            return None
+        if len(cells) >= 2 and cells[0] and _is_known_markdown_key(cells[0]):
             return _clean_markdown_inline(cells[0]), _clean_markdown_inline(cells[1])
     match = _MARKDOWN_KEY_VALUE_RE.match(line)
     if not match:
@@ -640,7 +867,12 @@ def _rule_id_from_markdown_title(title: str) -> str:
 
 def _first_markdown_sentence(lines: List[str]) -> str:
     for line in lines:
-        if _MARKDOWN_HEADING_RE.match(line) or _markdown_key_value(line) is not None:
+        table_cells = _markdown_table_cells(line)
+        if (
+            _MARKDOWN_HEADING_RE.match(line)
+            or _markdown_key_value(line) is not None
+            or (table_cells is not None and (_is_markdown_table_separator_row(table_cells) or _looks_like_markdown_table_header(table_cells)))
+        ):
             continue
         cleaned = _clean_markdown_inline(line).strip()
         cleaned = re.sub(r"^\s*[-*+]\s*", "", cleaned).strip()
@@ -661,3 +893,144 @@ def _clean_markdown_inline(value: str) -> str:
     cleaned = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", cleaned)
     cleaned = cleaned.replace("**", "").replace("__", "")
     return cleaned.strip("` \t")
+
+
+def _markdown_table_cells(line: str) -> Optional[List[str]]:
+    cleaned = line.strip()
+    if not (cleaned.startswith("|") and cleaned.endswith("|")):
+        return None
+    return [_clean_markdown_inline(cell.strip()) for cell in cleaned.strip("|").split("|")]
+
+
+def _is_markdown_table_separator_row(cells: List[str]) -> bool:
+    return bool(cells) and all(_is_markdown_table_separator_cell(cell) for cell in cells if cell)
+
+
+def _is_markdown_table_separator_cell(cell: str) -> bool:
+    return bool(re.fullmatch(r":?-{2,}:?", cell.strip()))
+
+
+def _looks_like_markdown_table_header(cells: List[str]) -> bool:
+    return sum(1 for cell in cells if _is_known_markdown_key(cell)) >= 2
+
+
+def _is_known_markdown_key(key: str) -> bool:
+    normalized = _normalize_markdown_key(key)
+    known = _RULE_KEYS | _MESSAGE_KEYS | _LEVEL_KEYS | _LOCATION_KEYS | _LINE_KEYS | _COLUMN_KEYS | _FLOW_KEYS | _CONTEXT_KEYS
+    return normalized in known
+
+
+def _message_from_markdown_fields(fields: Dict[str, str]) -> str:
+    for key in ("message", "description", "summary", "details", "title", "issue"):
+        value = fields.get(key)
+        if value and not _looks_like_bad_report_text(value):
+            return value
+    parts = []
+    if fields.get("vulnerabilitytype"):
+        parts.append(f"漏洞类型：{fields['vulnerabilitytype']}")
+    danger = fields.get("dangerousfunction") or fields.get("dangerousapi") or fields.get("sinkfunction") or fields.get("sinkapi")
+    if danger:
+        parts.append(f"危险函数：{danger}")
+    if fields.get("rootcause"):
+        parts.append(f"根因：{fields['rootcause']}")
+    if fields.get("impact"):
+        parts.append(f"影响：{fields['impact']}")
+    return "；".join(parts)
+
+
+def _looks_like_bad_report_text(value: str) -> bool:
+    cleaned = _clean_markdown_inline(str(value or "")).strip()
+    if not cleaned:
+        return True
+    if _markdown_table_cells(cleaned) is not None and _is_markdown_table_separator_row(_markdown_table_cells(cleaned) or []):
+        return True
+    return bool(re.fullmatch(r"\|?\s*:?-{2,}:?(?:\s*\|\s*:?-{2,}:?)+\s*\|?", cleaned))
+
+
+def _message_from_sarif_result(result: Dict[str, Any]) -> str:
+    props = result.get("properties") if isinstance(result.get("properties"), dict) else {}
+    fields = {
+        key.removeprefix("markdown_"): str(value)
+        for key, value in props.items()
+        if isinstance(key, str) and key.startswith("markdown_") and value is not None
+    }
+    message = _message_from_markdown_fields(fields)
+    if message:
+        return message
+    rule_id = str(result.get("ruleId") or "").strip()
+    if rule_id and not _looks_like_bad_report_text(rule_id):
+        return rule_id
+    return "Moderator 修复后的 SARIF 发现缺少原始描述，需人工复核报告内容。"
+
+
+def _rule_from_sarif_result(result: Dict[str, Any]) -> str:
+    props = result.get("properties") if isinstance(result.get("properties"), dict) else {}
+    for key in ("markdown_rule", "markdown_vulnerabilitytype", "markdown_title", "markdown_cwe", "markdown_cweid"):
+        value = str(props.get(key) or "").strip()
+        if value and not _looks_like_bad_report_text(value):
+            return value
+    message = _message_from_sarif_result(result)
+    return re.sub(r"\s+", "-", message.lower())[:80] if message else ""
+
+
+def _locations_from_sarif_properties(props: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_file = props.get("markdown_file") or props.get("markdown_path") or props.get("markdown_sourcefile")
+    if not raw_file:
+        return []
+    location = SourceLocation(
+        file=_normalize_markdown_file(str(raw_file)),
+        line=_optional_int(props.get("markdown_line") or props.get("markdown_startline")),
+        column=_optional_int(props.get("markdown_column") or props.get("markdown_startcolumn")),
+    )
+    return [_location_to_sarif(location)]
+
+
+def _location_to_sarif(location: SourceLocation) -> Dict[str, Any]:
+    region: Dict[str, Any] = {}
+    if location.line is not None:
+        region["startLine"] = location.line
+    if location.column is not None:
+        region["startColumn"] = location.column
+    if location.end_line is not None:
+        region["endLine"] = location.end_line
+    if location.end_column is not None:
+        region["endColumn"] = location.end_column
+    physical: Dict[str, Any] = {"artifactLocation": {"uri": location.file}}
+    if region:
+        physical["region"] = region
+    return {"physicalLocation": physical}
+
+
+def _code_flow_to_sarif(flow: List[SourceLocation]) -> Dict[str, Any]:
+    return {
+        "threadFlows": [
+            {
+                "locations": [
+                    {
+                        "location": _location_to_sarif(location),
+                    }
+                    for location in flow
+                ]
+            }
+        ]
+    }
+
+
+def _write_temp_sarif(data: Dict[str, Any], original_path: Path) -> Path:
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", original_path.stem)[:40] or "report"
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        suffix=".sarif",
+        prefix=f"vuln-judger-{safe_stem}-",
+        delete=False,
+    ) as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        return Path(handle.name)
+
+
+def _validation_diagnostic(issues: List[str]) -> str:
+    if not issues:
+        return "Moderator SARIF 格式验证通过"
+    return "Moderator SARIF 格式验证发现问题：" + "；".join(issues)

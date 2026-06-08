@@ -14,7 +14,7 @@ from .llm import LLMClient, build_llm_clients
 from .logging_config import logger
 from .models import RunConfig, RunReport, to_jsonable
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderConfig, ProviderStore
-from .sarif import load_report
+from .sarif import load_sarif, prepare_report_for_processing
 from .skills import load_project_context
 from .source import SourceIndexer
 
@@ -46,8 +46,16 @@ def run_judgement(
         config.enable_llm,
         config.enable_external_tools,
     )
-    findings = load_report(sarif_path)
-    LOG.info("报告解析完成 findings=%s report=%s", len(findings), sarif_path)
+    prepared_report = prepare_report_for_processing(sarif_path)
+    diagnostics = list(prepared_report.diagnostics)
+    findings = load_sarif(prepared_report.effective_path)
+    LOG.info(
+        "报告解析完成 findings=%s report=%s effective_report=%s temporary=%s",
+        len(findings),
+        sarif_path,
+        prepared_report.effective_path,
+        prepared_report.temporary,
+    )
     project_context = load_project_context(config.skills_path)
     LOG.info("项目知识库加载完成 facts=%s skills=%s", len(project_context.facts), config.skills_path)
     analyzer_settings = AnalyzerSettings(
@@ -97,7 +105,6 @@ def run_judgement(
     )
     agent_configs = _agent_config_metadata(orchestrator_template)
     reports = []
-    diagnostics = []
 
     def check_stop() -> None:
         if should_stop is not None and should_stop():

@@ -24,7 +24,7 @@ from vuln_judger.models import AgentConfig, CodeEvidence, EvidenceKind, Evidence
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunRecordStore
-from vuln_judger.sarif import parse_markdown_report
+from vuln_judger.sarif import load_sarif, parse_markdown_report, prepare_report_for_processing
 from vuln_judger.skills import SkillSourceStore
 from vuln_judger.source import SourceIndexer, detect_project_languages
 
@@ -119,6 +119,46 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(report.reports[0].source_locations[0].file, "app.py")
             self.assertEqual(report.reports[0].verdict, Verdict.TRUE_POSITIVE)
 
+    def test_markdown_table_report_is_moderated_into_temp_sarif(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _sarif, skills = write_python_fixture(root)
+            markdown = root / "report.md"
+            markdown.write_text(
+                "\n".join(
+                    [
+                        "# Markdown 表格报告",
+                        "",
+                        "| 漏洞类型 | 危险函数 | 漏洞描述 | 文件 | 行号 | 严重性 |",
+                        "|------|-----|-----|-----|-----|-----|",
+                        "| python-command-injection | os.system | 用户输入可到达命令执行点 | app.py | 5 | error |",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            prepared = prepare_report_for_processing(markdown)
+            self.assertNotEqual(prepared.effective_path, markdown.resolve())
+            self.assertTrue(prepared.temporary)
+            findings = load_sarif(prepared.effective_path)
+            self.assertEqual(findings[0].message, "用户输入可到达命令执行点")
+            self.assertEqual(findings[0].rule_id, "python-command-injection")
+            self.assertEqual(findings[0].locations[0].display(), "app.py:5")
+
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=markdown,
+                    source_path=root,
+                    skills_path=skills,
+                    enable_external_tools=False,
+                )
+            )
+            self.assertTrue(any("Markdown 报告转换为临时 SARIF" in item for item in report.diagnostics))
+            self.assertTrue(any("SARIF 格式验证通过" in item for item in report.diagnostics))
+            summaries = "\n".join(item.summary for item in report.reports[0].evidence_chain)
+            self.assertIn("用户输入可到达命令执行点", summaries)
+            self.assertNotIn("|------|-----|", summaries)
+
     def test_markdown_cpp_paths_keep_full_extension(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -208,6 +248,63 @@ class PipelineTests(unittest.TestCase):
                 "Panorama::copy_entry",
             ],
         )
+
+    def test_moderator_repairs_suspicious_sarif_message_in_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _fixture_sarif, skills = write_python_fixture(root)
+            sarif = root / "bad.sarif"
+            sarif.write_text(
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "unit"}},
+                                "results": [
+                                    {
+                                        "ruleId": "unknown-rule",
+                                        "message": {"text": "|------|-----|"},
+                                        "locations": [
+                                            {
+                                                "physicalLocation": {
+                                                    "artifactLocation": {"uri": "app.py"},
+                                                    "region": {"startLine": 5},
+                                                }
+                                            }
+                                        ],
+                                        "properties": {
+                                            "markdown_vulnerabilitytype": "python-command-injection",
+                                            "markdown_dangerousfunction": "os.system",
+                                            "markdown_description": "用户输入可到达命令执行点",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            prepared = prepare_report_for_processing(sarif)
+            self.assertTrue(prepared.temporary)
+            repaired = load_sarif(prepared.effective_path)
+            self.assertEqual(repaired[0].rule_id, "python-command-injection")
+            self.assertEqual(repaired[0].message, "用户输入可到达命令执行点")
+
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    skills_path=skills,
+                    enable_external_tools=False,
+                )
+            )
+            self.assertTrue(any("修复 SARIF 读取异常" in item for item in report.diagnostics))
+            summaries = "\n".join(item.summary for item in report.reports[0].evidence_chain)
+            self.assertIn("用户输入可到达命令执行点", summaries)
+            self.assertNotIn("|------|-----|", summaries)
 
     def test_source_indexer_resolves_markdown_symbol_locations_without_line(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1650,6 +1747,39 @@ for raw in sys.stdin.buffer:
                 self.assertNotIn("只输出1到3句话", field)
             self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.final_conclusion)
             self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.reasoning_summary)
+
+    def test_moderator_ends_debate_when_agents_repeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            finding = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            ).reports[0]
+            bundle = EvidenceBundle(
+                finding=type("FindingLike", (), {})(),
+                evidence=finding.evidence_chain,
+                diagnostics=[],
+            )
+            bundle.finding.finding_id = finding.finding_id
+            bundle.finding.rule_id = finding.rule_id
+            bundle.finding.message = "demo"
+            bundle.finding.locations = finding.source_locations
+            repeated = "重复观点：报告位置、调用链、影响和防护结论全部照抄上一轮，没有新增证据。" * 3
+
+            report = DebateOrchestrator(
+                max_rounds=4,
+                affirmative_client=FakeLLM(repeated),
+                negative_client=FakeLLM(repeated),
+            ).adjudicate(bundle)
+
+            self.assertEqual(report.debate[-1].role.value, "MODERATOR")
+            self.assertIn("Moderator 提前结束", report.final_conclusion)
+            self.assertIn("高度复读", report.final_conclusion)
+            self.assertLess(len(report.debate), 6)
 
     def test_run_report_records_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:

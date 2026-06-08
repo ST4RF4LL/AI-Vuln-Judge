@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -150,6 +151,8 @@ class DebateOrchestrator:
             )
         )
         self._emit_progress(bundle, base_decision, turns)
+        if repetition_issue := _moderator_repetition_issue(turns):
+            return self._early_moderator_conclusion(bundle, base_decision, challenges, turns, repetition_issue)
         unresolved = list(challenges)
         last_negative = negative_report
         for round_index in range(2, max(1, self.max_rounds) + 1):
@@ -183,6 +186,8 @@ class DebateOrchestrator:
                 )
             )
             self._emit_progress(bundle, base_decision, turns)
+            if repetition_issue := _moderator_repetition_issue(turns):
+                return self._early_moderator_conclusion(bundle, base_decision, challenges, turns, repetition_issue)
             negative_review = self._llm_claim(
                 "NEGATIVE",
                 (
@@ -207,6 +212,8 @@ class DebateOrchestrator:
                 )
             )
             self._emit_progress(bundle, base_decision, turns)
+            if repetition_issue := _moderator_repetition_issue(turns):
+                return self._early_moderator_conclusion(bundle, base_decision, challenges, turns, repetition_issue)
             last_negative = negative_review
             if _can_reach_consensus(base_decision, unresolved):
                 unresolved = []
@@ -252,6 +259,37 @@ class DebateOrchestrator:
                 round_index=final_round,
                 claim=final_conclusion,
                 evidence_ids=[item.evidence_id for item in evidence],
+                resolved=decision.verdict != Verdict.INCONCLUSIVE,
+            )
+        )
+        self._emit_progress(bundle, decision, turns, final_conclusion=final_conclusion)
+        return turns, final_conclusion, decision
+
+    def _early_moderator_conclusion(
+        self,
+        bundle: EvidenceBundle,
+        base_decision: DebateDecision,
+        challenges: Sequence[str],
+        turns: List[DebateTurn],
+        reason: str,
+    ) -> Tuple[List[DebateTurn], str, DebateDecision]:
+        affirmative_label, affirmative_verdict, affirmative_statement = _fallback_side_conclusion(
+            "AFFIRMATIVE", bundle, base_decision, challenges
+        )
+        negative_label, negative_verdict, negative_statement = _fallback_side_conclusion(
+            "NEGATIVE", bundle, base_decision, challenges
+        )
+        affirmative = SideConclusion(affirmative_label, affirmative_verdict, affirmative_statement)
+        negative = SideConclusion(negative_label, negative_verdict, negative_statement)
+        side_final = _final_conclusion(affirmative, negative)
+        final_conclusion = f"Moderator 提前结束：{reason}；{side_final}"
+        decision = _decision_from_conclusions(base_decision, affirmative, negative, final_conclusion)
+        turns.append(
+            DebateTurn(
+                role=DebateRole.MODERATOR,
+                round_index=max((turn.round_index for turn in turns), default=0),
+                claim=final_conclusion,
+                evidence_ids=[item.evidence_id for item in bundle.evidence],
                 resolved=decision.verdict != Verdict.INCONCLUSIVE,
             )
         )
@@ -849,6 +887,45 @@ def _negative_review_summary(evidence: Sequence[CodeEvidence], unresolved: Seque
     if _has_meaningful_flow(evidence) and not _has_protection(evidence):
         return "在当前证据下，反方接受攻击链基本成立，但保留对业务前提的人工复核要求。"
     return "正方澄清降低了部分不确定性，但自动证据仍不足以直接定性。"
+
+
+def _moderator_repetition_issue(turns: Sequence[DebateTurn]) -> Optional[str]:
+    if len(turns) < 2:
+        return None
+    latest = turns[-1]
+    if latest.role == DebateRole.MODERATOR:
+        return None
+    latest_text = _normalize_claim_for_repetition(latest.claim)
+    if len(latest_text) < 24:
+        return None
+    for previous in turns[:-1]:
+        if previous.role == DebateRole.MODERATOR:
+            continue
+        previous_text = _normalize_claim_for_repetition(previous.claim)
+        if len(previous_text) < 24:
+            continue
+        similarity = difflib.SequenceMatcher(None, latest_text, previous_text).ratio()
+        same_role_threshold = 0.88 if latest.role == previous.role else 0.94
+        contains_repetition = (
+            latest.role == previous.role
+            and min(len(latest_text), len(previous_text)) >= 80
+            and (latest_text in previous_text or previous_text in latest_text)
+        )
+        if similarity >= same_role_threshold or contains_repetition:
+            return (
+                f"检测到{_role_label(latest.role.value)}第 {latest.round_index} 回合与"
+                f"{_role_label(previous.role.value)}第 {previous.round_index} 回合高度复读，"
+                "继续辩论不会增加新证据"
+            )
+    return None
+
+
+def _normalize_claim_for_repetition(text: str) -> str:
+    normalized = re.sub(r"`[^`]+`", "", text.lower())
+    normalized = re.sub(r"\b[a-z]+-[0-9a-f]{8,}\b", "", normalized)
+    normalized = re.sub(r"evidence[_-]?[a-z0-9_-]+", "", normalized)
+    normalized = re.sub(r"[\s#*_>\-|:：,，.;；。!！?？()\[\]【】\"'“”‘’]+", "", normalized)
+    return normalized
 
 
 def _fallback_side_conclusion(
