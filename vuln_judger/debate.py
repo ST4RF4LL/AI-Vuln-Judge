@@ -37,6 +37,13 @@ class SideConclusion:
     statement: str
 
 
+@dataclass
+class ModeratorRoundDecision:
+    continue_debate: bool
+    unresolved: List[str]
+    summary: str
+
+
 class DebateOrchestrator:
     def __init__(
         self,
@@ -63,6 +70,7 @@ class DebateOrchestrator:
         evidence = bundle.evidence
         decision = self._decide(bundle)
         turns, final_conclusion, decision = self._debate_turns(bundle, decision)
+        turns = _dedupe_debate_turns(turns)
         return VerdictReport(
             finding_id=bundle.finding.finding_id,
             rule_id=bundle.finding.rule_id,
@@ -91,6 +99,8 @@ class DebateOrchestrator:
         protection_ids = _ids(evidence, EvidenceKind.PROTECTION)
         impact_ids = _ids(evidence, EvidenceKind.IMPACT, EvidenceKind.PROJECT_CONTEXT)
         tool_diag_ids = _ids(evidence, EvidenceKind.TOOL_DIAGNOSTIC)
+        configured_rounds = max(1, int(self.max_rounds or 1))
+        max_regular_round = 1 if configured_rounds == 1 else configured_rounds - 1
         affirmative_report = self._llm_claim(
             "AFFIRMATIVE",
             (
@@ -130,7 +140,7 @@ class DebateOrchestrator:
             )
         )
         self._emit_progress(bundle, base_decision, turns)
-        negative_report = self._llm_claim(
+        negative_llm_report = self._llm_claim(
             "NEGATIVE",
             (
                 "提交反方质疑报告。目标固定为：客观验证正方给出的报告源码真实性、外部/内部入口可达性、"
@@ -140,7 +150,8 @@ class DebateOrchestrator:
             ),
             bundle,
             extra=_stage_context("反方第一回合", "正方证据报告：\n" + affirmative_report, challenges, ""),
-        ) or _negative_challenge_report(bundle, challenges, affirmative_report)
+        )
+        negative_report = negative_llm_report or _negative_challenge_report(bundle, challenges, affirmative_report)
         turns.append(
             DebateTurn(
                 role=DebateRole.NEGATIVE,
@@ -151,13 +162,33 @@ class DebateOrchestrator:
             )
         )
         self._emit_progress(bundle, base_decision, turns)
-        if repetition_issue := _moderator_repetition_issue(turns):
-            return self._early_moderator_conclusion(bundle, base_decision, challenges, turns, repetition_issue)
-        unresolved = list(challenges)
+        unresolved = _merge_challenges(challenges, _negative_disputed_points(negative_report) if negative_llm_report else [])
         last_negative = negative_report
-        for round_index in range(2, max(1, self.max_rounds) + 1):
-            if not unresolved:
-                break
+        moderator_decision = self._moderator_round_review(
+            bundle,
+            base_decision,
+            turns,
+            challenges,
+            unresolved,
+            round_index=1,
+            max_regular_round=max_regular_round,
+        )
+        turns.append(
+            DebateTurn(
+                role=DebateRole.MODERATOR,
+                round_index=1,
+                claim=moderator_decision.summary,
+                evidence_ids=[item.evidence_id for item in evidence],
+                resolved=not moderator_decision.continue_debate,
+            )
+        )
+        self._emit_progress(bundle, base_decision, turns)
+        unresolved = moderator_decision.unresolved
+        if not moderator_decision.continue_debate:
+            final_round = 1 if configured_rounds == 1 else min(configured_rounds, 2)
+            return self._finalize_debate(bundle, base_decision, challenges, turns, last_negative, final_round)
+
+        for round_index in range(2, max_regular_round + 1):
             clarification = self._llm_claim(
                 "AFFIRMATIVE",
                 (
@@ -182,13 +213,11 @@ class DebateOrchestrator:
                     round_index=round_index,
                     claim=clarification,
                     evidence_ids=answer_ids,
-                    resolved=not _material_unresolved(challenges),
+                    resolved=not _material_unresolved(unresolved),
                 )
             )
             self._emit_progress(bundle, base_decision, turns)
-            if repetition_issue := _moderator_repetition_issue(turns):
-                return self._early_moderator_conclusion(bundle, base_decision, challenges, turns, repetition_issue)
-            negative_review = self._llm_claim(
+            negative_llm_review = self._llm_claim(
                 "NEGATIVE",
                 (
                     "复审正方澄清。指出已经闭环的问题和仍然不成立的断点，并给出是否继续质疑。"
@@ -201,24 +230,66 @@ class DebateOrchestrator:
                     unresolved,
                     "",
                 ),
-            ) or _negative_review_report(bundle, unresolved, clarification, round_index)
+            )
+            negative_review = negative_llm_review or _negative_review_report(bundle, unresolved, clarification, round_index)
+            next_unresolved = _merge_challenges(
+                [item for item in unresolved if _challenge_still_material(evidence, item)],
+                _negative_disputed_points(negative_review) if negative_llm_review else [],
+            )
             turns.append(
                 DebateTurn(
                     role=DebateRole.NEGATIVE,
                     round_index=round_index,
                     claim=negative_review,
                     evidence_ids=protection_ids + tool_diag_ids + flow_ids + location_ids,
-                    resolved=not _material_unresolved(unresolved),
+                    resolved=not _material_unresolved(next_unresolved),
                 )
             )
             self._emit_progress(bundle, base_decision, turns)
-            if repetition_issue := _moderator_repetition_issue(turns):
-                return self._early_moderator_conclusion(bundle, base_decision, challenges, turns, repetition_issue)
             last_negative = negative_review
-            if _can_reach_consensus(base_decision, unresolved):
-                unresolved = []
+            moderator_decision = self._moderator_round_review(
+                bundle,
+                base_decision,
+                turns,
+                challenges,
+                next_unresolved,
+                round_index=round_index,
+                max_regular_round=max_regular_round,
+            )
+            turns.append(
+                DebateTurn(
+                    role=DebateRole.MODERATOR,
+                    round_index=round_index,
+                    claim=moderator_decision.summary,
+                    evidence_ids=[item.evidence_id for item in evidence],
+                    resolved=not moderator_decision.continue_debate,
+                )
+            )
+            self._emit_progress(bundle, base_decision, turns)
+            unresolved = moderator_decision.unresolved
+            if not moderator_decision.continue_debate:
+                final_round = min(configured_rounds, round_index + 1)
+                return self._finalize_debate(bundle, base_decision, challenges, turns, last_negative, final_round)
 
-        final_round = max((turn.round_index for turn in turns), default=0) + 1
+        return self._finalize_debate(bundle, base_decision, challenges, turns, last_negative, configured_rounds)
+
+    def _finalize_debate(
+        self,
+        bundle: EvidenceBundle,
+        base_decision: DebateDecision,
+        challenges: Sequence[str],
+        turns: List[DebateTurn],
+        last_negative: str,
+        final_round: int,
+    ) -> Tuple[List[DebateTurn], str, DebateDecision]:
+        evidence = bundle.evidence
+        source_root_ids = _ids(evidence, EvidenceKind.SOURCE_ROOT)
+        report_ids = _ids(evidence, EvidenceKind.REPORT)
+        location_ids = _ids(evidence, EvidenceKind.SOURCE_LOCATION)
+        flow_ids = _ids(evidence, EvidenceKind.SARIF_CODE_FLOW, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN)
+        protection_ids = _ids(evidence, EvidenceKind.PROTECTION)
+        impact_ids = _ids(evidence, EvidenceKind.IMPACT, EvidenceKind.PROJECT_CONTEXT)
+        tool_diag_ids = _ids(evidence, EvidenceKind.TOOL_DIAGNOSTIC)
         affirmative_final = self._side_conclusion("AFFIRMATIVE", bundle, base_decision, challenges, last_negative)
         turns.append(
             DebateTurn(
@@ -231,6 +302,16 @@ class DebateOrchestrator:
         )
         self._emit_progress(bundle, base_decision, turns)
         negative_final = self._side_conclusion("NEGATIVE", bundle, base_decision, challenges, last_negative)
+        turns.append(
+            DebateTurn(
+                role=DebateRole.NEGATIVE,
+                round_index=final_round,
+                claim=f"## 反方结案\n【{negative_final.label}】，{negative_final.statement}",
+                evidence_ids=source_root_ids + protection_ids + tool_diag_ids + location_ids + flow_ids,
+                resolved=True,
+            )
+        )
+        self._emit_progress(bundle, base_decision, turns)
         side_final_conclusion = _final_conclusion(affirmative_final, negative_final)
         moderator_summary = self._moderator_summary(
             bundle,
@@ -245,16 +326,6 @@ class DebateOrchestrator:
         decision = _decision_from_conclusions(base_decision, affirmative_final, negative_final, final_conclusion)
         turns.append(
             DebateTurn(
-                role=DebateRole.NEGATIVE,
-                round_index=final_round,
-                claim=f"## 反方结案\n【{negative_final.label}】，{negative_final.statement}",
-                evidence_ids=source_root_ids + protection_ids + tool_diag_ids + location_ids + flow_ids,
-                resolved=True,
-            )
-        )
-        self._emit_progress(bundle, decision, turns)
-        turns.append(
-            DebateTurn(
                 role=DebateRole.MODERATOR,
                 round_index=final_round,
                 claim=final_conclusion,
@@ -265,36 +336,64 @@ class DebateOrchestrator:
         self._emit_progress(bundle, decision, turns, final_conclusion=final_conclusion)
         return turns, final_conclusion, decision
 
-    def _early_moderator_conclusion(
+    def _moderator_round_review(
         self,
         bundle: EvidenceBundle,
         base_decision: DebateDecision,
+        turns: Sequence[DebateTurn],
         challenges: Sequence[str],
-        turns: List[DebateTurn],
-        reason: str,
-    ) -> Tuple[List[DebateTurn], str, DebateDecision]:
-        affirmative_label, affirmative_verdict, affirmative_statement = _fallback_side_conclusion(
-            "AFFIRMATIVE", bundle, base_decision, challenges
+        candidate_unresolved: Sequence[str],
+        *,
+        round_index: int,
+        max_regular_round: int,
+    ) -> ModeratorRoundDecision:
+        repetition_issue = _moderator_repetition_issue(turns)
+        reached_round_limit = round_index >= max_regular_round
+        fallback = _fallback_moderator_round_decision(
+            base_decision,
+            candidate_unresolved,
+            round_index=round_index,
+            reached_round_limit=reached_round_limit,
+            repetition_issue=repetition_issue,
         )
-        negative_label, negative_verdict, negative_statement = _fallback_side_conclusion(
-            "NEGATIVE", bundle, base_decision, challenges
+        round_context = "\n\n".join(
+            f"{_role_label(turn.role.value)}第 {turn.round_index} 回合：\n{turn.claim}"
+            for turn in turns
+            if turn.round_index == round_index and turn.role != DebateRole.MODERATOR
         )
-        affirmative = SideConclusion(affirmative_label, affirmative_verdict, affirmative_statement)
-        negative = SideConclusion(negative_label, negative_verdict, negative_statement)
-        side_final = _final_conclusion(affirmative, negative)
-        final_conclusion = f"Moderator 提前结束：{reason}；{side_final}"
-        decision = _decision_from_conclusions(base_decision, affirmative, negative, final_conclusion)
-        turns.append(
-            DebateTurn(
-                role=DebateRole.MODERATOR,
-                round_index=max((turn.round_index for turn in turns), default=0),
-                claim=final_conclusion,
-                evidence_ids=[item.evidence_id for item in bundle.evidence],
-                resolved=decision.verdict != Verdict.INCONCLUSIVE,
+        issue_context = f"检测到复读：{repetition_issue}" if repetition_issue else ""
+        llm_review = self._llm_response(
+            "MODERATOR",
+            (
+                "分析本轮正反方陈述，裁定是否需要继续下一轮。"
+                "必须客观说明双方一致点、仍未闭环争议、是否存在复读或证据跳跃。"
+                "只能依据证据链和本轮陈述，不得替任一方新增事实。"
+            ),
+            bundle,
+            extra=_stage_context(
+                f"Moderator 第 {round_index} 回合分析",
+                (
+                    f"本轮正反方陈述：\n{round_context}\n\n"
+                    f"候选未闭环争议：\n{_challenge_lines(candidate_unresolved)}\n"
+                    f"{issue_context}"
+                ),
+                challenges,
+                "",
+            ),
+            output_instruction=(
+                "按以下字段输出：是否继续下一轮：是/否；未闭环争议：逐条列出或写无；"
+                "分析：2 到 4 句话。不要复述任务、角色或格式要求。"
+            ),
+        )
+        parsed = _parse_moderator_round_decision(llm_review, fallback, candidate_unresolved)
+        decision = parsed or fallback
+        if reached_round_limit and decision.continue_debate:
+            decision = ModeratorRoundDecision(
+                continue_debate=False,
+                unresolved=decision.unresolved,
+                summary=_append_moderator_limit_notice(decision.summary, round_index),
             )
-        )
-        self._emit_progress(bundle, decision, turns, final_conclusion=final_conclusion)
-        return turns, final_conclusion, decision
+        return decision
 
     def _emit_progress(
         self,
@@ -314,7 +413,7 @@ class DebateOrchestrator:
                 reasoning_summary=decision.reasoning_summary,
                 final_conclusion=final_conclusion,
                 evidence_chain=bundle.evidence,
-                debate=list(turns),
+                debate=_dedupe_debate_turns(turns),
                 disputed_points=decision.disputed_points,
                 protection_assessment=_protection_assessment(bundle.evidence),
                 impact_assessment=_impact_assessment(bundle.evidence),
@@ -929,6 +1028,191 @@ def _normalize_claim_for_repetition(text: str) -> str:
     return normalized
 
 
+def _dedupe_debate_turns(turns: Sequence[DebateTurn]) -> List[DebateTurn]:
+    deduped: List[DebateTurn] = []
+    seen = set()
+    for turn in turns:
+        key = (turn.role.value, turn.round_index, re.sub(r"\s+", " ", turn.claim).strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(turn)
+    return deduped
+
+
+def _fallback_moderator_round_decision(
+    base_decision: DebateDecision,
+    candidate_unresolved: Sequence[str],
+    *,
+    round_index: int,
+    reached_round_limit: bool,
+    repetition_issue: Optional[str],
+) -> ModeratorRoundDecision:
+    unresolved = _merge_challenges(candidate_unresolved)
+    if repetition_issue:
+        return ModeratorRoundDecision(
+            continue_debate=False,
+            unresolved=unresolved,
+            summary=_moderator_round_summary(
+                round_index,
+                False,
+                unresolved,
+                f"检测到复读：{repetition_issue}；继续辩论不会增加新证据，进入最终总结。",
+            ),
+        )
+    if reached_round_limit:
+        return ModeratorRoundDecision(
+            continue_debate=False,
+            unresolved=unresolved,
+            summary=_moderator_round_summary(
+                round_index,
+                False,
+                unresolved,
+                "已达到预设轮数，本轮分析后进入正方、反方和 Moderator 的最终总结。",
+            ),
+        )
+    if _can_reach_consensus(base_decision, unresolved):
+        return ModeratorRoundDecision(
+            continue_debate=False,
+            unresolved=[],
+            summary=_moderator_round_summary(
+                round_index,
+                False,
+                [],
+                "正反方本轮未保留阻断性质疑，证据链已达到当前自动裁决所需闭环，进入最终总结。",
+            ),
+        )
+    if _material_unresolved(unresolved):
+        return ModeratorRoundDecision(
+            continue_debate=True,
+            unresolved=unresolved,
+            summary=_moderator_round_summary(
+                round_index,
+                True,
+                unresolved,
+                "本轮仍存在会影响结论的未闭环争议，需要正方继续补证或澄清，并由反方复审。",
+            ),
+        )
+    return ModeratorRoundDecision(
+        continue_debate=False,
+        unresolved=unresolved,
+        summary=_moderator_round_summary(
+            round_index,
+            False,
+            unresolved,
+            "剩余问题未构成继续辩论的阻断性质疑，进入最终总结。",
+        ),
+    )
+
+
+def _parse_moderator_round_decision(
+    text: Optional[str], fallback: ModeratorRoundDecision, candidate_unresolved: Sequence[str]
+) -> Optional[ModeratorRoundDecision]:
+    if not text or _looks_like_task_echo(text):
+        return None
+    summary = _clean_moderator_review_text(text)
+    if not summary:
+        return None
+    continue_debate = _parse_continue_decision(summary, fallback.continue_debate)
+    unresolved = _merge_challenges(candidate_unresolved, _negative_disputed_points(summary))
+    if not continue_debate and not _material_unresolved(unresolved):
+        unresolved = []
+    if continue_debate and not unresolved:
+        unresolved = list(fallback.unresolved)
+    return ModeratorRoundDecision(
+        continue_debate=continue_debate,
+        unresolved=unresolved,
+        summary=_ensure_moderator_decision_summary(summary, continue_debate, unresolved),
+    )
+
+
+def _parse_continue_decision(text: str, default: bool) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower())
+    negative_patterns = (
+        "是否继续下一轮:否",
+        "是否继续下一轮：否",
+        "继续下一轮:否",
+        "继续下一轮：否",
+        "是否继续:否",
+        "是否继续：否",
+        "不继续下一轮",
+        "无需继续",
+        "不需要继续",
+        "停止继续",
+        "进入最终总结",
+        "进入结案",
+    )
+    if any(pattern in normalized for pattern in negative_patterns):
+        return False
+    positive_patterns = (
+        "是否继续下一轮:是",
+        "是否继续下一轮：是",
+        "继续下一轮:是",
+        "继续下一轮：是",
+        "是否继续:是",
+        "是否继续：是",
+        "需要继续",
+        "继续辩论",
+        "继续下一轮",
+    )
+    if any(pattern in normalized for pattern in positive_patterns):
+        return True
+    return default
+
+
+def _clean_moderator_review_text(text: str) -> str:
+    lines = []
+    for raw_line in text.strip().splitlines():
+        if _looks_like_task_echo(raw_line):
+            continue
+        cleaned = raw_line.replace("**", "").strip()
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines).strip()[:1200]
+
+
+def _ensure_moderator_decision_summary(text: str, continue_debate: bool, unresolved: Sequence[str]) -> str:
+    if re.search(r"是否继续(?:下一轮|辩论)?\s*[:：]", text):
+        return text
+    return "\n".join(
+        [
+            "## Moderator 回合分析",
+            f"是否继续下一轮：{'是' if continue_debate else '否'}",
+            "未闭环争议：",
+            _challenge_lines(unresolved),
+            "分析：",
+            text,
+        ]
+    )
+
+
+def _append_moderator_limit_notice(summary: str, round_index: int) -> str:
+    notice = f"已达到第 {round_index} 个可交锋回合，下一轮进入最终总结。"
+    if notice in summary:
+        return summary
+    return summary.rstrip() + "\n\n" + notice
+
+
+def _moderator_round_summary(round_index: int, continue_debate: bool, unresolved: Sequence[str], analysis: str) -> str:
+    return "\n".join(
+        [
+            f"## Moderator 第 {round_index} 回合分析",
+            f"是否继续下一轮：{'是' if continue_debate else '否'}",
+            "未闭环争议：",
+            _challenge_lines(unresolved),
+            "分析：",
+            analysis,
+        ]
+    )
+
+
+def _challenge_lines(challenges: Sequence[str]) -> str:
+    items = [str(item).strip() for item in challenges if str(item).strip()]
+    if not items:
+        return "- 无"
+    return "\n".join(f"- {item}" for item in items[:8])
+
+
 def _fallback_side_conclusion(
     role: str, bundle: EvidenceBundle, decision: DebateDecision, challenges: Sequence[str]
 ) -> Tuple[str, Verdict, str]:
@@ -972,6 +1256,8 @@ def _clean_moderator_summary(text: str) -> str:
 def _clean_statement_segments(text: str, max_segments: int, label: str = "") -> List[str]:
     segments: List[str] = []
     for raw_line in text.strip().splitlines():
+        if _looks_like_task_echo(raw_line):
+            continue
         line = _strip_response_line(raw_line, label)
         if not line:
             continue
@@ -986,10 +1272,10 @@ def _clean_statement_segments(text: str, max_segments: int, label: str = "") -> 
 
 
 def _strip_response_line(text: str, label: str = "") -> str:
-    cleaned = text.strip("# -*\t ，,;；")
+    cleaned = text.replace("**", "").strip("# -*\t ，,;；")
     cleaned = re.sub(r"^\s*(?:\d+[\.\、\)]\s*)+", "", cleaned)
     cleaned = re.sub(
-        r"^\s*(?:分析请求|请求分析|分析|思考|推理|reasoning|analysis)\s*[:：]\s*",
+        r"^\s*(?:分析用户请求|分析请求|请求分析|理解目标|分析输入|分析|思考|推理|reasoning|analysis)\s*[:：]\s*",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -1004,7 +1290,7 @@ def _strip_response_line(text: str, label: str = "") -> str:
     cleaned = re.sub(r"^\s*(?:结案陈述|结案陈词|陈述正文|正文|主持人总结|总结)\s*[:：]\s*", "", cleaned)
     cleaned = re.sub(r"^\s*(?:\d+[\.\、\)]\s*)+", "", cleaned)
     cleaned = re.sub(
-        r"^\s*(?:分析请求|请求分析|分析|思考|推理|reasoning|analysis)\s*[:：]\s*",
+        r"^\s*(?:分析用户请求|分析请求|请求分析|理解目标|分析输入|角色|任务|方向|约束|反方质疑摘要|分析|思考|推理|reasoning|analysis)\s*[:：]\s*",
         "",
         cleaned,
         flags=re.IGNORECASE,
@@ -1021,8 +1307,13 @@ def _looks_like_task_echo(statement: str) -> bool:
     normalized = re.sub(r"\s+", "", statement.lower())
     markers = (
         "用户要求",
+        "用户请求",
         "任务要求",
         "根据任务要求",
+        "分析用户请求",
+        "理解目标",
+        "分析输入",
+        "用户希望我担任",
         "agent.md",
         "agent配置",
         "角色配置",
@@ -1073,9 +1364,23 @@ def _looks_like_task_echo(statement: str) -> bool:
         "作为反方",
         "作为中立moderator",
         "作为主持人",
+        "担任正方",
+        "担任反方",
+        "担任主持人",
         "affirmative_default",
+        "positive_default",
         "negative_default",
         "moderator_default",
+        "正方agent",
+        "反方agent",
+        "反方质疑摘要",
+        "方向真实漏洞",
+        "方向误报",
+        "方向证据不足",
+        "约束中文markdown",
+        "引用证据id",
+        "不重复指令",
+        "坚持漏洞主张",
         "给出简短结案陈述",
         "给出最终结案陈述",
         "结案陈述正文",
@@ -1234,10 +1539,128 @@ def _has_project_context(evidence: Sequence[CodeEvidence]) -> bool:
     return any(item.kind == EvidenceKind.PROJECT_CONTEXT for item in evidence)
 
 
+def _merge_challenges(*groups: Sequence[str]) -> List[str]:
+    merged: List[str] = []
+    seen = set()
+    for group in groups:
+        for item in group:
+            cleaned = _clean_dispute_line(item)
+            if not cleaned:
+                continue
+            key = re.sub(r"\s+", "", cleaned.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(cleaned)
+    return merged[:8]
+
+
+def _negative_disputed_points(text: str) -> List[str]:
+    disputes: List[str] = []
+    for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = _clean_dispute_line(raw_line)
+        if not line or _is_negative_acceptance_line(line):
+            continue
+        if _is_negative_dispute_line(line):
+            disputes.append(line)
+    return _merge_challenges(disputes)
+
+
+def _clean_dispute_line(text: str) -> str:
+    cleaned = text.replace("**", "").strip()
+    cleaned = re.sub(r"^\s*(?:[-*+>]\s*)+", "", cleaned)
+    cleaned = re.sub(r"^\s*(?:\d+[\.\、\)]\s*)+", "", cleaned)
+    cleaned = cleaned.strip("# \t，,;；")
+    cleaned = re.sub(r"^\s*(?:仍未闭环的问题|待正方澄清的问题|反方阶段性意见|反方复审意见|是否继续质疑)\s*[:：]?\s*", "", cleaned)
+    if cleaned in {"是", "否", "问题", "质疑", "分歧"}:
+        return ""
+    if cleaned.startswith("正方必须证明") and "否则结论应" in cleaned:
+        return ""
+    normalized = re.sub(r"\s+", "", cleaned.lower())
+    if "不接受未引用证据id的新增事实" in normalized:
+        return ""
+    return cleaned[:240].strip()
+
+
+def _is_negative_acceptance_line(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower())
+    if "不接受" in normalized or "暂不接受" in normalized:
+        return False
+    acceptance_markers = (
+        "暂未发现足以推翻",
+        "暂无已知阻断性质疑",
+        "暂未发现硬性反证",
+        "未发现足以推翻",
+        "不继续质疑",
+        "无需继续质疑",
+        "已经闭环",
+        "已闭环",
+        "可以闭环",
+        "接受攻击链基本成立",
+        "反方接受",
+        "同意正方",
+    )
+    return any(marker in normalized for marker in acceptance_markers)
+
+
+def _is_negative_dispute_line(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", text.lower())
+    dispute_markers = (
+        "仍未闭环",
+        "未闭环",
+        "无法证明",
+        "未证明",
+        "尚未证明",
+        "不能证明",
+        "无法确认",
+        "未验证",
+        "缺少",
+        "缺乏",
+        "证据不足",
+        "不成立",
+        "不可达",
+        "断点",
+        "跳跃",
+        "无关命中",
+        "混充证据",
+        "浑水摸鱼",
+        "误报",
+        "不接受",
+        "继续质疑",
+        "存在分歧",
+        "不同意",
+        "不能支持",
+        "无法支持",
+        "遗漏",
+        "死代码",
+    )
+    return any(marker in normalized for marker in dispute_markers)
+
+
 def _material_unresolved(challenges: Sequence[str]) -> bool:
     material = (
         "无法",
         "尚未建立",
+        "未闭环",
+        "无法证明",
+        "未证明",
+        "尚未证明",
+        "不能证明",
+        "无法确认",
+        "未验证",
+        "缺少",
+        "缺乏",
+        "证据不足",
+        "不成立",
+        "不可达",
+        "断点",
+        "跳跃",
+        "不接受",
+        "存在分歧",
+        "不同意",
+        "不能支持",
+        "无法支持",
+        "遗漏",
         "受限",
         "cannot be resolved",
         "No verified",

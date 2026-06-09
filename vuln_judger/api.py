@@ -29,10 +29,20 @@ PROMPT_ECHO_MARKERS = (
     "Agent 配置",
     "角色配置",
     "角色名称",
+    "正方 Agent",
+    "反方 Agent",
     "提示词",
     "用户要求",
+    "用户请求",
+    "分析用户请求",
+    "理解目标",
+    "分析输入",
+    "用户希望我担任",
+    "反方质疑摘要",
     "任务要求",
     "格式要求",
+    "方向：",
+    "约束：",
     "结论标签固定",
     "标签约束",
     "强约束",
@@ -3316,9 +3326,19 @@ def app_html() -> str:
         </div>`;
     }}
 
+    function uniqueDebateTurns(debate) {{
+      const seen = new Set();
+      return (debate || []).filter(turn => {{
+        const key = [turn.role || '', turn.round_index ?? '', String(turn.claim || '').replace(/\\s+/g, ' ').trim()].join('|');
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }});
+    }}
+
     function renderFindingDetail(detail) {{
       const evidence = detail.evidence_chain || [];
-      const debate = detail.debate || [];
+      const debate = uniqueDebateTurns(detail.debate || []);
       return `
         ${{renderOriginalReportSection(detail)}}
         <div class="detail">

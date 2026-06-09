@@ -1197,6 +1197,7 @@ for raw in sys.stdin.buffer:
         self.assertIn('原始报告详情', html)
         self.assertIn('renderOriginalReportSection(detail)', html)
         self.assertIn('raw_result', html)
+        self.assertIn('function uniqueDebateTurns(debate)', html)
         self.assertIn('function renderTable(start)', html)
         self.assertIn('function bindRunExportButtons()', html)
         self.assertIn('function exportRun(runId, format)', html)
@@ -1924,11 +1925,15 @@ for raw in sys.stdin.buffer:
             bundle.finding.message = "demo"
             bundle.finding.locations = finding.source_locations
             bad_final = (
-                "【证据不足】，1.分析请求:这是一个强约束。"
-                "即使我之前的分析认为漏洞成立，我也必须遵守这个标签约束。"
-                "用户要求我作为正方(Affirmative_default)给出最终结案陈述。"
+                "【真实漏洞】，分析用户请求**： 方向**：真实漏洞。 "
+                "约束**：中文 Markdown，引用证据 ID，不编造，不重复指令。"
             )
-            bad_summary = "我需要总结正反方核心观点，并输出 2 到 5 句话。"
+            bad_summary = (
+                "理解目标**：用户希望我担任“正方 Agent”（Positive_default），"
+                "对“反方”提出的质疑进行反驳，并提交最终结案报告。 "
+                "分析输入**： 角色**：正方 Agent（Positive_default）。 "
+                "任务**：反驳反方质疑，坚持漏洞主张。 反方质疑摘要**："
+            )
             report = DebateOrchestrator(
                 affirmative_client=FakeLLM(bad_final),
                 negative_client=FakeLLM(bad_final),
@@ -1942,6 +1947,10 @@ for raw in sys.stdin.buffer:
                 self.assertNotIn("结论标签固定", field)
                 self.assertNotIn("只输出1到3句话", field)
                 self.assertNotIn("分析请求", field)
+                self.assertNotIn("分析用户请求", field)
+                self.assertNotIn("理解目标", field)
+                self.assertNotIn("Positive_default", field)
+                self.assertNotIn("反方质疑摘要", field)
                 self.assertNotIn("强约束", field)
                 self.assertNotIn("标签约束", field)
                 self.assertNotIn("必须遵守", field)
@@ -1949,10 +1958,125 @@ for raw in sys.stdin.buffer:
             for turn in serialized["debate"]:
                 if turn["claim"].startswith("## 正方结案") or turn["claim"].startswith("## 反方结案"):
                     self.assertNotIn("分析请求", turn["claim"])
+                    self.assertNotIn("分析用户请求", turn["claim"])
                     self.assertNotIn("强约束", turn["claim"])
                     self.assertNotIn("标签约束", turn["claim"])
             self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.final_conclusion)
             self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.reasoning_summary)
+
+    def test_negative_dispute_prevents_default_web_debate_from_closing_after_first_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            finding = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            ).reports[0]
+            bundle = EvidenceBundle(
+                finding=type("FindingLike", (), {})(),
+                evidence=finding.evidence_chain,
+                diagnostics=[],
+            )
+            bundle.finding.finding_id = finding.finding_id
+            bundle.finding.rule_id = finding.rule_id
+            bundle.finding.message = "demo"
+            bundle.finding.locations = finding.source_locations
+            affirmative = SequenceLLM(
+                [
+                    "正方证据报告：调用链和数据流已按证据闭环。",
+                    "正方第 2 回合澄清：继续补充外部输入可达性证据。",
+                    "正方第 3 回合澄清：继续补充调用链证据。",
+                    "正方结案正文。",
+                ]
+            )
+            negative = SequenceLLM(
+                [
+                    "## 反方质疑报告\n### 仍未闭环的问题\n- 调用链仍未闭环，报告无法证明外部输入可达。\n### 是否继续质疑：是",
+                    "## 反方第 2 回合复审报告\n### 仍未闭环的问题\n- 调用链仍未闭环，反方继续质疑。",
+                    "## 反方第 3 回合复审报告\n### 仍未闭环的问题\n- 调用链仍未闭环，反方继续质疑。",
+                    "反方结案正文。",
+                ]
+            )
+            report = DebateOrchestrator(
+                max_rounds=4,
+                affirmative_client=affirmative,
+                negative_client=negative,
+                moderator_client=FakeLLM("主持人总结正文。"),
+            ).adjudicate(bundle)
+
+            moderator_rounds = [
+                turn for turn in report.debate if turn.role.value == "MODERATOR" and turn.round_index == 1
+            ]
+            self.assertTrue(moderator_rounds)
+            self.assertIn("是否继续下一轮：是", moderator_rounds[0].claim)
+            affirmative_rounds = [
+                turn for turn in report.debate if turn.role.value == "AFFIRMATIVE" and turn.round_index == 2
+            ]
+            self.assertTrue(affirmative_rounds)
+            self.assertNotIn("正方结案", affirmative_rounds[0].claim)
+            self.assertTrue(
+                any(turn.role.value == "NEGATIVE" and turn.round_index == 2 for turn in report.debate)
+            )
+            self.assertNotEqual(report.debate[-1].round_index, 2)
+            self.assertEqual(report.debate[-1].round_index, 4)
+            self.assertTrue(
+                any(turn.role.value == "AFFIRMATIVE" and turn.round_index == 4 and "正方结案" in turn.claim for turn in report.debate)
+            )
+
+    def test_moderator_can_stop_next_round_even_when_negative_disputes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            finding = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            ).reports[0]
+            bundle = EvidenceBundle(
+                finding=type("FindingLike", (), {})(),
+                evidence=finding.evidence_chain,
+                diagnostics=[],
+            )
+            bundle.finding.finding_id = finding.finding_id
+            bundle.finding.rule_id = finding.rule_id
+            bundle.finding.message = "demo"
+            bundle.finding.locations = finding.source_locations
+            report = DebateOrchestrator(
+                max_rounds=4,
+                affirmative_client=SequenceLLM(["正方证据报告。", "正方最终总结正文。"]),
+                negative_client=SequenceLLM(
+                    [
+                        "## 反方质疑报告\n- 调用链仍未闭环，报告无法证明外部输入可达。",
+                        "反方最终总结正文。",
+                    ]
+                ),
+                moderator_client=SequenceLLM(
+                    [
+                        "是否继续下一轮：否\n未闭环争议：无\n分析：Moderator 裁定当前争议不需要继续下一轮。",
+                        "Moderator 最终总结正文。",
+                    ]
+                ),
+            ).adjudicate(bundle)
+
+            moderator_round = next(
+                turn for turn in report.debate if turn.role.value == "MODERATOR" and turn.round_index == 1
+            )
+            self.assertIn("是否继续下一轮：否", moderator_round.claim)
+            self.assertEqual(report.debate[-1].round_index, 2)
+            self.assertFalse(
+                any(
+                    turn.role.value == "AFFIRMATIVE"
+                    and turn.round_index == 2
+                    and "正方结案" not in turn.claim
+                    for turn in report.debate
+                )
+            )
+            self.assertIn("Moderator 最终总结正文", report.final_conclusion)
 
     def test_moderator_ends_debate_when_agents_repeat(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1983,9 +2107,18 @@ for raw in sys.stdin.buffer:
             ).adjudicate(bundle)
 
             self.assertEqual(report.debate[-1].role.value, "MODERATOR")
-            self.assertIn("Moderator 提前结束", report.final_conclusion)
-            self.assertIn("高度复读", report.final_conclusion)
-            self.assertLess(len(report.debate), 6)
+            moderator_round = next(
+                turn for turn in report.debate if turn.role.value == "MODERATOR" and turn.round_index == 1
+            )
+            self.assertIn("是否继续下一轮：否", moderator_round.claim)
+            self.assertIn("高度复读", moderator_round.claim)
+            self.assertTrue(
+                any(turn.role.value == "AFFIRMATIVE" and turn.round_index == 2 and "正方结案" in turn.claim for turn in report.debate)
+            )
+            self.assertTrue(
+                any(turn.role.value == "NEGATIVE" and turn.round_index == 2 and "反方结案" in turn.claim for turn in report.debate)
+            )
+            self.assertEqual(report.debate[-1].round_index, 2)
 
     def test_run_report_records_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2576,6 +2709,20 @@ class FakeLLM(LLMClient):
     def complete(self, system_prompt: str, user_prompt: str):
         self.calls.append((system_prompt, user_prompt))
         return self.response
+
+
+class SequenceLLM(LLMClient):
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def complete(self, system_prompt: str, user_prompt: str):
+        self.calls.append((system_prompt, user_prompt))
+        if not self.responses:
+            return ""
+        if len(self.responses) == 1:
+            return self.responses[0]
+        return self.responses.pop(0)
 
 
 if __name__ == "__main__":
