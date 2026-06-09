@@ -1142,6 +1142,8 @@ for raw in sys.stdin.buffer:
         self.assertIn('state.autoRefreshEnabled', html)
         self.assertIn('function toggleAutoRefresh()', html)
         self.assertIn('function updateAutoRefreshControl()', html)
+        self.assertIn('async function refreshSelectedRun(resetFinding = false)', html)
+        self.assertIn('await refreshSelectedRun(false)', html)
         self.assertIn('id="mcp-server-panel"', html)
         self.assertIn('id="skill-source-panel"', html)
         self.assertIn('#mcp-server-panel', html)

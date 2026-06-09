@@ -2214,7 +2214,16 @@ def app_html() -> str:
     }}
 
     async function refreshAll() {{
+      const selectedRun = state.selectedRun;
       await Promise.all([loadProviders(), loadAgentPrompts(), loadIntegrations(), loadRuns()]);
+      if (selectedRun && state.runs.some(run => run.run_id === selectedRun)) {{
+        await refreshSelectedRun(false);
+      }}
+    }}
+
+    async function refreshSelectedRun(resetFinding = false) {{
+      if (!state.selectedRun) return;
+      await selectRun(state.selectedRun, resetFinding);
     }}
 
     async function loadProviders() {{
