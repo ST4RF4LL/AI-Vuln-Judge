@@ -1323,6 +1323,15 @@ def app_html() -> str:
       white-space: pre-wrap;
     }}
     .markdown-body pre code {{ background: transparent; padding: 0; color: inherit; }}
+    .plain-text {{
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      line-height: 1.65;
+    }}
+    .plain-inline {{
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }}
     .debate-turn {{
       display: grid;
       gap: 8px;
@@ -1817,6 +1826,47 @@ def app_html() -> str:
       return String(value ?? '').replace(/[&<>"']/g, ch => ({{
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       }}[ch]));
+    }}
+    const promptEchoPatterns = [
+      /AGENT\\.md/i,
+      /Agent\\s*配置/i,
+      /角色配置/,
+      /角色名称/,
+      /提示词/,
+      /用户要求/,
+      /任务要求/,
+      /格式要求/,
+      /格式说明/,
+      /结论标签固定/,
+      /标签约束/,
+      /强约束/,
+      /分析请求/,
+      /必须遵守/,
+      /之前的分析/,
+      /禁止编造/,
+      /每个具体论断/,
+      /输出必须/,
+      /只输出/,
+      /只返回/,
+      /证据解释约束/,
+      /SOURCE_ROOT\\s*只能证明/i,
+      /rg\\/grep\\s*证据必须/i
+    ];
+    function displayText(value) {{
+      const raw = String(value ?? '').replace(/\\r\\n?/g, '\\n');
+      if (!raw.trim()) return '';
+      const kept = raw.split('\\n').filter(line => {{
+        const trimmed = line.trim();
+        if (!trimmed) return true;
+        return !promptEchoPatterns.some(pattern => pattern.test(trimmed));
+      }}).join('\\n').trim();
+      return kept || '内容疑似为提示词回显，已隐藏。';
+    }}
+    function plainText(value) {{
+      return esc(displayText(value));
+    }}
+    function plainInlineText(value) {{
+      return esc(displayText(value).replace(/\\s+/g, ' ').trim());
     }}
     function renderMarkdown(value) {{
       const text = String(value ?? '').replace(/\\r\\n?/g, '\\n');
@@ -3075,7 +3125,7 @@ def app_html() -> str:
                   <td><span class="chip ${{verdictClass(item.verdict)}}">${{esc(verdictLabel(item.verdict))}}</span></td>
                   <td>${{esc(item.rule_id)}}<div class="path">${{esc(item.finding_id)}}</div></td>
                   <td>${{esc(item.confidence)}}</td>
-                  <td>${{esc(item.summary)}}<div class="path">${{esc((item.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div></td>
+                  <td><span class="plain-inline">${{plainInlineText(item.summary)}}</span><div class="path">${{esc((item.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div></td>
                 </tr>`).join('')}}
               </tbody>
             </table>
@@ -3167,11 +3217,11 @@ def app_html() -> str:
               <span class="chip">置信度 ${{esc(detail.confidence)}}</span>
               <span class="chip">${{esc(detail.rule_id)}}</span>
             </div>
-            ${{detail.final_conclusion ? `<div><strong>最终结论：</strong> ${{esc(detail.final_conclusion)}}</div>` : ''}}
-            <div>${{esc(detail.reasoning_summary)}}</div>
-            <div><strong>防护研判：</strong> ${{esc(detail.protection_assessment)}}</div>
-            <div><strong>影响研判：</strong> ${{esc(detail.impact_assessment)}}</div>
-            ${{(detail.disputed_points || []).length ? `<div><strong>争议点：</strong><ul>${{detail.disputed_points.map(point => `<li>${{esc(point)}}</li>`).join('')}}</ul></div>` : ''}}
+            ${{detail.final_conclusion ? `<div><strong>最终结论：</strong> <span class="plain-text">${{plainText(detail.final_conclusion)}}</span></div>` : ''}}
+            <div class="plain-text">${{plainText(detail.reasoning_summary)}}</div>
+            <div><strong>防护研判：</strong> <span class="plain-text">${{plainText(detail.protection_assessment)}}</span></div>
+            <div><strong>影响研判：</strong> <span class="plain-text">${{plainText(detail.impact_assessment)}}</span></div>
+            ${{(detail.disputed_points || []).length ? `<div><strong>争议点：</strong><ul>${{detail.disputed_points.map(point => `<li><span class="plain-text">${{plainText(point)}}</span></li>`).join('')}}</ul></div>` : ''}}
           </div>
         </div>
         <div class="detail">
@@ -3179,7 +3229,7 @@ def app_html() -> str:
           <div class="detail-body">
             ${{debate.map(turn => `<div class="debate-turn">
               <strong>${{esc(roleLabel(turn.role))}} 第 ${{esc(turn.round_index)}} 回合</strong>
-              <div class="markdown-body">${{renderMarkdown(turn.claim)}}</div>
+              <div class="plain-text">${{plainText(turn.claim)}}</div>
               <div class="path">证据：${{esc((turn.evidence_ids || []).join(', '))}}</div>
             </div>`).join('') || '<div class="muted">暂无博弈回合记录。</div>'}}
           </div>
@@ -3194,7 +3244,7 @@ def app_html() -> str:
                 <span class="chip">${{esc(evidenceStrengthLabel(item.strength))}}</span>
                 <span class="chip">${{esc(item.source)}}</span>
               </div>
-              <div>${{esc(item.summary)}}</div>
+              <div class="plain-text">${{plainText(item.summary)}}</div>
               ${{item.locations && item.locations.length ? `<div class="path">位置：${{esc(item.locations.map(locationText).join(' -> '))}}</div>` : ''}}
               ${{item.data && (item.data.requested_file || item.data.resolved_file) ? `<div class="path">路径映射：${{esc(item.data.requested_file || '')}}${{item.data.resolved_file ? ' => ' + esc(item.data.resolved_file) : ''}}</div>` : ''}}
               ${{item.snippet ? `<pre>${{esc(item.snippet)}}</pre>` : ''}}

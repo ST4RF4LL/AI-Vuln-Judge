@@ -1157,7 +1157,12 @@ for raw in sys.stdin.buffer:
         self.assertIn('id="run-moderator-provider"', html)
         self.assertIn('function renderMarkdown(value)', html)
         self.assertIn('class="markdown-body"', html)
-        self.assertIn('renderMarkdown(turn.claim)', html)
+        self.assertIn('function plainText(value)', html)
+        self.assertIn('function displayText(value)', html)
+        self.assertIn('promptEchoPatterns', html)
+        self.assertIn('plainText(turn.claim)', html)
+        self.assertNotIn('renderMarkdown(turn.claim)', html)
+        self.assertIn('class="plain-text"', html)
         self.assertIn('function renderTable(start)', html)
         self.assertIn('function bindRunExportButtons()', html)
         self.assertIn('function exportRun(runId, format)', html)
@@ -1881,9 +1886,9 @@ for raw in sys.stdin.buffer:
             bundle.finding.message = "demo"
             bundle.finding.locations = finding.source_locations
             bad_final = (
-                "【证据不足】，我需要给出一个间断的结案陈述。"
+                "【证据不足】，1.分析请求:这是一个强约束。"
+                "即使我之前的分析认为漏洞成立，我也必须遵守这个标签约束。"
                 "用户要求我作为正方(Affirmative_default)给出最终结案陈述。"
-                "根据任务要求:1.结论标签固定为 2.只输出1到3句话"
             )
             bad_summary = "我需要总结正反方核心观点，并输出 2 到 5 句话。"
             report = DebateOrchestrator(
@@ -1898,6 +1903,16 @@ for raw in sys.stdin.buffer:
                 self.assertNotIn("用户要求", field)
                 self.assertNotIn("结论标签固定", field)
                 self.assertNotIn("只输出1到3句话", field)
+                self.assertNotIn("分析请求", field)
+                self.assertNotIn("强约束", field)
+                self.assertNotIn("标签约束", field)
+                self.assertNotIn("必须遵守", field)
+                self.assertNotIn("之前的分析", field)
+            for turn in serialized["debate"]:
+                if turn["claim"].startswith("## 正方结案") or turn["claim"].startswith("## 反方结案"):
+                    self.assertNotIn("分析请求", turn["claim"])
+                    self.assertNotIn("强约束", turn["claim"])
+                    self.assertNotIn("标签约束", turn["claim"])
             self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.final_conclusion)
             self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.reasoning_summary)
 

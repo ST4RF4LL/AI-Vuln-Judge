@@ -413,12 +413,13 @@ class DebateOrchestrator:
         llm_statement = self._llm_response(
             role,
             (
-                f"给出简短结案陈述。结论标签已固定为【{label}】，不得改成其他标签。"
-                "只输出结案陈述正文 1 到 3 句话，不要输出 Markdown 表格，不要复述用户要求、任务要求、角色名称或格式说明。"
+                f"给出简短结案陈述。当前结案方向为【{label}】，系统会自动添加标签。"
+                "你只需要输出结案陈述正文 1 到 3 句话，不要输出 Markdown 表格，"
+                "不要复述或讨论用户要求、任务要求、标签、格式约束、角色名称或指令遵循过程。"
             ),
             bundle,
             extra=_stage_context("结案", "最近一轮反方意见：\n" + last_negative, challenges, ""),
-            output_instruction="只返回结案陈述正文 1 到 3 句话；不要说明你要做什么，不要复述任务、标签或格式要求。",
+            output_instruction="只返回结案陈述正文 1 到 3 句话；不要说明你要做什么，不要复述任务、标签、约束或格式要求。",
         )
         if llm_statement:
             statement = _clean_final_statement(llm_statement, label) or statement
@@ -986,6 +987,13 @@ def _clean_statement_segments(text: str, max_segments: int, label: str = "") -> 
 
 def _strip_response_line(text: str, label: str = "") -> str:
     cleaned = text.strip("# -*\t ，,;；")
+    cleaned = re.sub(r"^\s*(?:\d+[\.\、\)]\s*)+", "", cleaned)
+    cleaned = re.sub(
+        r"^\s*(?:分析请求|请求分析|分析|思考|推理|reasoning|analysis)\s*[:：]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     labels = [label] if label else []
     labels.extend(item for item in ("真实漏洞", "误报", "证据不足") if item not in labels)
     label_pattern = "|".join(re.escape(item) for item in labels if item)
@@ -994,6 +1002,13 @@ def _strip_response_line(text: str, label: str = "") -> str:
         cleaned = re.sub(rf"^\s*【(?:{label_pattern})】\s*[，,;；:：-]*\s*", "", cleaned)
         cleaned = re.sub(rf"^\s*(?:{label_pattern})\s*[，,;；:：-]+\s*", "", cleaned)
     cleaned = re.sub(r"^\s*(?:结案陈述|结案陈词|陈述正文|正文|主持人总结|总结)\s*[:：]\s*", "", cleaned)
+    cleaned = re.sub(r"^\s*(?:\d+[\.\、\)]\s*)+", "", cleaned)
+    cleaned = re.sub(
+        r"^\s*(?:分析请求|请求分析|分析|思考|推理|reasoning|analysis)\s*[:：]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
     return cleaned.strip()
 
 
@@ -1008,8 +1023,45 @@ def _looks_like_task_echo(statement: str) -> bool:
         "用户要求",
         "任务要求",
         "根据任务要求",
+        "agent.md",
+        "agent配置",
+        "角色配置",
+        "角色名称",
+        "提示词",
+        "系统提示",
+        "systemprompt",
+        "prompt",
+        "开发者指令",
+        "系统指令",
+        "指令遵循",
+        "禁止编造文件",
+        "禁止编造",
+        "每个具体论断",
+        "输出必须使用中文markdown",
+        "证据解释约束",
+        "source_root只能证明",
+        "rg/grep证据必须",
+        "若存在atlas-agent-mcp",
+        "围绕报告收集证据",
+        "客观复核正方",
+        "不得新增双方没有提出",
+        "必须客观区分",
+        "输出应简洁",
+        "必须优先寻找新证据",
+        "重新阅读源码上下文",
+        "检查atlasproject/status",
+        "用search/trace/calls补齐",
         "结论标签固定",
         "标签固定为",
+        "标签约束",
+        "强约束",
+        "分析请求",
+        "指令要求",
+        "系统要求",
+        "遵守这个标签",
+        "必须遵守",
+        "之前的分析",
+        "即使我之前",
         "只输出",
         "只返回",
         "1到3句话",
