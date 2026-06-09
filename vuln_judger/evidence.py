@@ -129,8 +129,12 @@ class EvidenceCollector:
                 "rule_id": finding.rule_id,
                 "level": finding.level,
                 "message": finding.message,
+                "locations": [location.display() for location in finding.locations],
+                "code_flows": [[location.display() for location in flow] for flow in finding.code_flows],
                 "location_count": len(finding.locations),
                 "code_flow_count": len(finding.code_flows),
+                "properties": dict(finding.properties),
+                "raw_result": dict(finding.raw),
             },
         )
 

@@ -24,6 +24,27 @@ from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore
 
 DEFAULT_RECORDS_DIR = Path(".vuln-judger") / "runs"
 LOG = logger("api")
+PROMPT_ECHO_MARKERS = (
+    "AGENT.md",
+    "Agent 配置",
+    "角色配置",
+    "角色名称",
+    "提示词",
+    "用户要求",
+    "任务要求",
+    "格式要求",
+    "结论标签固定",
+    "标签约束",
+    "强约束",
+    "分析请求",
+    "必须遵守",
+    "禁止编造",
+    "每个具体论断",
+    "输出必须",
+    "只输出",
+    "只返回",
+    "证据解释约束",
+)
 
 
 def serve(
@@ -76,6 +97,9 @@ def make_handler(
     mcp_store = mcp_store or MCPServerStore(store.root.parent / "mcp.json")
     mcp_store.ensure_default_atlas()
     skill_store = skill_store or SkillSourceStore(store.root.parent / "skills.json")
+    recovered = store.recover_unfinished()
+    if recovered:
+        LOG.info("恢复未完成运行记录 count=%s ids=%s", len(recovered), ",".join(str(item.get("run_id")) for item in recovered))
     tasks = {}
     stop_events = {}
     pause_events = {}
@@ -95,6 +119,7 @@ def make_handler(
                     task = _task_from_config(config, run_id, "running")
                     stop_event = Event()
                     pause_event = Event()
+                    store.save_payload(task)
                     with tasks_lock:
                         tasks[run_id] = task
                         stop_events[run_id] = stop_event
@@ -120,6 +145,7 @@ def make_handler(
                         self._json({"error": "运行任务未找到或已结束"}, HTTPStatus.NOT_FOUND)
                     else:
                         LOG.info("收到停止任务请求 run_id=%s status=%s", parts[1], result.get("status"))
+                        store.save_payload(result)
                         self._json(result)
                     return
                 if len(parts) == 3 and parts[0] == "runs" and parts[2] == "pause":
@@ -128,6 +154,7 @@ def make_handler(
                         self._json({"error": "运行任务未找到或已结束"}, HTTPStatus.NOT_FOUND)
                     else:
                         LOG.info("收到暂停任务请求 run_id=%s status=%s", parts[1], result.get("status"))
+                        store.save_payload(result)
                         self._json(result)
                     return
                 if len(parts) == 3 and parts[0] == "runs" and parts[2] == "resume":
@@ -581,8 +608,10 @@ def _run_task(
             payload["config"] = _config_task_snapshot(config)
             last_payload = payload
             status = "stopping" if stop_event.is_set() else "pausing" if pause_event.is_set() else "running"
+            payload["status"] = status
             with tasks_lock:
                 tasks[payload["run_id"]] = _task_from_report_payload(payload, status)
+            store.save_payload(payload)
             LOG.info(
                 "后台任务进度 run_id=%s reports=%s debate_turns=%s",
                 payload["run_id"],
@@ -630,6 +659,7 @@ def _run_task(
             failed["error"] = str(exc)
             failed["diagnostics"] = [str(exc)]
             tasks[failed["run_id"]] = failed
+            store.save_payload(failed)
     finally:
         with tasks_lock:
             stop_events.pop(config.run_id, None)
@@ -781,6 +811,7 @@ def _request_resume(
         tasks[run_id] = task
         stop_events[run_id] = stop_event
         pause_events[run_id] = pause_event
+        store.save_payload(task)
     Thread(
         target=_run_task,
         args=(config, store, tasks, stop_events, pause_events, tasks_lock, stop_event, pause_event),
@@ -844,12 +875,52 @@ def _finding_summary(report):
         "rule_id": report.get("rule_id"),
         "verdict": report.get("verdict"),
         "confidence": report.get("confidence"),
-        "summary": report.get("reasoning_summary"),
+        "summary": _finding_report_summary(report),
         "final_conclusion": report.get("final_conclusion"),
         "source_locations": report.get("source_locations", []),
         "evidence_count": len(report.get("evidence_chain", [])),
         "debate_turn_count": len(report.get("debate", [])),
     }
+
+
+def _finding_report_summary(report: dict) -> str:
+    report_evidence = _report_evidence(report)
+    if report_evidence:
+        data = report_evidence.get("data") if isinstance(report_evidence.get("data"), dict) else {}
+        rule_id = str(data.get("rule_id") or report.get("rule_id") or "").strip()
+        level = str(data.get("level") or "").strip()
+        message = str(data.get("message") or "").strip()
+        locations = data.get("locations") if isinstance(data.get("locations"), list) else []
+        parts = []
+        if rule_id:
+            parts.append(f"{rule_id}（{level}）" if level else rule_id)
+        if message:
+            parts.append(message)
+        if locations:
+            parts.append("位置：" + "; ".join(str(item) for item in locations[:3]))
+        return "；".join(parts) or str(report_evidence.get("summary") or "")
+    fallback = str(report.get("final_conclusion") or report.get("reasoning_summary") or "")
+    return _strip_prompt_echo_text(fallback)
+
+
+def _report_evidence(report: dict) -> Optional[dict]:
+    for item in report.get("evidence_chain") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "REPORT" or item.get("source") == "input-report":
+            return item
+    return None
+
+
+def _strip_prompt_echo_text(value: str) -> str:
+    lines = []
+    for line in str(value or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        stripped = line.strip()
+        if stripped and any(marker.lower() in stripped.lower() for marker in PROMPT_ECHO_MARKERS):
+            continue
+        lines.append(line)
+    cleaned = "\n".join(lines).strip()
+    return cleaned or "摘要疑似为提示词回显，已隐藏。"
 
 
 def _agent_config_from_payload(payload, role: str) -> Optional[AgentConfig]:
@@ -1867,6 +1938,9 @@ def app_html() -> str:
     }}
     function plainInlineText(value) {{
       return esc(displayText(value).replace(/\\s+/g, ' ').trim());
+    }}
+    function rawText(value) {{
+      return esc(String(value ?? '').replace(/\\r\\n?/g, '\\n'));
     }}
     function renderMarkdown(value) {{
       const text = String(value ?? '').replace(/\\r\\n?/g, '\\n');
@@ -3205,10 +3279,48 @@ def app_html() -> str:
       }}
     }}
 
+    function findingReportEvidence(detail) {{
+      return (detail.evidence_chain || []).find(item => item && (item.kind === 'REPORT' || item.source === 'input-report')) || null;
+    }}
+
+    function jsonBlock(value) {{
+      try {{
+        return JSON.stringify(value ?? {{}}, null, 2);
+      }} catch (_error) {{
+        return String(value ?? '');
+      }}
+    }}
+
+    function renderOriginalReportSection(detail) {{
+      const item = findingReportEvidence(detail);
+      const data = item && item.data ? item.data : {{}};
+      const locations = Array.isArray(data.locations) ? data.locations : [];
+      const codeFlows = Array.isArray(data.code_flows) ? data.code_flows : [];
+      const properties = data.properties && typeof data.properties === 'object' ? data.properties : null;
+      const rawResult = data.raw_result && typeof data.raw_result === 'object' ? data.raw_result : null;
+      const rawLines = [
+        data.rule_id ? `规则：${{data.rule_id}}` : '',
+        data.level ? `等级：${{data.level}}` : '',
+        data.message ? `消息：${{data.message}}` : ''
+      ].filter(Boolean).join('\\n');
+      return `
+        <div class="detail">
+          <h3>原始报告详情</h3>
+          <div class="detail-body">
+            ${{rawLines ? `<div class="plain-text">${{rawText(rawLines)}}</div>` : '<div class="muted">未找到输入报告摘要。</div>'}}
+            ${{locations.length ? `<div><strong>报告位置：</strong><div class="plain-text">${{rawText(locations.join('\\n'))}}</div></div>` : ''}}
+            ${{codeFlows.length ? `<div><strong>报告代码流：</strong><pre>${{esc(codeFlows.map((flow, index) => `Flow ${{index + 1}}:\\n${{flow.join('\\n')}}`).join('\\n\\n'))}}</pre></div>` : ''}}
+            ${{properties ? `<div><strong>报告 properties：</strong><pre>${{esc(jsonBlock(properties))}}</pre></div>` : ''}}
+            ${{rawResult ? `<div><strong>原始 SARIF result：</strong><pre>${{esc(jsonBlock(rawResult))}}</pre></div>` : ''}}
+          </div>
+        </div>`;
+    }}
+
     function renderFindingDetail(detail) {{
       const evidence = detail.evidence_chain || [];
       const debate = detail.debate || [];
       return `
+        ${{renderOriginalReportSection(detail)}}
         <div class="detail">
           <h3>发现详情</h3>
           <div class="detail-body">

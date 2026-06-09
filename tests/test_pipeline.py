@@ -1026,6 +1026,37 @@ for raw in sys.stdin.buffer:
             self.assertIsNone(store.get(report.run_id))
             self.assertFalse(store.delete(report.run_id))
 
+    def test_record_store_recovers_unfinished_run_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunRecordStore(Path(tmp) / "records")
+            store.save_payload(
+                {
+                    "run_id": "run-recover",
+                    "status": "running",
+                    "created_at": "2026-06-09T00:00:00Z",
+                    "source_path": "/src",
+                    "sarif_path": "/report.sarif",
+                    "finding_count": 3,
+                    "completed_finding_count": 1,
+                    "current_finding_id": "finding-2",
+                    "current_finding_index": 1,
+                    "reports": [{"finding_id": "finding-1", "verdict": "TRUE_POSITIVE"}, {"finding_id": "partial"}],
+                    "diagnostics": [],
+                    "config": {"report_path": "/report.sarif", "source_path": "/src"},
+                }
+            )
+
+            recovered = store.recover_unfinished()
+
+            self.assertEqual(len(recovered), 1)
+            saved = store.get("run-recover")
+            self.assertEqual(saved["status"], "paused")
+            self.assertEqual(saved["completed_finding_count"], 1)
+            self.assertEqual(saved["resume_from_finding_id"], "finding-2")
+            self.assertEqual(saved["resume_from_finding_index"], 1)
+            self.assertEqual(len(saved["reports"]), 1)
+            self.assertIn("服务重启时发现任务未完成", saved["diagnostics"][-1])
+
     def test_api_serves_records_and_html(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1156,13 +1187,16 @@ for raw in sys.stdin.buffer:
         self.assertIn('id="default-moderator"', html)
         self.assertIn('id="run-moderator-provider"', html)
         self.assertIn('function renderMarkdown(value)', html)
-        self.assertIn('class="markdown-body"', html)
         self.assertIn('function plainText(value)', html)
+        self.assertIn('function rawText(value)', html)
         self.assertIn('function displayText(value)', html)
         self.assertIn('promptEchoPatterns', html)
         self.assertIn('plainText(turn.claim)', html)
         self.assertNotIn('renderMarkdown(turn.claim)', html)
         self.assertIn('class="plain-text"', html)
+        self.assertIn('原始报告详情', html)
+        self.assertIn('renderOriginalReportSection(detail)', html)
+        self.assertIn('raw_result', html)
         self.assertIn('function renderTable(start)', html)
         self.assertIn('function bindRunExportButtons()', html)
         self.assertIn('function exportRun(runId, format)', html)
@@ -1584,6 +1618,10 @@ for raw in sys.stdin.buffer:
                 )
                 running = wait_for_run_field(base, created["run_id"], "current_finding_id")
                 self.assertEqual(running["current_finding_index"], 0)
+                persisted_running = store.get(created["run_id"])
+                self.assertIsNotNone(persisted_running)
+                self.assertEqual(persisted_running["status"], "running")
+                self.assertEqual(persisted_running["current_finding_id"], running["current_finding_id"])
 
                 pause = post_json(f"{base}/runs/{created['run_id']}/pause", {})
                 self.assertEqual(pause["status"], "pausing")
