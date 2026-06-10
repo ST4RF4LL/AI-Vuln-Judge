@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
+from .evidence_graph import build_evidence_graph, graph_to_markdown
 from .llm import test_provider_connection
 from .logging_config import DEFAULT_LOG_FILE, configure_logging, logger
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE, MCPServerStore
@@ -996,7 +997,12 @@ def _export_run_markdown(run: dict) -> str:
                 f"- 发现 ID：{report.get('finding_id') or ''}",
                 f"- 结论：{report.get('verdict') or ''}",
                 f"- 置信度：{report.get('confidence')}",
-                f"- 最终结论：{report.get('final_conclusion') or ''}",
+                "",
+                "### 最终结论",
+                "",
+                _conclusion_without_graph(str(report.get("final_conclusion") or "无")),
+                "",
+                graph_to_markdown(_report_evidence_graph(report)).rstrip(),
                 "",
                 "### 摘要",
                 "",
@@ -1064,6 +1070,22 @@ def _export_run_markdown(run: dict) -> str:
             lines.append("- 无")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _report_evidence_graph(report: dict) -> dict:
+    graph = report.get("evidence_graph")
+    if isinstance(graph, dict) and graph.get("nodes"):
+        return graph
+    return build_evidence_graph(report.get("evidence_chain") or [], report.get("disputed_points") or [])
+
+
+def _conclusion_without_graph(text: str) -> str:
+    marker = "\n### 证据串联图"
+    if marker in text:
+        return text.split(marker, 1)[0].rstrip()
+    if text.startswith("### 证据串联图"):
+        return ""
+    return text.rstrip()
 
 
 def _location_text(location) -> str:
@@ -1416,6 +1438,50 @@ def app_html() -> str:
     .debate-turn {{
       display: grid;
       gap: 8px;
+    }}
+    .evidence-graph {{
+      display: grid;
+      gap: 12px;
+    }}
+    .graph-edge-row {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(140px, 0.7fr) auto minmax(0, 1fr);
+      gap: 8px;
+      align-items: center;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+    }}
+    .graph-node {{
+      min-width: 0;
+      padding: 7px 9px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #f8fafc;
+      overflow-wrap: anywhere;
+      line-height: 1.35;
+    }}
+    .graph-node.verified {{ border-color: #34d399; background: #ecfdf5; color: #064e3b; }}
+    .graph-node.partial {{ border-color: #f59e0b; background: #fffbeb; color: #78350f; }}
+    .graph-node.break {{ border-color: #f87171; background: #fef2f2; color: #7f1d1d; }}
+    .graph-arrow {{
+      color: var(--muted);
+      font-weight: 700;
+      text-align: center;
+    }}
+    .graph-edge-label {{
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+      overflow-wrap: anywhere;
+    }}
+    .graph-break-list {{
+      display: grid;
+      gap: 6px;
+      margin: 0;
+      padding-left: 18px;
+      color: #7f1d1d;
     }}
     .empty {{ padding: 42px 18px; color: var(--muted); text-align: center; }}
     .error {{ color: var(--bad); }}
@@ -3345,9 +3411,50 @@ def app_html() -> str:
       }});
     }}
 
+    function conclusionWithoutEvidenceGraph(value) {{
+      const text = String(value ?? '').replace(/\\r\\n?/g, '\\n');
+      const index = text.indexOf('\\n### 证据串联图');
+      if (index >= 0) return text.slice(0, index).trim();
+      return text.startsWith('### 证据串联图') ? '' : text.trim();
+    }}
+
+    function renderEvidenceGraphSection(detail) {{
+      const graph = detail.evidence_graph && typeof detail.evidence_graph === 'object' ? detail.evidence_graph : null;
+      if (!graph || !Array.isArray(graph.nodes) || !graph.nodes.length) return '';
+      const nodes = new Map(graph.nodes.map(node => [node.id, node]));
+      const edges = Array.isArray(graph.edges) ? graph.edges : [];
+      const breaks = Array.isArray(graph.breaks) ? graph.breaks : [];
+      const edgeRows = edges.map(edge => {{
+        const from = nodes.get(edge.from) || {{ label: edge.from, status: 'partial' }};
+        const to = nodes.get(edge.to) || {{ label: edge.to, status: 'partial' }};
+        return `<div class="graph-edge-row">
+          ${{renderGraphNode(from)}}
+          <div class="graph-arrow">${{edge.status === 'break' ? '断' : '→'}}</div>
+          <div class="graph-edge-label">${{esc(edge.label || '')}}${{(edge.evidence_ids || []).length ? '<br>' + esc(edge.evidence_ids.join(', ')) : ''}}</div>
+          <div class="graph-arrow">→</div>
+          ${{renderGraphNode(to)}}
+        </div>`;
+      }}).join('');
+      const isolatedNodes = edges.length ? '' : graph.nodes.map(renderGraphNode).join('');
+      return `<div class="detail">
+        <h3>证据串联图</h3>
+        <div class="detail-body evidence-graph">
+          ${{edgeRows || isolatedNodes || '<div class="muted">暂无可串联路径。</div>'}}
+          ${{breaks.length ? `<div><strong>断链 / 未闭环点：</strong><ul class="graph-break-list">${{breaks.map(item => `<li>${{plainInlineText(item.label || item.reason || '未闭环')}}${{(item.evidence_ids || []).length ? `（证据：${{esc(item.evidence_ids.join(', '))}}）` : ''}}</li>`).join('')}}</ul></div>` : ''}}
+        </div>
+      </div>`;
+    }}
+
+    function renderGraphNode(node) {{
+      const status = ['verified', 'partial', 'break'].includes(node.status) ? node.status : 'partial';
+      const evidence = Array.isArray(node.evidence_ids) && node.evidence_ids.length ? `<div class="path">${{esc(node.evidence_ids.join(', '))}}</div>` : '';
+      return `<div class="graph-node ${{status}}"><strong>${{esc(node.kind || '节点')}}</strong><br>${{plainInlineText(node.label || node.id || '')}}${{evidence}}</div>`;
+    }}
+
     function renderFindingDetail(detail) {{
       const evidence = detail.evidence_chain || [];
       const debate = uniqueDebateTurns(detail.debate || []);
+      const conclusion = conclusionWithoutEvidenceGraph(detail.final_conclusion);
       return `
         ${{renderOriginalReportSection(detail)}}
         <div class="detail">
@@ -3358,13 +3465,14 @@ def app_html() -> str:
               <span class="chip">置信度 ${{esc(detail.confidence)}}</span>
               <span class="chip">${{esc(detail.rule_id)}}</span>
             </div>
-            ${{detail.final_conclusion ? `<div><strong>最终结论：</strong> <span class="plain-text">${{plainText(detail.final_conclusion)}}</span></div>` : ''}}
+            ${{conclusion ? `<div><strong>最终结论：</strong> <span class="plain-text">${{plainText(conclusion)}}</span></div>` : ''}}
             <div class="plain-text">${{plainText(detail.reasoning_summary)}}</div>
             <div><strong>防护研判：</strong> <span class="plain-text">${{plainText(detail.protection_assessment)}}</span></div>
             <div><strong>影响研判：</strong> <span class="plain-text">${{plainText(detail.impact_assessment)}}</span></div>
             ${{(detail.disputed_points || []).length ? `<div><strong>争议点：</strong><ul>${{detail.disputed_points.map(point => `<li><span class="plain-text">${{plainText(point)}}</span></li>`).join('')}}</ul></div>` : ''}}
           </div>
         </div>
+        ${{renderEvidenceGraphSection(detail)}}
         <div class="detail">
           <h3>博弈过程</h3>
           <div class="detail-body">

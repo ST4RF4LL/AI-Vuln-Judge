@@ -272,6 +272,7 @@ def _coerce_verdict_report(value) -> VerdictReport:
         impact_assessment=str(value.get("impact_assessment") or ""),
         source_locations=[_coerce_source_location(item) for item in value.get("source_locations") or []],
         recommended_next_steps=[str(item) for item in value.get("recommended_next_steps") or []],
+        evidence_graph=value.get("evidence_graph") if isinstance(value.get("evidence_graph"), dict) else {},
     )
 
 

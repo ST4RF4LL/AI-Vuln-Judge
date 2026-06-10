@@ -7,6 +7,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_NEGATIVE_AGENT
 from .evidence import EvidenceBundle
+from .evidence_graph import build_evidence_graph, graph_to_markdown
 from .llm import LLMClient
 from .models import (
     AgentConfig,
@@ -71,6 +72,7 @@ class DebateOrchestrator:
         decision = self._decide(bundle)
         turns, final_conclusion, decision = self._debate_turns(bundle, decision)
         turns = _dedupe_debate_turns(turns)
+        evidence_graph = build_evidence_graph(evidence, decision.disputed_points)
         return VerdictReport(
             finding_id=bundle.finding.finding_id,
             rule_id=bundle.finding.rule_id,
@@ -85,6 +87,7 @@ class DebateOrchestrator:
             impact_assessment=_impact_assessment(evidence),
             source_locations=_resolved_source_locations(evidence, bundle.finding.locations),
             recommended_next_steps=decision.recommended_next_steps,
+            evidence_graph=evidence_graph,
         )
 
     def _debate_turns(
@@ -322,7 +325,8 @@ class DebateOrchestrator:
             side_final_conclusion,
             turns,
         )
-        final_conclusion = moderator_summary or side_final_conclusion
+        evidence_graph = build_evidence_graph(evidence, challenges)
+        final_conclusion = _append_evidence_graph_markdown(moderator_summary or side_final_conclusion, evidence_graph)
         decision = _decision_from_conclusions(base_decision, affirmative_final, negative_final, final_conclusion)
         turns.append(
             DebateTurn(
@@ -419,6 +423,7 @@ class DebateOrchestrator:
                 impact_assessment=_impact_assessment(bundle.evidence),
                 source_locations=_resolved_source_locations(bundle.evidence, bundle.finding.locations),
                 recommended_next_steps=decision.recommended_next_steps,
+                evidence_graph=build_evidence_graph(bundle.evidence, decision.disputed_points),
             )
         )
 
@@ -1415,10 +1420,28 @@ def _final_conclusion(affirmative: SideConclusion, negative: SideConclusion) -> 
     return f"存在分歧。正方【{affirmative.label}】，{affirmative.statement}；反方【{negative.label}】，{negative.statement}"
 
 
+def _append_evidence_graph_markdown(conclusion: str, graph: Dict[str, Any]) -> str:
+    graph_markdown = graph_to_markdown(graph).strip()
+    if not graph_markdown:
+        return conclusion
+    if "### 证据串联图" in conclusion:
+        return conclusion
+    return conclusion.rstrip() + "\n\n" + graph_markdown
+
+
+def _conclusion_without_evidence_graph(conclusion: str) -> str:
+    marker = "\n### 证据串联图"
+    if marker in conclusion:
+        return conclusion.split(marker, 1)[0].rstrip()
+    if conclusion.startswith("### 证据串联图"):
+        return ""
+    return conclusion.rstrip()
+
+
 def _decision_from_conclusions(
     base: DebateDecision, affirmative: SideConclusion, negative: SideConclusion, final_conclusion: str
 ) -> DebateDecision:
-    reasoning_summary = _clean_moderator_summary(final_conclusion) or base.reasoning_summary
+    reasoning_summary = _clean_moderator_summary(_conclusion_without_evidence_graph(final_conclusion)) or base.reasoning_summary
     if affirmative.verdict == negative.verdict:
         return DebateDecision(
             verdict=affirmative.verdict,

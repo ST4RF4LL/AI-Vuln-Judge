@@ -145,6 +145,7 @@ class VerdictReport:
     impact_assessment: str
     source_locations: List[SourceLocation]
     recommended_next_steps: List[str]
+    evidence_graph: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

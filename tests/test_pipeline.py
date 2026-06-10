@@ -767,6 +767,11 @@ for raw in sys.stdin.buffer:
             self.assertIn("反方质疑报告", finding.debate[1].claim)
             self.assertTrue(finding.final_conclusion.startswith("【真实漏洞】"))
             self.assertEqual(finding.debate[-1].claim, finding.final_conclusion)
+            self.assertIn("### 证据串联图", finding.final_conclusion)
+            self.assertTrue(finding.evidence_graph["nodes"])
+            self.assertTrue(finding.evidence_graph["edges"])
+            self.assertIn("mermaid", finding.evidence_graph)
+            self.assertIn("breaks", finding.evidence_graph)
 
     def test_affirmative_planner_pushes_evidence_hunting_when_chain_is_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1107,7 +1112,10 @@ for raw in sys.stdin.buffer:
                 self.assertIn("# 漏洞研判报告", markdown_report)
                 self.assertIn(f"- 任务 ID：{created['run_id']}", markdown_report)
                 self.assertIn("## 发现 1:", markdown_report)
+                self.assertIn("### 证据串联图", markdown_report)
+                self.assertIn("```mermaid", markdown_report)
                 self.assertIn("### 博弈过程", markdown_report)
+                self.assertIn("evidence_graph", json_report["reports"][0])
                 self.assertEqual(findings[0]["verdict"], "TRUE_POSITIVE")
                 self.assertIn("漏洞研判记录", html)
                 delete_request = urllib.request.Request(f"{base}/runs/{created['run_id']}", method="DELETE")
@@ -1199,6 +1207,10 @@ for raw in sys.stdin.buffer:
         self.assertIn('原始报告详情', html)
         self.assertIn('renderOriginalReportSection(detail)', html)
         self.assertIn('raw_result', html)
+        self.assertIn('证据串联图', html)
+        self.assertIn('function renderEvidenceGraphSection(detail)', html)
+        self.assertIn('function conclusionWithoutEvidenceGraph(value)', html)
+        self.assertIn('class="graph-edge-row"', html)
         self.assertIn('function uniqueDebateTurns(debate)', html)
         self.assertIn('function renderTable(start)', html)
         self.assertIn('function bindRunExportButtons()', html)
