@@ -1080,10 +1080,10 @@ def _report_evidence_graph(report: dict) -> dict:
 
 
 def _conclusion_without_graph(text: str) -> str:
-    marker = "\n### 证据串联图"
-    if marker in text:
-        return text.split(marker, 1)[0].rstrip()
-    if text.startswith("### 证据串联图"):
+    for marker in ("\n### 证据串联图", "\n### 调用链 / 数据流概览"):
+        if marker in text:
+            return text.split(marker, 1)[0].rstrip()
+    if text.startswith("### 证据串联图") or text.startswith("### 调用链 / 数据流概览"):
         return ""
     return text.rstrip()
 
@@ -1439,49 +1439,16 @@ def app_html() -> str:
       display: grid;
       gap: 8px;
     }}
-    .evidence-graph {{
-      display: grid;
-      gap: 12px;
-    }}
-    .graph-edge-row {{
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto minmax(140px, 0.7fr) auto minmax(0, 1fr);
-      gap: 8px;
-      align-items: center;
-      padding: 8px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #ffffff;
-    }}
-    .graph-node {{
-      min-width: 0;
-      padding: 7px 9px;
-      border: 1px solid var(--line);
-      border-radius: 6px;
-      background: #f8fafc;
+    .path-overview {{
+      white-space: pre-wrap;
       overflow-wrap: anywhere;
-      line-height: 1.35;
-    }}
-    .graph-node.verified {{ border-color: #34d399; background: #ecfdf5; color: #064e3b; }}
-    .graph-node.partial {{ border-color: #f59e0b; background: #fffbeb; color: #78350f; }}
-    .graph-node.break {{ border-color: #f87171; background: #fef2f2; color: #7f1d1d; }}
-    .graph-arrow {{
-      color: var(--muted);
-      font-weight: 700;
-      text-align: center;
-    }}
-    .graph-edge-label {{
-      color: var(--muted);
-      font-size: 12px;
-      text-align: center;
-      overflow-wrap: anywhere;
-    }}
-    .graph-break-list {{
-      display: grid;
-      gap: 6px;
+      line-height: 1.7;
       margin: 0;
-      padding-left: 18px;
-      color: #7f1d1d;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfe;
+      color: var(--text);
     }}
     .empty {{ padding: 42px 18px; color: var(--muted); text-align: center; }}
     .error {{ color: var(--bad); }}
@@ -3413,42 +3380,167 @@ def app_html() -> str:
 
     function conclusionWithoutEvidenceGraph(value) {{
       const text = String(value ?? '').replace(/\\r\\n?/g, '\\n');
-      const index = text.indexOf('\\n### 证据串联图');
-      if (index >= 0) return text.slice(0, index).trim();
-      return text.startsWith('### 证据串联图') ? '' : text.trim();
+      const markers = ['\\n### 证据串联图', '\\n### 调用链 / 数据流概览'];
+      for (const marker of markers) {{
+        const index = text.indexOf(marker);
+        if (index >= 0) return text.slice(0, index).trim();
+      }}
+      return text.startsWith('### 证据串联图') || text.startsWith('### 调用链 / 数据流概览') ? '' : text.trim();
     }}
 
-    function renderEvidenceGraphSection(detail) {{
+    function renderPathOverviewSection(detail) {{
       const graph = detail.evidence_graph && typeof detail.evidence_graph === 'object' ? detail.evidence_graph : null;
       if (!graph || !Array.isArray(graph.nodes) || !graph.nodes.length) return '';
-      const nodes = new Map(graph.nodes.map(node => [node.id, node]));
-      const edges = Array.isArray(graph.edges) ? graph.edges : [];
-      const breaks = Array.isArray(graph.breaks) ? graph.breaks : [];
-      const edgeRows = edges.map(edge => {{
-        const from = nodes.get(edge.from) || {{ label: edge.from, status: 'partial' }};
-        const to = nodes.get(edge.to) || {{ label: edge.to, status: 'partial' }};
-        return `<div class="graph-edge-row">
-          ${{renderGraphNode(from)}}
-          <div class="graph-arrow">${{edge.status === 'break' ? '断' : '→'}}</div>
-          <div class="graph-edge-label">${{esc(edge.label || '')}}${{(edge.evidence_ids || []).length ? '<br>' + esc(edge.evidence_ids.join(', ')) : ''}}</div>
-          <div class="graph-arrow">→</div>
-          ${{renderGraphNode(to)}}
-        </div>`;
-      }}).join('');
-      const isolatedNodes = edges.length ? '' : graph.nodes.map(renderGraphNode).join('');
+      const overview = String(graph.path_overview || buildPathOverview(graph) || '').replace(/\\bev-[0-9A-Za-z_-]+\\b/g, '').trim();
+      if (!overview) return '';
       return `<div class="detail">
-        <h3>证据串联图</h3>
-        <div class="detail-body evidence-graph">
-          ${{edgeRows || isolatedNodes || '<div class="muted">暂无可串联路径。</div>'}}
-          ${{breaks.length ? `<div><strong>断链 / 未闭环点：</strong><ul class="graph-break-list">${{breaks.map(item => `<li>${{plainInlineText(item.label || item.reason || '未闭环')}}${{(item.evidence_ids || []).length ? `（证据：${{esc(item.evidence_ids.join(', '))}}）` : ''}}</li>`).join('')}}</ul></div>` : ''}}
+        <h3>调用链 / 数据流概览</h3>
+        <div class="detail-body">
+          <pre class="path-overview">${{esc(overview)}}</pre>
         </div>
       </div>`;
     }}
 
-    function renderGraphNode(node) {{
-      const status = ['verified', 'partial', 'break'].includes(node.status) ? node.status : 'partial';
-      const evidence = Array.isArray(node.evidence_ids) && node.evidence_ids.length ? `<div class="path">${{esc(node.evidence_ids.join(', '))}}</div>` : '';
-      return `<div class="graph-node ${{status}}"><strong>${{esc(node.kind || '节点')}}</strong><br>${{plainInlineText(node.label || node.id || '')}}${{evidence}}</div>`;
+    function buildPathOverview(graph) {{
+      const nodes = new Map((graph.nodes || []).map(node => [String(node.id), node]));
+      const edges = Array.isArray(graph.edges) ? graph.edges : [];
+      const breaks = Array.isArray(graph.breaks) ? graph.breaks : [];
+      const lines = [];
+      lines.push(...pathCategoryLines('调用链', nodes, edges, new Set(['调用链', '调用', '定位符号']), breaks));
+      lines.push('');
+      lines.push(...pathCategoryLines('数据流', nodes, edges, new Set(['数据流', 'SARIF 代码流']), breaks));
+      if (breaks.length) {{
+        lines.push('', '未闭环点：');
+        for (const item of breaks) lines.push(`- ${{cleanPathText(item.label || item.reason || '未闭环')}}`);
+      }}
+      return lines.join('\\n').trim();
+    }}
+
+    function pathCategoryLines(title, nodes, edges, labels, breaks) {{
+      const categoryEdges = edges.filter(edge => labels.has(String(edge.label || '')) && !isContextAnchorEdge(edge, nodes));
+      const lines = [`${{title}}状态：${{pathStatus(categoryEdges, breaks)}}`, ''];
+      if (!categoryEdges.length) {{
+        lines.push(`${{title}}：未获得可展示路径。`);
+        return lines;
+      }}
+      let index = 1;
+      for (const component of edgeComponents(categoryEdges)) {{
+        lines.push(`${{title}} ${{index}}：`);
+        lines.push(...verticalComponentLines(component, nodes));
+        lines.push('');
+        index += 1;
+      }}
+      while (lines[lines.length - 1] === '') lines.pop();
+      return lines;
+    }}
+
+    function edgeComponents(edges) {{
+      let remaining = [...edges];
+      const components = [];
+      while (remaining.length) {{
+        const seed = remaining.shift();
+        const component = [seed];
+        const nodeIds = new Set([String(seed.from), String(seed.to)]);
+        let changed = true;
+        while (changed) {{
+          changed = false;
+          const next = [];
+          for (const edge of remaining) {{
+            const from = String(edge.from);
+            const to = String(edge.to);
+            if (nodeIds.has(from) || nodeIds.has(to)) {{
+              component.push(edge);
+              nodeIds.add(from);
+              nodeIds.add(to);
+              changed = true;
+            }} else {{
+              next.push(edge);
+            }}
+          }}
+          remaining = next;
+        }}
+        components.push(component);
+      }}
+      return components;
+    }}
+
+    function verticalComponentLines(edges, nodes) {{
+      const outgoing = new Map();
+      const incoming = new Set();
+      const nodeIds = [];
+      for (const edge of edges) {{
+        const from = String(edge.from);
+        const to = String(edge.to);
+        if (!outgoing.has(from)) outgoing.set(from, []);
+        outgoing.get(from).push(edge);
+        incoming.add(to);
+        if (!nodeIds.includes(from)) nodeIds.push(from);
+        if (!nodeIds.includes(to)) nodeIds.push(to);
+      }}
+      const starts = nodeIds.filter(id => !incoming.has(id));
+      if (!starts.length && nodeIds.length) starts.push(nodeIds[0]);
+      const seenEdges = new Set();
+      const lines = [];
+      const walk = (nodeId, depth, stack) => {{
+        lines.push(`${{'  '.repeat(depth)}}${{pathNodeLabel(nodes.get(nodeId), nodeId)}}`);
+        if (stack.has(nodeId)) {{
+          lines.push(`${{'  '.repeat(depth + 1)}}↳ 循环调用，已在上方出现。`);
+          return;
+        }}
+        const nextStack = new Set(stack);
+        nextStack.add(nodeId);
+        for (const edge of outgoing.get(nodeId) || []) {{
+          const key = [edge.from, edge.to, edge.label || '', edge.status || ''].join('|');
+          if (seenEdges.has(key)) continue;
+          seenEdges.add(key);
+          lines.push(`${{'  '.repeat(depth + 1)}}↓ ${{pathEdgeLabel(edge)}}`);
+          walk(String(edge.to), depth + 1, nextStack);
+        }}
+      }};
+      for (const start of starts) walk(start, 0, new Set());
+      return lines.length ? lines : ['无可展示路径。'];
+    }}
+
+    function pathStatus(edges, breaks) {{
+      if (breaks.length) return '未闭环';
+      if (!edges.length) return '未获得证据';
+      if (edges.some(edge => edge.status === 'break')) return '未闭环';
+      if (edges.some(edge => edge.status === 'partial')) return '部分闭环';
+      return '已闭环';
+    }}
+
+    function isContextAnchorEdge(edge, nodes) {{
+      const source = nodes.get(String(edge.from)) || {{}};
+      const target = nodes.get(String(edge.to)) || {{}};
+      return ['REPORT', 'SOURCE_LOCATION'].includes(source.kind) && ['SARIF_CODE_FLOW', 'DATA_FLOW', 'CALL_CHAIN'].includes(target.kind);
+    }}
+
+    function pathEdgeLabel(edge) {{
+      const label = cleanPathText(edge.label || '连接');
+      if (edge.status === 'break') return `断链：${{label}}`;
+      if (edge.status === 'partial') return `${{label}}（部分）`;
+      return label;
+    }}
+
+    function pathNodeLabel(node, fallback) {{
+      const kindLabels = {{
+        REPORT: '报告',
+        SOURCE_LOCATION: '源码位置',
+        SARIF_CODE_FLOW: '代码流',
+        DATA_FLOW: '数据流',
+        CALL_CHAIN: '调用链',
+        CALLER: '调用方',
+        CALLEE: '被调函数',
+        SYMBOL: '符号',
+        BREAK: '断链'
+      }};
+      if (!node) return cleanPathText(fallback);
+      const status = node.status === 'break' ? ' [断链]' : node.status === 'partial' ? ' [部分]' : '';
+      return `[${{kindLabels[node.kind] || node.kind || '节点'}}] ${{cleanPathText(node.label || fallback)}}${{status}}`;
+    }}
+
+    function cleanPathText(value) {{
+      return String(value ?? '').replace(/\\bev-[0-9A-Za-z_-]+\\b/g, '').replace(/\\s+/g, ' ').trim() || '未命名节点';
     }}
 
     function renderFindingDetail(detail) {{
@@ -3472,7 +3564,7 @@ def app_html() -> str:
             ${{(detail.disputed_points || []).length ? `<div><strong>争议点：</strong><ul>${{detail.disputed_points.map(point => `<li><span class="plain-text">${{plainText(point)}}</span></li>`).join('')}}</ul></div>` : ''}}
           </div>
         </div>
-        ${{renderEvidenceGraphSection(detail)}}
+        ${{renderPathOverviewSection(detail)}}
         <div class="detail">
           <h3>博弈过程</h3>
           <div class="detail-body">

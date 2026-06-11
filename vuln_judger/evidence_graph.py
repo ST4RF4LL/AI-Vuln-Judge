@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .models import CodeEvidence, EvidenceKind, SourceLocation
 
@@ -55,99 +55,203 @@ def build_evidence_graph(evidence: Sequence[Any], disputed_points: Optional[Sequ
         builder.break_node("未获得可串联的调用链或源到汇数据流证据。", [], anchor)
 
     graph = builder.graph()
-    graph["mermaid"] = graph_to_mermaid(graph)
-    graph["ascii"] = graph_to_ascii(graph)
+    graph["path_overview"] = graph_to_path_overview(graph)
     return graph
 
 
 def graph_to_markdown(graph: Dict[str, Any]) -> str:
     if not graph:
-        return "### 证据串联图\n\n无可展示的证据路径图。\n"
+        return "### 调用链 / 数据流概览\n\n无可展示的调用链或数据流。\n"
     lines = [
-        "### 证据串联图",
+        "### 调用链 / 数据流概览",
         "",
-        "```mermaid",
-        str(graph.get("mermaid") or "flowchart LR"),
-        "```",
-        "",
-        "#### 调用链 / 数据流概览",
-        "",
-        "```text",
-        str(graph.get("ascii") or "无"),
-        "```",
-        "",
+        str(graph.get("path_overview") or graph_to_path_overview(graph) or "无可展示的调用链或数据流。"),
     ]
-    breaks = graph.get("breaks") or []
-    if breaks:
-        lines.extend(["#### 断链 / 未闭环点", ""])
-        for item in breaks:
-            evidence_ids = item.get("evidence_ids") or []
-            suffix = f"（证据：{', '.join(evidence_ids)}）" if evidence_ids else ""
-            lines.append(f"- {item.get('label') or item.get('reason') or '未闭环'}{suffix}")
-        lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
-def graph_to_mermaid(graph: Dict[str, Any]) -> str:
+def graph_to_path_overview(graph: Dict[str, Any]) -> str:
     nodes = graph.get("nodes") or []
     edges = graph.get("edges") or []
-    lines = ["flowchart LR"]
-    if not nodes:
-        lines.append('  empty["无证据路径"]')
-        return "\n".join(lines)
-    for node in nodes:
-        shape = "{{{label}}}" if node.get("status") == "break" else "[{label}]"
-        label = _mermaid_label(node.get("label") or node.get("id") or "节点")
-        lines.append(f"  {node.get('id')}{shape.format(label=label)}")
-    for edge in edges:
-        style = "-.->" if edge.get("status") == "break" else "-->"
-        label = _mermaid_label(edge.get("label") or "")
-        if label:
-            lines.append(f"  {edge.get('from')} {style}|{label}| {edge.get('to')}")
-        else:
-            lines.append(f"  {edge.get('from')} {style} {edge.get('to')}")
-    lines.extend(
-        [
-            "  classDef verified fill:#ecfdf5,stroke:#059669,color:#064e3b;",
-            "  classDef partial fill:#fffbeb,stroke:#d97706,color:#78350f;",
-            "  classDef break fill:#fef2f2,stroke:#dc2626,color:#7f1d1d;",
-        ]
-    )
-    for node in nodes:
-        status = node.get("status")
-        if status in {"verified", "partial", "break"}:
-            lines.append(f"  class {node.get('id')} {status};")
-    return "\n".join(lines)
+    breaks = graph.get("breaks") or []
+    node_by_id = {str(node.get("id")): node for node in nodes if isinstance(node, dict)}
+    lines: List[str] = []
+    lines.extend(_category_overview_lines("调用链", node_by_id, edges, {"调用链", "调用", "定位符号"}, breaks))
+    lines.append("")
+    lines.extend(_category_overview_lines("数据流", node_by_id, edges, {"数据流", "SARIF 代码流"}, breaks))
+    if breaks:
+        lines.extend(["", "未闭环点："])
+        for item in breaks:
+            reason = _clean_display_text(item.get("label") or item.get("reason") or "未闭环")
+            lines.append(f"- {reason}")
+    return "\n".join(lines).rstrip()
 
 
 def graph_to_ascii(graph: Dict[str, Any]) -> str:
-    nodes = graph.get("nodes") or []
-    edges = graph.get("edges") or []
-    if not nodes:
-        return "无证据路径"
+    return graph_to_path_overview(graph)
+
+
+def _category_overview_lines(
+    title: str,
+    node_by_id: Dict[str, Dict[str, Any]],
+    edges: Sequence[Dict[str, Any]],
+    labels: set[str],
+    breaks: Sequence[Dict[str, Any]],
+) -> List[str]:
+    category_edges = [
+        edge for edge in edges if str(edge.get("label") or "") in labels and not _is_context_anchor_edge(edge, node_by_id)
+    ]
+    lines = [f"{title}状态：{_path_status(category_edges, breaks)}", ""]
+    if not category_edges:
+        lines.append(f"{title}：未获得可展示路径。")
+        return lines
+    for index, component in enumerate(_edge_components(category_edges), start=1):
+        lines.append(f"{title} {index}：")
+        lines.extend(_vertical_component_lines(component, node_by_id))
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _edge_components(edges: Sequence[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    remaining = list(edges)
+    components: List[List[Dict[str, Any]]] = []
+    while remaining:
+        seed = remaining.pop(0)
+        component = [seed]
+        node_ids = {str(seed.get("from")), str(seed.get("to"))}
+        changed = True
+        while changed:
+            changed = False
+            next_remaining: List[Dict[str, Any]] = []
+            for edge in remaining:
+                from_id = str(edge.get("from"))
+                to_id = str(edge.get("to"))
+                if from_id in node_ids or to_id in node_ids:
+                    component.append(edge)
+                    node_ids.update({from_id, to_id})
+                    changed = True
+                else:
+                    next_remaining.append(edge)
+            remaining = next_remaining
+        components.append(component)
+    return components
+
+
+def _vertical_component_lines(edges: Sequence[Dict[str, Any]], node_by_id: Dict[str, Dict[str, Any]]) -> List[str]:
     outgoing: Dict[str, List[Dict[str, Any]]] = {}
-    incoming = set()
+    incoming: set[str] = set()
+    node_ids: List[str] = []
     for edge in edges:
-        outgoing.setdefault(str(edge.get("from")), []).append(edge)
-        incoming.add(str(edge.get("to")))
-    starts = [node for node in nodes if str(node.get("id")) not in incoming] or nodes[:1]
-    seen = set()
+        from_id = str(edge.get("from"))
+        to_id = str(edge.get("to"))
+        outgoing.setdefault(from_id, []).append(edge)
+        incoming.add(to_id)
+        if from_id not in node_ids:
+            node_ids.append(from_id)
+        if to_id not in node_ids:
+            node_ids.append(to_id)
+    starts = [node_id for node_id in node_ids if node_id not in incoming] or node_ids[:1]
+    seen_edges: set[Tuple[str, str, str, str]] = set()
     lines: List[str] = []
 
-    def walk(node_id: str, depth: int) -> None:
-        if node_id in seen:
-            lines.append("  " * depth + f"↳ {_node_label(nodes, node_id)}（已在上方出现）")
+    def walk(node_id: str, depth: int, stack: set[str]) -> None:
+        lines.append("  " * depth + _overview_node_label(node_by_id.get(node_id), node_id))
+        if node_id in stack:
+            lines.append("  " * (depth + 1) + "↳ 循环调用，已在上方出现。")
             return
-        seen.add(node_id)
-        lines.append("  " * depth + f"- {_node_label(nodes, node_id)}")
-        for edge in outgoing.get(node_id, [])[:8]:
-            status = "断链" if edge.get("status") == "break" else "部分" if edge.get("status") == "partial" else "连接"
-            lines.append("  " * (depth + 1) + f"{status}: {edge.get('label') or ''}")
-            walk(str(edge.get("to")), depth + 2)
+        next_stack = set(stack)
+        next_stack.add(node_id)
+        for edge in outgoing.get(node_id, []):
+            edge_key = (
+                str(edge.get("from")),
+                str(edge.get("to")),
+                str(edge.get("label") or ""),
+                str(edge.get("status") or ""),
+            )
+            if edge_key in seen_edges:
+                continue
+            seen_edges.add(edge_key)
+            lines.append("  " * (depth + 1) + f"↓ {_overview_edge_label(edge)}")
+            walk(str(edge.get("to")), depth + 1, next_stack)
 
-    for start in starts[:4]:
-        walk(str(start.get("id")), 0)
-    return "\n".join(lines)
+    for start in starts:
+        walk(start, 0, set())
+    for edge in edges:
+        edge_key = (
+            str(edge.get("from")),
+            str(edge.get("to")),
+            str(edge.get("label") or ""),
+            str(edge.get("status") or ""),
+        )
+        if edge_key not in seen_edges:
+            lines.append(_overview_node_label(node_by_id.get(str(edge.get("from"))), str(edge.get("from"))))
+            lines.append(f"  ↓ {_overview_edge_label(edge)}")
+            lines.append("  " + _overview_node_label(node_by_id.get(str(edge.get("to"))), str(edge.get("to"))))
+            seen_edges.add(edge_key)
+    return lines or ["无可展示路径。"]
+
+
+def _path_status(edges: Sequence[Dict[str, Any]], breaks: Sequence[Dict[str, Any]]) -> str:
+    if breaks:
+        return "未闭环"
+    if not edges:
+        return "未获得证据"
+    statuses = {str(edge.get("status") or "") for edge in edges}
+    if "break" in statuses:
+        return "未闭环"
+    if "partial" in statuses:
+        return "部分闭环"
+    return "已闭环"
+
+
+def _is_context_anchor_edge(edge: Dict[str, Any], node_by_id: Dict[str, Dict[str, Any]]) -> bool:
+    source = node_by_id.get(str(edge.get("from"))) or {}
+    target = node_by_id.get(str(edge.get("to"))) or {}
+    source_kind = str(source.get("kind") or "")
+    target_kind = str(target.get("kind") or "")
+    return source_kind in {"REPORT", "SOURCE_LOCATION"} and target_kind in FLOW_KINDS
+
+
+def _overview_edge_label(edge: Dict[str, Any]) -> str:
+    label = _clean_display_text(edge.get("label") or "连接")
+    if edge.get("status") == "break":
+        return f"断链：{label}"
+    if edge.get("status") == "partial":
+        return f"{label}（部分）"
+    return label
+
+
+def _overview_node_label(node: Optional[Dict[str, Any]], fallback: str) -> str:
+    if not node:
+        return _clean_display_text(fallback)
+    kind = _overview_kind_label(str(node.get("kind") or "节点"))
+    status = str(node.get("status") or "")
+    suffix = " [断链]" if status == "break" else " [部分]" if status == "partial" else ""
+    label = _clean_display_text(node.get("label") or fallback)
+    return f"[{kind}] {label}{suffix}".strip()
+
+
+def _overview_kind_label(kind: str) -> str:
+    return {
+        "REPORT": "报告",
+        "SOURCE_LOCATION": "源码位置",
+        "SARIF_CODE_FLOW": "代码流",
+        "DATA_FLOW": "数据流",
+        "CALL_CHAIN": "调用链",
+        "CALLER": "调用方",
+        "CALLEE": "被调函数",
+        "SYMBOL": "符号",
+        "BREAK": "断链",
+    }.get(kind, kind or "节点")
+
+
+def _clean_display_text(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"\bev-[0-9A-Za-z_-]+\b", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or "未命名节点"
 
 
 class _EvidenceGraphBuilder:
@@ -255,11 +359,11 @@ def _add_call_edges(builder: _EvidenceGraphBuilder, item: Dict[str, Any], center
         symbol_node = builder.node(f"符号：{symbols[0]}", "SYMBOL", status, evidence_id, item.get("summary") or "")
         if center:
             builder.edge(center, symbol_node, "定位符号", status, evidence_id)
-    for caller in _entry_list(data.get("callers"))[:5]:
+    for caller in _entry_list(data.get("callers")):
         caller_node = builder.node(_entry_label(caller), "CALLER", status, evidence_id, _entry_label(caller))
         if symbol_node:
             builder.edge(caller_node, symbol_node, "调用", status, evidence_id)
-    for callee in _entry_list(data.get("callees"))[:5]:
+    for callee in _entry_list(data.get("callees")):
         callee_node = builder.node(_entry_label(callee), "CALLEE", status, evidence_id, _entry_label(callee))
         if symbol_node:
             builder.edge(symbol_node, callee_node, "调用", status, evidence_id)
@@ -288,7 +392,7 @@ def _add_evidence_breaks(builder: _EvidenceGraphBuilder, item: Dict[str, Any], a
         builder.break_node(f"{_kind_label(kind)} 证据强度为 {strength}：{summary}", [evidence_id], anchor)
     missing = data.get("missing_evidence")
     if isinstance(missing, list):
-        for item_name in missing[:6]:
+        for item_name in missing:
             builder.break_node(f"缺失证据：{item_name}", [evidence_id], anchor)
 
 
@@ -388,20 +492,3 @@ def _int_or_none(value: Any) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _mermaid_label(value: Any) -> str:
-    text = str(value or "").replace("\\", "\\\\").replace('"', "'")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:120]
-
-
-def _node_label(nodes: Sequence[Dict[str, Any]], node_id: str) -> str:
-    for node in nodes:
-        if str(node.get("id")) == node_id:
-            status = node.get("status")
-            suffix = " [断链]" if status == "break" else " [部分]" if status == "partial" else ""
-            evidence_ids = node.get("evidence_ids") or []
-            evidence_text = f" ({', '.join(evidence_ids[:3])})" if evidence_ids else ""
-            return f"{node.get('label')}{suffix}{evidence_text}"
-    return node_id

@@ -1744,16 +1744,16 @@ def _append_evidence_graph_markdown(conclusion: str, graph: Dict[str, Any]) -> s
     graph_markdown = graph_to_markdown(graph).strip()
     if not graph_markdown:
         return conclusion
-    if "### 证据串联图" in conclusion:
+    if "### 证据串联图" in conclusion or "### 调用链 / 数据流概览" in conclusion:
         return conclusion
     return conclusion.rstrip() + "\n\n" + graph_markdown
 
 
 def _conclusion_without_evidence_graph(conclusion: str) -> str:
-    marker = "\n### 证据串联图"
-    if marker in conclusion:
-        return conclusion.split(marker, 1)[0].rstrip()
-    if conclusion.startswith("### 证据串联图"):
+    for marker in ("\n### 证据串联图", "\n### 调用链 / 数据流概览"):
+        if marker in conclusion:
+            return conclusion.split(marker, 1)[0].rstrip()
+    if conclusion.startswith("### 证据串联图") or conclusion.startswith("### 调用链 / 数据流概览"):
         return ""
     return conclusion.rstrip()
 
