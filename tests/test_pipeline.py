@@ -761,10 +761,22 @@ for raw in sys.stdin.buffer:
             self.assertTrue(any(item.kind == EvidenceKind.REPORT for item in finding.evidence_chain))
             self.assertTrue(any(item.kind == EvidenceKind.SOURCE_ROOT for item in finding.evidence_chain))
             self.assertIn("正方证据报告", finding.debate[0].claim)
+            self.assertIn("代码上下文业务逻辑说明", finding.debate[0].claim)
+            self.assertIn("行为目的候选", finding.debate[0].claim)
             self.assertIn("攻击链", finding.debate[0].claim)
             self.assertIn("攻击前提", finding.debate[0].claim)
             self.assertIn("攻击影响", finding.debate[0].claim)
             self.assertIn("反方质疑报告", finding.debate[1].claim)
+            self.assertIn("代码上下文业务逻辑核验", finding.debate[1].claim)
+            negative_evidence_ids = set(finding.debate[1].evidence_ids)
+            report_evidence_ids = {item.evidence_id for item in finding.evidence_chain if item.kind == EvidenceKind.REPORT}
+            flow_evidence_ids = {
+                item.evidence_id
+                for item in finding.evidence_chain
+                if item.kind in {EvidenceKind.SARIF_CODE_FLOW, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN}
+            }
+            self.assertTrue(report_evidence_ids.issubset(negative_evidence_ids))
+            self.assertTrue(flow_evidence_ids.issubset(negative_evidence_ids))
             self.assertTrue(finding.final_conclusion.startswith("【真实漏洞】"))
             self.assertEqual(finding.debate[-1].claim, finding.final_conclusion)
             self.assertIn("### 证据串联图", finding.final_conclusion)
@@ -772,6 +784,170 @@ for raw in sys.stdin.buffer:
             self.assertTrue(finding.evidence_graph["edges"])
             self.assertIn("mermaid", finding.evidence_graph)
             self.assertIn("breaks", finding.evidence_graph)
+
+    def test_negative_challenges_sensitive_info_semantics_before_impact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "\n".join(
+                    [
+                        "def handler(request):",
+                        "    key = request.args.get('key')",
+                        "    return {'key': key}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            sarif = root / "report.sarif"
+            sarif.write_text(
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "unit"}},
+                                "results": [
+                                    {
+                                        "ruleId": "key-exposure",
+                                        "level": "warning",
+                                        "message": {"text": "key 参数可能被返回"},
+                                        "locations": [
+                                            {
+                                                "physicalLocation": {
+                                                    "artifactLocation": {"uri": "app.py"},
+                                                    "region": {"startLine": 3, "startColumn": 5},
+                                                }
+                                            }
+                                        ],
+                                        "codeFlows": [
+                                            {
+                                                "threadFlows": [
+                                                    {
+                                                        "locations": [
+                                                            {
+                                                                "location": {
+                                                                    "physicalLocation": {
+                                                                        "artifactLocation": {"uri": "app.py"},
+                                                                        "region": {"startLine": 2, "startColumn": 11},
+                                                                    }
+                                                                }
+                                                            },
+                                                            {
+                                                                "location": {
+                                                                    "physicalLocation": {
+                                                                        "artifactLocation": {"uri": "app.py"},
+                                                                        "region": {"startLine": 3, "startColumn": 5},
+                                                                    }
+                                                                }
+                                                            },
+                                                        ]
+                                                    }
+                                                ]
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            )
+            negative_claim = report.reports[0].debate[1].claim
+            self.assertIn("代码上下文业务逻辑核验", negative_claim)
+            self.assertIn("敏感信息真实性", negative_claim)
+            self.assertIn("key 可能为密钥", negative_claim)
+            self.assertIn("普通标识", negative_claim)
+            self.assertIn("真实敏感性", negative_claim)
+            self.assertIn("未见加解密", negative_claim)
+
+    def test_local_vulnerability_without_entry_reachability_is_doubtful(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "legacy.py").write_text(
+                "\n".join(
+                    [
+                        "import os",
+                        "",
+                        "def legacy_exec(cmd):",
+                        "    os.system(cmd)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            sarif = root / "report.sarif"
+            sarif.write_text(
+                json.dumps(
+                    {
+                        "version": "2.1.0",
+                        "runs": [
+                            {
+                                "tool": {"driver": {"name": "unit"}},
+                                "results": [
+                                    {
+                                        "ruleId": "python-command-injection",
+                                        "level": "warning",
+                                        "message": {"text": "legacy helper command reaches os.system"},
+                                        "locations": [
+                                            {
+                                                "physicalLocation": {
+                                                    "artifactLocation": {"uri": "legacy.py"},
+                                                    "region": {"startLine": 4, "startColumn": 5},
+                                                }
+                                            }
+                                        ],
+                                        "codeFlows": [
+                                            {
+                                                "threadFlows": [
+                                                    {
+                                                        "locations": [
+                                                            {
+                                                                "location": {
+                                                                    "physicalLocation": {
+                                                                        "artifactLocation": {"uri": "legacy.py"},
+                                                                        "region": {"startLine": 3, "startColumn": 17},
+                                                                    }
+                                                                }
+                                                            },
+                                                            {
+                                                                "location": {
+                                                                    "physicalLocation": {
+                                                                        "artifactLocation": {"uri": "legacy.py"},
+                                                                        "region": {"startLine": 4, "startColumn": 5},
+                                                                    }
+                                                                }
+                                                            },
+                                                        ]
+                                                    }
+                                                ]
+                                            }
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = run_judgement(
+                RunConfig(
+                    sarif_path=sarif,
+                    source_path=root,
+                    enable_external_tools=False,
+                )
+            )
+            finding = report.reports[0]
+            self.assertEqual(finding.verdict, Verdict.INCONCLUSIVE)
+            self.assertTrue(finding.final_conclusion.startswith("【可达性存疑】"))
+            self.assertTrue(any("REST/API/接口入口" in point for point in finding.disputed_points))
 
     def test_affirmative_planner_pushes_evidence_hunting_when_chain_is_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1376,9 +1552,22 @@ for raw in sys.stdin.buffer:
                 affirmative_default = next(
                     profile for profile in defaults["roles"]["affirmative"] if profile["profile_id"] == "Affirmative_default"
                 )
+                negative_default = next(
+                    profile for profile in defaults["roles"]["negative"] if profile["profile_id"] == "Negative_default"
+                )
+                moderator_default = next(
+                    profile for profile in defaults["roles"]["moderator"] if profile["profile_id"] == "Moderator_default"
+                )
                 self.assertIn("外部输入源头", affirmative_default["instructions"])
                 self.assertIn("grep/ripgrep", affirmative_default["instructions"])
                 self.assertIn("转回 Atlas", affirmative_default["instructions"])
+                self.assertIn("代码上下文业务逻辑", affirmative_default["instructions"])
+                self.assertIn("自主达成反方目标", negative_default["instructions"])
+                self.assertIn("代码上下文业务逻辑", negative_default["instructions"])
+                self.assertIn("key 可能是密钥", negative_default["instructions"])
+                self.assertIn("自主达成 Moderator 目标", moderator_default["instructions"])
+                self.assertIn("代码上下文业务逻辑", moderator_default["instructions"])
+                self.assertIn("异常读取", moderator_default["instructions"])
                 saved = post_json(
                     f"{base}/agent-prompts",
                     {
@@ -1913,10 +2102,23 @@ for raw in sys.stdin.buffer:
             self.assertIn("grep/ripgrep", affirmative.calls[0][1])
             self.assertIn("回到 Atlas", affirmative.calls[0][1])
             self.assertIn("误报、不可利用漏洞或证据不足", affirmative.calls[0][1])
+            self.assertIn("代码上下文业务逻辑说明", affirmative.calls[0][1])
             self.assertIn("可达性复核员", negative.calls[0][0])
             self.assertIn("质疑死代码和缓解措施。", negative.calls[0][0])
+            self.assertIn("敏感信息", negative.calls[0][1])
+            self.assertIn("key 可能是密钥", negative.calls[0][1])
+            self.assertIn("普通标识", negative.calls[0][1])
+            self.assertIn("代码上下文业务逻辑", negative.calls[0][1])
+            self.assertIn("加解密、签名、凭证校验", negative.calls[0][1])
+            self.assertIn("反方自主验证策略", negative.calls[0][1])
+            self.assertIn("独立围绕原始报告", negative.calls[0][1])
+            self.assertIn("主动寻找能推翻、削弱或限定正方主张", negative.calls[0][1])
             self.assertIn("中立主持人", moderator.calls[0][0])
             self.assertIn("只总结双方核心观点。", moderator.calls[0][0])
+            self.assertIn("Moderator 自主审查策略", moderator.calls[0][1])
+            self.assertIn("独立审查报告读取", moderator.calls[0][1])
+            self.assertIn("代码上下文业务逻辑", moderator.calls[0][1])
+            self.assertIn("异常报告读取", moderator.calls[0][1])
 
     def test_final_conclusion_rejects_llm_task_echo(self):
         with tempfile.TemporaryDirectory() as tmp:

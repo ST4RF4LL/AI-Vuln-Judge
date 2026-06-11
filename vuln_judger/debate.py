@@ -3,7 +3,7 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_NEGATIVE_AGENT
 from .evidence import EvidenceBundle
@@ -43,6 +43,127 @@ class ModeratorRoundDecision:
     continue_debate: bool
     unresolved: List[str]
     summary: str
+
+
+FINAL_LABELS = ("真实漏洞", "误报", "证据不足", "可达性存疑")
+
+
+ENTRY_REACHABILITY_MARKERS = (
+    "request",
+    "response",
+    "param",
+    "params",
+    "query",
+    "body",
+    "header",
+    "cookie",
+    "argv",
+    "stdin",
+    "recv",
+    "route",
+    "router",
+    "endpoint",
+    "controller",
+    "servlet",
+    "handler",
+    "rest",
+    "api",
+    "http",
+    "flask",
+    "fastapi",
+    "django",
+    "express",
+    "spring",
+    "getparameter",
+    "getheader",
+    "requestmapping",
+    "getmapping",
+    "postmapping",
+    "putmapping",
+    "deletemapping",
+    "@route",
+    "@app.route",
+    "app.get",
+    "app.post",
+    "router.get",
+    "router.post",
+    "add_url_rule",
+)
+
+
+SENSITIVE_INFO_TERMS: Tuple[Tuple[str, str, bool], ...] = (
+    ("private_key", "private_key", True),
+    ("privatekey", "privateKey", True),
+    ("private key", "private key", True),
+    ("secret_key", "secret_key", True),
+    ("secretkey", "secretKey", True),
+    ("secret key", "secret key", True),
+    ("access_key", "access_key", True),
+    ("accesskey", "accessKey", True),
+    ("access key", "access key", True),
+    ("api_key", "api_key", True),
+    ("apikey", "apiKey", True),
+    ("api key", "API key", True),
+    ("credential", "credential", True),
+    ("credentials", "credentials", True),
+    ("password", "password", True),
+    ("passwd", "passwd", True),
+    ("token", "token", True),
+    ("secret", "secret", True),
+    ("密钥", "密钥", True),
+    ("秘钥", "秘钥", True),
+    ("密码", "密码", True),
+    ("口令", "口令", True),
+    ("令牌", "令牌", True),
+    ("凭证", "凭证", True),
+    ("sensitive information", "sensitive information", False),
+    ("sensitive data", "sensitive data", False),
+    ("sensitive", "sensitive", False),
+    ("敏感信息", "敏感信息", False),
+    ("key", "key", False),
+)
+
+SOURCE_CONTEXT_KINDS = {
+    EvidenceKind.SOURCE_LOCATION,
+    EvidenceKind.SARIF_CODE_FLOW,
+    EvidenceKind.DATA_FLOW,
+    EvidenceKind.CALL_CHAIN,
+}
+
+BUSINESS_LOGIC_PATTERNS: Tuple[Tuple[Tuple[str, ...], str], ...] = (
+    (
+        ("request", "req.", "args", "param", "query", "body", "stdin", "argv", "用户输入", "请求", "参数"),
+        "读取外部输入或请求参数",
+    ),
+    (("return", "response", "send", "write", "print", "json", "返回", "响应", "输出", "写出"), "返回或写出处理结果"),
+    (
+        ("encrypt", "decrypt", "cipher", "crypto", "hmac", "sign", "verify", "hash", "加密", "解密", "签名", "验签"),
+        "执行加解密、签名、验签或摘要计算",
+    ),
+    (("password", "token", "credential", "auth", "session", "login", "密码", "令牌", "凭证", "认证", "鉴权"), "处理认证、会话或凭证语义"),
+    (("open(", "read(", "write(", "file", "path", "目录", "路径", "文件"), "读写文件或处理路径"),
+    (("select", "insert", "update", "delete", "sql", "query", "database", "db.", "数据库"), "访问数据库或构造查询"),
+    (("exec", "system", "popen", "shell", "command", "命令"), "执行命令或调用系统进程"),
+    (("http", "url", "socket", "client", "网络", "请求转发"), "访问网络资源或转发请求"),
+    (("log", "logger", "日志"), "记录日志或审计信息"),
+)
+
+CRYPTO_CONTEXT_MARKERS = (
+    "encrypt",
+    "decrypt",
+    "cipher",
+    "crypto",
+    "hmac",
+    "sign",
+    "verify",
+    "hash",
+    "digest",
+    "加密",
+    "解密",
+    "签名",
+    "验签",
+    "摘要",
+)
 
 
 class DebateOrchestrator:
@@ -117,6 +238,8 @@ class DebateOrchestrator:
                 "只有 Atlas、源码阅读、grep/ripgrep 与交叉验证均失败时，才可怀疑报告为误报、不可利用漏洞或证据不足。"
                 "如有证据缺口，应主动从已有证据中交叉验证补强（如从 calls 调用图反查数据流、从源码片段拼接路径、用报告附近符号补全 search 遗漏），"
                 "只有在穷尽补强手段后才可标注为证据限制，并说明尝试过哪些补强方法。"
+                "必须增加“代码上下文业务逻辑说明”：梳理当前漏洞代码及相邻上下文的行为目的，并用它校验变量语义和影响归因；"
+                "例如 key 是否为密钥，要结合后续是否参与加解密、签名、凭证校验、返回、日志或存储等上下文判断。"
                 "防护消减只在源码或 Skill/项目上下文存在明确防护证据时分析；没有证据就不要引入防护消减假设。"
             ),
             bundle,
@@ -148,11 +271,23 @@ class DebateOrchestrator:
             (
                 "提交反方质疑报告。目标固定为：客观验证正方给出的报告源码真实性、外部/内部入口可达性、"
                 "调用链、源到汇数据流、攻击影响和防护分析是否由证据支持。重点找出证据跳跃、无关 rg/Atlas 命中、"
-                "把候选汇点当作可达汇点、遗漏调用前提或浑水摸鱼的地方。只能引用提示中给出的证据 ID。"
+                "把候选汇点当作可达汇点、遗漏调用前提或浑水摸鱼的地方。"
+                "你必须像正方一样自主达成反方目标：不以正方报告为准，而是围绕原始报告、源码位置、Atlas/rg/源码证据独立重构调用链和数据流，"
+                "主动寻找能推翻、削弱或限定正方主张的新断点；如果证据不足，应说明还需补哪类证据，而不是只复述正方结论。"
+                "只能引用提示中给出的证据 ID。"
+                "如果报告涉及敏感信息，必须首先根据证据链确认相关参数或变量是否真实承载敏感信息；"
+                "例如 key 可能是密钥，也可能只是普通标识、索引或业务字段，不能仅凭变量名扩大为敏感信息泄露。"
+                "必须核验正方的代码上下文业务逻辑说明是否与源码一致，并用上下文行为判断变量语义；"
+                "如果后续没有加解密、签名、凭证校验等操作，应指出 key 被认定为密钥的证据不足。"
                 "防护消减只能基于源码或 Skill/项目上下文中的明确防护证据质疑；没有证据时不得凭空假设统一防护。"
             ),
             bundle,
-            extra=_stage_context("反方第一回合", "正方证据报告：\n" + affirmative_report, challenges, ""),
+            extra=_stage_context(
+                "反方第一回合",
+                "正方证据报告：\n" + affirmative_report,
+                challenges,
+                _negative_autonomous_audit_context(bundle),
+            ),
         )
         negative_report = negative_llm_report or _negative_challenge_report(bundle, challenges, affirmative_report)
         turns.append(
@@ -160,7 +295,7 @@ class DebateOrchestrator:
                 role=DebateRole.NEGATIVE,
                 round_index=1,
                 claim=negative_report,
-                evidence_ids=source_root_ids + protection_ids + tool_diag_ids,
+                evidence_ids=source_root_ids + report_ids + location_ids + flow_ids + protection_ids + impact_ids + tool_diag_ids,
                 resolved=not challenges,
             )
         )
@@ -224,14 +359,16 @@ class DebateOrchestrator:
                 "NEGATIVE",
                 (
                     "复审正方澄清。指出已经闭环的问题和仍然不成立的断点，并给出是否继续质疑。"
-                    "重点仍是攻击链真实性、攻击前提、防护消减和影响归因。"
+                    "重点仍是攻击链真实性、代码上下文业务逻辑、攻击前提、防护消减、敏感信息真实性和影响归因。"
+                    "必须自主复核正方新增论证：独立核对证据 ID、报告位置、Atlas/rg/源码上下文和调用链节点，"
+                    "判断正方是否真的补齐缺口；发现证据跳跃、复读或未证明事实时继续质疑，并提出下一步应补证的具体方向。"
                 ),
                 bundle,
                 extra=_stage_context(
                     f"反方第 {round_index} 回合复审",
                     "正方澄清：\n" + clarification,
                     unresolved,
-                    "",
+                    _negative_autonomous_audit_context(bundle),
                 ),
             )
             negative_review = negative_llm_review or _negative_review_report(bundle, unresolved, clarification, round_index)
@@ -244,7 +381,7 @@ class DebateOrchestrator:
                     role=DebateRole.NEGATIVE,
                     round_index=round_index,
                     claim=negative_review,
-                    evidence_ids=protection_ids + tool_diag_ids + flow_ids + location_ids,
+                    evidence_ids=source_root_ids + report_ids + location_ids + flow_ids + protection_ids + impact_ids + tool_diag_ids,
                     resolved=not _material_unresolved(next_unresolved),
                 )
             )
@@ -371,6 +508,8 @@ class DebateOrchestrator:
             (
                 "分析本轮正反方陈述，裁定是否需要继续下一轮。"
                 "必须客观说明双方一致点、仍未闭环争议、是否存在复读或证据跳跃。"
+                "必须像正方一样自主达成 Moderator 目标：独立审查输入报告读取是否正常、证据链是否覆盖源码位置、代码上下文业务逻辑、入口可达性、调用链、数据流、影响、防护和敏感信息语义，"
+                "判断正反方是否围绕报告验证而非复读或引用无关命中；必要时主动提出下一轮必须解决的证据缺口。"
                 "只能依据证据链和本轮陈述，不得替任一方新增事实。"
             ),
             bundle,
@@ -382,7 +521,7 @@ class DebateOrchestrator:
                     f"{issue_context}"
                 ),
                 challenges,
-                "",
+                _moderator_autonomous_review_context(bundle, turns, candidate_unresolved),
             ),
             output_instruction=(
                 "按以下字段输出：是否继续下一轮：是/否；未闭环争议：逐条列出或写无；"
@@ -436,6 +575,8 @@ class DebateOrchestrator:
             challenges.append("尚未建立已验证的源到汇数据流或调用路径。")
         if _has_protection(evidence):
             challenges.append("附近代码存在可能缓解问题的校验、鉴权或消毒逻辑。")
+        if _has_reachability_doubt(evidence):
+            challenges.append("局部漏洞路径存在，但尚未证明外部或内部 REST/API/接口入口能够调用到漏洞相关函数。")
         if not _has_impact(evidence):
             challenges.append("实际影响尚未关联到资产、权限或可达的危险汇点。")
         challenges.extend(bundle.diagnostics)
@@ -546,6 +687,8 @@ class DebateOrchestrator:
             "MODERATOR",
             (
                 "作为中立 Moderator，总结正反方核心观点、双方一致点、主要分歧、证据闭环状态和最终研判。"
+                "必须自主串联证据链并审查双方是否达成各自目标：正方是否证明可达攻击链，反方是否客观验证断点，"
+                "Moderator 是否识别了复读、异常报告读取、证据跳跃和仍未闭环缺口。"
                 "不得新增证据链之外的新事实；不得替任一方辩护；只基于双方陈述和证据 ID 做客观归纳。"
                 "输出 2 到 5 句话，不要使用 Markdown 表格。"
             ),
@@ -560,7 +703,7 @@ class DebateOrchestrator:
                     f"最近回合：\n{turn_context}"
                 ),
                 challenges,
-                "",
+                _moderator_autonomous_review_context(bundle, turns, challenges),
             ),
             output_instruction="只返回主持人总结正文 2 到 5 句话；不要说明你要做什么，不要复述任务、标签或格式要求。",
         )
@@ -580,6 +723,14 @@ class DebateOrchestrator:
                 recommended_next_steps=["确认 SARIF 报告是否由同一源码版本生成。"],
             )
         if _has_meaningful_flow(evidence) and not _has_protection(evidence):
+            if _has_reachability_doubt(evidence):
+                return DebateDecision(
+                    verdict=Verdict.INCONCLUSIVE,
+                    confidence=0.56,
+                    disputed_points=challenges,
+                    reasoning_summary="局部源码或源汇路径存在，但未证明外部或内部 REST/API/接口入口能够调用到漏洞相关函数，存在废弃代码或不可达路径风险。",
+                    recommended_next_steps=["补充从 REST/API/内部接口入口到漏洞函数的调用链；若确认无入口调用，应按废弃代码或不可达路径处理。"],
+                )
             return DebateDecision(
                 verdict=Verdict.TRUE_POSITIVE,
                 confidence=0.82 if _has_project_context(evidence) else 0.76,
@@ -588,6 +739,14 @@ class DebateOrchestrator:
                 recommended_next_steps=["人工验证利用前提，并根据资产影响确定修复优先级。"],
             )
         if _has_meaningful_flow(evidence) and _has_protection(evidence):
+            if _has_reachability_doubt(evidence):
+                return DebateDecision(
+                    verdict=Verdict.INCONCLUSIVE,
+                    confidence=0.54,
+                    disputed_points=challenges,
+                    reasoning_summary="局部漏洞路径和防护候选均存在，但入口可达性未闭环，无法证明 REST/API/内部接口会触发该函数。",
+                    recommended_next_steps=["先补齐入口到漏洞函数的调用链，再评估防护是否覆盖该路径。"],
+                )
             return DebateDecision(
                 verdict=Verdict.INCONCLUSIVE,
                 confidence=0.58,
@@ -596,6 +755,14 @@ class DebateOrchestrator:
                 recommended_next_steps=["审查被引用的防护代码，并测试攻击者可控输入是否能绕过。"],
             )
         if _has_weak_source_sink(evidence) and not _has_protection(evidence):
+            if _has_reachability_doubt(evidence):
+                return DebateDecision(
+                    verdict=Verdict.INCONCLUSIVE,
+                    confidence=0.5,
+                    disputed_points=challenges,
+                    reasoning_summary="代码位置存在且包含局部源点/汇点迹象，但未证明 REST/API/内部接口入口能够调用到漏洞相关函数。",
+                    recommended_next_steps=["使用 Atlas calls/search 或源码阅读补齐入口调用链；确认是否为废弃代码。"],
+                )
             return DebateDecision(
                 verdict=Verdict.INCONCLUSIVE,
                 confidence=0.52,
@@ -631,19 +798,21 @@ def _affirmative_evidence_report(
             _evidence_bullets(evidence, {EvidenceKind.REPORT}) or "未找到输入报告证据。",
             "### 2. 源码真实性",
             _source_authenticity_report(evidence),
-            "### 3. 函数调用链与数据流",
+            "### 3. 代码上下文业务逻辑说明",
+            _code_context_business_logic_report(evidence),
+            "### 4. 函数调用链与数据流",
             _flow_report(evidence),
-            "### 4. 攻击链",
+            "### 5. 攻击链",
             _attack_chain_report(bundle),
-            "### 5. 攻击前提与限制",
+            "### 6. 攻击前提与限制",
             _attack_prerequisite_report(evidence, challenges),
-            "### 6. 防护消减分析",
+            "### 7. 防护消减分析",
             _protection_assessment(evidence),
-            "### 7. 攻击影响",
+            "### 8. 攻击影响",
             _impact_assessment(evidence),
-            "### 8. PoC/EXP",
+            "### 9. PoC/EXP",
             _poc_report(evidence),
-            "### 9. 正方补证策略",
+            "### 10. 正方补证策略",
             _affirmative_evidence_hunting_report(evidence),
             "### 正方阶段性结论",
             f"{decision.reasoning_summary} 当前启发式标签倾向：{_verdict_label(decision.verdict)}。",
@@ -665,9 +834,13 @@ def _negative_challenge_report(bundle: EvidenceBundle, challenges: Sequence[str]
             _negative_prerequisite_challenge(evidence, challenges),
             "### 4. 安全防护消减风险",
             _negative_protection_challenge(evidence),
-            "### 5. 攻击影响是否被夸大",
+            "### 5. 代码上下文业务逻辑核验",
+            _negative_business_logic_challenge(evidence),
+            "### 6. 敏感信息真实性",
+            _negative_sensitive_info_challenge(evidence),
+            "### 7. 攻击影响是否被夸大",
             _negative_impact_challenge(evidence),
-            "### 6. 待正方澄清的问题",
+            "### 8. 待正方澄清的问题",
             challenge_text,
             "### 反方阶段性意见",
             "正方必须证明报告位置、源码片段、调用链/数据流和影响归因均能闭环；否则结论应降级为误报或证据不足。",
@@ -842,18 +1015,40 @@ def _source_authenticity_report(evidence: Sequence[CodeEvidence]) -> str:
     return root_text + "\n" + location_text
 
 
+def _code_context_business_logic_report(evidence: Sequence[CodeEvidence]) -> str:
+    if not _has_source_context(evidence):
+        return "当前未收集到可审查的报告附近源码上下文；无法稳定说明漏洞代码的业务目的。"
+    lines = []
+    locations = _context_locations(evidence)
+    if locations:
+        lines.append("- 报告上下文位置：" + " -> ".join(locations[:8]))
+    symbols = _context_symbols(evidence)
+    if symbols:
+        lines.append("- 相关符号/变量：" + ", ".join(symbols[:10]))
+    operations = _business_logic_operations(evidence)
+    if operations:
+        lines.append("- 行为目的候选：" + "；".join(operations[:6]) + "。")
+    else:
+        lines.append("- 行为目的候选：当前证据只能确认报告附近源码被读取，尚不能稳定归纳业务目的。")
+    sensitive_note = _sensitive_context_note(evidence)
+    if sensitive_note:
+        lines.append("- 敏感语义校验：" + sensitive_note)
+    return "\n".join(lines)
+
+
 def _attack_chain_report(bundle: EvidenceBundle) -> str:
     evidence = bundle.evidence
     steps = [
         f"1. 报告入口：`{bundle.finding.rule_id}` 指出 {bundle.finding.message}，对应输入报告证据 {_join_ids(_ids(evidence, EvidenceKind.REPORT))}。",
         "2. 源码定位：" + (_source_authenticity_report(evidence).replace("\n", "\n   ") or "未能定位真实源码。"),
-        "3. 传播/调用路径：" + (_flow_report(evidence).replace("\n", "\n   ") or "未建立路径。"),
-        "4. 危险操作或资产影响：" + _impact_assessment(evidence),
+        "3. 代码上下文业务目的：" + (_code_context_business_logic_report(evidence).replace("\n", "\n   ") or "未能归纳上下文业务逻辑。"),
+        "4. 传播/调用路径：" + (_flow_report(evidence).replace("\n", "\n   ") or "未建立路径。"),
+        "5. 危险操作或资产影响：" + _impact_assessment(evidence),
     ]
     if _has_protection(evidence):
-        steps.append("5. 防护限制：路径附近存在防护证据，攻击链必须证明这些控制无法覆盖该输入。")
+        steps.append("6. 防护限制：路径附近存在防护证据，攻击链必须证明这些控制无法覆盖该输入。")
     else:
-        steps.append("5. 防护限制：未发现针对报告路径的防护消减证据，本轮不引入防护消减假设。")
+        steps.append("6. 防护限制：未发现针对报告路径的防护消减证据，本轮不引入防护消减假设。")
     return "\n".join(steps)
 
 
@@ -911,6 +1106,49 @@ def _affirmative_evidence_plans(evidence: Sequence[CodeEvidence]) -> List[CodeEv
     return [item for item in evidence if item.source == "affirmative-evidence-planner"]
 
 
+def _negative_autonomous_audit_context(bundle: EvidenceBundle) -> str:
+    evidence = bundle.evidence
+    lines = [
+        "反方自主验证策略：不要只复述正方报告，应独立围绕原始报告验证源码真实性、代码上下文业务逻辑、可达入口、调用链、数据流、影响归因、防护和敏感信息语义。",
+        "执行要求：先从 REPORT 和 SOURCE_LOCATION 证据确认报告是否被正确读取，再用 SARIF_CODE_FLOW、DATA_FLOW、CALL_CHAIN、TOOL_DIAGNOSTIC、源码片段和项目上下文交叉核对每个链路节点。",
+        "Atlas/rg/源码审查要求：Atlas trace/calls/search、rg/grep 或源码阅读证据必须围绕报告路径、报告符号、codeFlow 或调用邻域；发现缺边、未命中、partial/empty 或无关候选时，应指出具体断点和还需要补的证据。",
+        "质疑目标：寻找能推翻、削弱或限定正方主张的客观证据，包括业务逻辑说明与源码不符、不可达入口、同名但不同上下文的候选命中、死代码/测试代码、数据流断链、汇点不可控、影响无法直接归因、明确防护覆盖或敏感信息语义未证实。",
+    ]
+    if _has_meaningful_flow(evidence):
+        lines.append("当前已有调用链/数据流候选，反方应逐跳核对同版本、同函数上下文、参数是否连续传递，并检查是否存在跳过的中间节点。")
+    else:
+        lines.append("当前缺少强调用链/数据流证据，反方应优先要求补齐从外部输入源头到报告危险点的可审计路径。")
+    if _has_protection(evidence):
+        lines.append("当前存在防护候选证据，反方应审查这些控制是否覆盖报告路径；只能基于已有证据质疑，不能凭空假设统一防护。")
+    if _sensitive_info_candidates(evidence):
+        lines.append("当前存在敏感信息候选词，反方必须先判断变量或参数是否真实敏感，例如 key 是密钥还是普通标识。")
+    return "\n".join(lines)
+
+
+def _moderator_autonomous_review_context(
+    bundle: EvidenceBundle, turns: Sequence[DebateTurn], candidate_unresolved: Sequence[str]
+) -> str:
+    evidence = bundle.evidence
+    lines = [
+        "Moderator 自主审查策略：不要只摘要双方文本，应独立审查报告读取、证据链闭环、争议质量和流程是否需要继续。",
+        "审查顺序：REPORT 是否包含具体漏洞类型/消息/位置；SOURCE_LOCATION 是否解析到真实源码；代码上下文业务逻辑说明是否能由源码复现；CALL_CHAIN/DATA_FLOW/SARIF_CODE_FLOW 是否能串起入口、传播节点和汇点；IMPACT/PROJECT_CONTEXT 是否支持影响；PROTECTION 和敏感信息语义是否有证据。",
+        "回合控制：如果正反方复读、引用提示词、引用无关命中或没有新增证据，应提前结束并给出结论；如果仍有影响结论的断链、异常报告读取或关键证据缺口，应要求继续下一轮并列出具体缺口。",
+        "中立约束：只能基于已有证据 ID 和双方陈述裁定，不替任一方补造事实；可以指出哪一方没有达成自己的目标。",
+    ]
+    if _all_primary_locations_invalid(evidence):
+        lines.append("当前报告主位置未能解析到源码，Moderator 应重点审查是否为报告路径/源码根配置问题或报告读取异常。")
+    if not _has_meaningful_flow(evidence):
+        lines.append("当前缺少强调用链/数据流证据，Moderator 应把端到端路径作为优先未闭环争议。")
+    if _sensitive_info_candidates(evidence):
+        lines.append("当前存在敏感信息候选词，Moderator 应检查反方是否审查真实敏感性，正方是否证明泄露或可读路径。")
+    repeated_roles = _roles_with_repeated_turns(turns)
+    if repeated_roles:
+        lines.append("当前检测到可能复读角色：" + "、".join(repeated_roles) + "；Moderator 应判断是否提前停止。")
+    if candidate_unresolved:
+        lines.append("候选未闭环争议需要逐项裁定：" + "；".join(_clean_dispute_line(item) for item in candidate_unresolved[:6] if _clean_dispute_line(item)))
+    return "\n".join(lines)
+
+
 def _negative_chain_challenge(evidence: Sequence[CodeEvidence]) -> str:
     if _all_primary_locations_invalid(evidence):
         return "报告中的主位置无法在源码树中解析，攻击链从第一步开始不成立。"
@@ -939,6 +1177,45 @@ def _negative_protection_challenge(evidence: Sequence[CodeEvidence]) -> str:
     return "当前证据未发现针对报告路径的防护消减证据；反方不得凭空引入统一防护，只能指出正方未提交相关防护证据。"
 
 
+def _negative_business_logic_challenge(evidence: Sequence[CodeEvidence]) -> str:
+    report = _code_context_business_logic_report(evidence)
+    if not _has_source_context(evidence):
+        return report + "\n- 反方核验：缺少报告附近源码上下文时，不能用变量名、规则名或孤立汇点推断业务语义。"
+    lines = [report]
+    lines.append("- 反方核验：正方的业务逻辑说明必须能从报告附近源码、codeFlow、调用链或数据流证据中复现，不能脱离当前代码上下文泛化。")
+    if _sensitive_info_candidates(evidence):
+        lines.append("- 反方核验：敏感信息类结论必须结合上下文行为判断；若没有加解密、签名、凭证校验、返回、日志或存储路径，变量名本身不足以证明敏感性。")
+    return "\n".join(lines)
+
+
+def _negative_sensitive_info_challenge(evidence: Sequence[CodeEvidence]) -> str:
+    candidates = _sensitive_info_candidates(evidence)
+    if not candidates:
+        return "当前报告与证据链未呈现敏感信息类变量、参数或资产；反方不额外引入敏感信息假设。"
+    labels = _candidate_labels(candidates)
+    label_text = "、".join(labels[:8])
+    has_key = any(label == "key" for label, _explicit in candidates)
+    has_explicit = any(explicit for _label, explicit in candidates)
+    if has_key and not has_explicit:
+        return (
+            f"报告/源码证据出现 {label_text}，但 key 可能为密钥，也可能只是普通标识、索引或业务字段；"
+            "正方必须用证据证明其真实敏感性，确认其确实承载密钥、凭证、token、密码等敏感信息，并说明泄露或可读路径。"
+            + " "
+            + _sensitive_context_note(evidence)
+        )
+    if has_key:
+        return (
+            f"报告/源码证据出现 {label_text}。即便存在敏感信息候选词，key 仍需先区分密钥与普通标识；"
+            "反方应核验变量来源、用途、传输/日志/响应/持久化路径和权限边界，只有证明真实敏感性后才能支持敏感信息泄露影响。"
+            + " "
+            + _sensitive_context_note(evidence)
+        )
+    return (
+        f"报告/源码证据出现 {label_text}。反方应核验证据链是否证明这些参数或变量真实承载密钥、凭证、token、密码等敏感信息，"
+        "以及是否存在可观察的泄露、写出或未授权读取路径。"
+    )
+
+
 def _negative_impact_challenge(evidence: Sequence[CodeEvidence]) -> str:
     impacts = [item for item in evidence if item.kind in {EvidenceKind.IMPACT, EvidenceKind.PROJECT_CONTEXT}]
     if not impacts:
@@ -949,10 +1226,14 @@ def _negative_impact_challenge(evidence: Sequence[CodeEvidence]) -> str:
 def _clarification_for_challenge(evidence: Sequence[CodeEvidence], challenge: str) -> str:
     if "源码" in challenge or "位置" in challenge or "解析" in challenge:
         return "源码真实性依据为：" + _source_authenticity_report(evidence)
+    if "业务逻辑" in challenge or "行为目的" in challenge or "上下文语义" in challenge:
+        return _code_context_business_logic_report(evidence)
     if "数据流" in challenge or "调用" in challenge or "路径" in challenge:
         return _flow_report(evidence)
     if "防护" in challenge or "校验" in challenge or "鉴权" in challenge or "消毒" in challenge:
         return _protection_assessment(evidence)
+    if _is_sensitive_info_challenge(challenge):
+        return _sensitive_info_assessment(evidence)
     if "影响" in challenge or "资产" in challenge:
         return _impact_assessment(evidence)
     return "该质疑需要人工复核；当前自动证据不能新增未采集事实，但可从已有调用图、源码片段和符号引用中交叉验证。"
@@ -977,10 +1258,14 @@ def _affirmative_reply_static(bundle: EvidenceBundle, challenges: Sequence[str])
 def _challenge_still_material(evidence: Sequence[CodeEvidence], challenge: str) -> bool:
     if "无法" in challenge or "位置" in challenge:
         return not _has_valid_location(evidence)
+    if "业务逻辑" in challenge or "行为目的" in challenge or "上下文语义" in challenge:
+        return not _has_source_context(evidence)
     if "数据流" in challenge or "调用" in challenge or "路径" in challenge or "尚未建立" in challenge:
         return not _has_meaningful_flow(evidence)
     if "防护" in challenge:
         return _has_protection(evidence)
+    if _is_sensitive_info_challenge(challenge):
+        return not _has_explicit_sensitive_info_evidence(evidence)
     if "影响" in challenge:
         return not _has_impact(evidence)
     return _material_unresolved([challenge])
@@ -1023,6 +1308,34 @@ def _moderator_repetition_issue(turns: Sequence[DebateTurn]) -> Optional[str]:
                 "继续辩论不会增加新证据"
             )
     return None
+
+
+def _roles_with_repeated_turns(turns: Sequence[DebateTurn]) -> List[str]:
+    repeated: List[str] = []
+    seen = set()
+    for index, turn in enumerate(turns):
+        if turn.role == DebateRole.MODERATOR:
+            continue
+        current = _normalize_claim_for_repetition(turn.claim)
+        if len(current) < 24:
+            continue
+        for previous in turns[:index]:
+            if previous.role != turn.role:
+                continue
+            previous_text = _normalize_claim_for_repetition(previous.claim)
+            if len(previous_text) < 24:
+                continue
+            similarity = difflib.SequenceMatcher(None, current, previous_text).ratio()
+            contains_repetition = min(len(current), len(previous_text)) >= 80 and (
+                current in previous_text or previous_text in current
+            )
+            if similarity >= 0.88 or contains_repetition:
+                role_label = _role_label(turn.role.value)
+                if role_label not in seen:
+                    repeated.append(role_label)
+                    seen.add(role_label)
+                break
+    return repeated
 
 
 def _normalize_claim_for_repetition(text: str) -> str:
@@ -1224,6 +1537,12 @@ def _fallback_side_conclusion(
     evidence = bundle.evidence
     if _all_primary_locations_invalid(evidence):
         return "误报", Verdict.FALSE_POSITIVE, "报告位置无法映射到当前源码版本，不能证明漏洞真实存在。"
+    if _has_reachability_doubt(evidence):
+        return (
+            "可达性存疑",
+            Verdict.INCONCLUSIVE,
+            "局部源码或源汇路径存在，但未证明外部或内部 REST/API/接口入口能够调用到漏洞相关函数，需排除废弃代码或不可达路径。",
+        )
     if role == "AFFIRMATIVE":
         if _has_meaningful_flow(evidence) and not _has_protection(evidence):
             return "真实漏洞", Verdict.TRUE_POSITIVE, "报告、源码位置和数据流/调用链证据形成闭环，当前未识别到有效防护。"
@@ -1286,7 +1605,7 @@ def _strip_response_line(text: str, label: str = "") -> str:
         flags=re.IGNORECASE,
     )
     labels = [label] if label else []
-    labels.extend(item for item in ("真实漏洞", "误报", "证据不足") if item not in labels)
+    labels.extend(item for item in FINAL_LABELS if item not in labels)
     label_pattern = "|".join(re.escape(item) for item in labels if item)
     if label_pattern:
         cleaned = re.sub(rf"^\s*(?:结论标签|结论|标签)\s*[:：]?\s*【?(?:{label_pattern})】?\s*[，,;；:：-]*\s*", "", cleaned)
@@ -1382,6 +1701,7 @@ def _looks_like_task_echo(statement: str) -> bool:
         "方向真实漏洞",
         "方向误报",
         "方向证据不足",
+        "方向可达性存疑",
         "约束中文markdown",
         "引用证据id",
         "不重复指令",
@@ -1543,6 +1863,53 @@ def _has_meaningful_flow(evidence: Sequence[CodeEvidence]) -> bool:
     return False
 
 
+def _has_reachability_doubt(evidence: Sequence[CodeEvidence]) -> bool:
+    return _has_valid_location(evidence) and _has_local_vulnerability_evidence(evidence) and not _has_entry_reachability(evidence)
+
+
+def _has_local_vulnerability_evidence(evidence: Sequence[CodeEvidence]) -> bool:
+    if _has_meaningful_flow(evidence) or _has_weak_source_sink(evidence):
+        return True
+    return any(item.kind == EvidenceKind.DATA_FLOW and item.data.get("sink_terms") for item in evidence)
+
+
+def _has_entry_reachability(evidence: Sequence[CodeEvidence]) -> bool:
+    text = _entry_reachability_text(evidence)
+    for marker in ENTRY_REACHABILITY_MARKERS:
+        normalized = marker.lower()
+        if not normalized:
+            continue
+        if re.search(r"^[a-z0-9_]+$", normalized):
+            if re.search(rf"(?<![a-z0-9_]){re.escape(normalized)}(?![a-z0-9_])", text):
+                return True
+        elif normalized in text:
+            return True
+    return False
+
+
+def _entry_reachability_text(evidence: Sequence[CodeEvidence]) -> str:
+    chunks: List[str] = []
+    for item in evidence:
+        if item.kind in {EvidenceKind.REPORT, EvidenceKind.SOURCE_LOCATION, EvidenceKind.SARIF_CODE_FLOW, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN, EvidenceKind.PROJECT_CONTEXT}:
+            chunks.append(item.summary)
+        if item.snippet:
+            chunks.append(item.snippet[:2000])
+        for location in item.locations[:10]:
+            chunks.append(location.file)
+            if location.symbol:
+                chunks.append(location.symbol)
+        data = item.data or {}
+        for key in ("source_terms", "symbols", "callers", "callees", "locations", "code_flows", "query_terms"):
+            value = data.get(key)
+            if value not in (None, "", [], {}):
+                chunks.append(str(value)[:2000])
+        raw_result = data.get("raw_result")
+        if isinstance(raw_result, dict):
+            chunks.append(str(raw_result.get("message", ""))[:1000])
+            chunks.append(str(raw_result.get("locations", ""))[:1000])
+    return "\n".join(chunk for chunk in chunks if chunk).lower()[:60000]
+
+
 def _has_weak_source_sink(evidence: Sequence[CodeEvidence]) -> bool:
     sources = {"code-search", "agentic-rg"}
     has_source = any(item.kind == EvidenceKind.DATA_FLOW and item.source in sources and item.data.get("source_terms") for item in evidence)
@@ -1656,6 +2023,25 @@ def _is_negative_dispute_line(text: str) -> bool:
         "无法支持",
         "遗漏",
         "死代码",
+        "废弃代码",
+        "可达性存疑",
+        "入口可达性",
+        "接口入口",
+        "rest接口",
+        "api入口",
+        "普通标识",
+        "真实敏感性",
+        "是否敏感",
+        "是否为密钥",
+        "未证明敏感",
+        "不能证明敏感",
+        "无法证明敏感",
+        "密钥也可能",
+        "业务逻辑",
+        "行为目的",
+        "上下文语义",
+        "上下文业务",
+        "代码上下文",
     )
     return any(marker in normalized for marker in dispute_markers)
 
@@ -1685,10 +2071,30 @@ def _material_unresolved(challenges: Sequence[str]) -> bool:
         "无法支持",
         "遗漏",
         "受限",
+        "死代码",
+        "废弃代码",
+        "可达性存疑",
+        "入口可达性",
+        "接口入口",
+        "rest接口",
+        "api入口",
         "cannot be resolved",
         "No verified",
         "degraded",
         "outside configured",
+        "普通标识",
+        "真实敏感性",
+        "是否敏感",
+        "是否为密钥",
+        "未证明敏感",
+        "不能证明敏感",
+        "无法证明敏感",
+        "密钥也可能",
+        "业务逻辑",
+        "行为目的",
+        "上下文语义",
+        "上下文业务",
+        "代码上下文",
     )
     return any(any(marker in challenge for marker in material) for challenge in challenges)
 
@@ -1752,6 +2158,182 @@ def _impact_assessment(evidence: Sequence[CodeEvidence]) -> str:
     if not impacts:
         return "未收集到影响证据。"
     return "; ".join(dict.fromkeys(impacts))
+
+
+def _sensitive_info_assessment(evidence: Sequence[CodeEvidence]) -> str:
+    candidates = _sensitive_info_candidates(evidence)
+    if not candidates:
+        return "当前证据未显示敏感信息类变量、参数或资产；不应扩大为敏感信息泄露影响。"
+    labels = _candidate_labels(candidates)
+    label_text = "、".join(labels[:8])
+    if not any(explicit for _label, explicit in candidates):
+        return (
+            f"当前仅发现敏感信息候选词 {label_text}，但尚未证明其真实语义。"
+            "需要结合报告位置、变量用途、上下游调用和输出/存储路径判断其是否为密钥、凭证、token、密码或其他敏感信息。"
+            + " "
+            + _sensitive_context_note(evidence)
+        )
+    return (
+        f"当前发现敏感信息相关候选词 {label_text}。仍需用源码上下文和调用/数据流证据证明这些值会被未授权读取、写出、记录或返回，"
+        "才能将影响归因为敏感信息泄露。"
+        + " "
+        + _sensitive_context_note(evidence)
+    )
+
+
+def _has_source_context(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(item.kind in SOURCE_CONTEXT_KINDS and (item.snippet or item.locations or item.data) for item in evidence)
+
+
+def _context_locations(evidence: Sequence[CodeEvidence]) -> List[str]:
+    locations = []
+    seen = set()
+    for item in evidence:
+        if item.kind not in SOURCE_CONTEXT_KINDS:
+            continue
+        for location in item.locations:
+            display = location.display()
+            if display in seen:
+                continue
+            seen.add(display)
+            locations.append(display)
+    return locations
+
+
+def _context_symbols(evidence: Sequence[CodeEvidence]) -> List[str]:
+    symbols: List[str] = []
+    for item in evidence:
+        if item.kind not in SOURCE_CONTEXT_KINDS:
+            continue
+        symbols.extend(str(value) for value in item.data.get("symbols", []) if value)
+        symbols.extend(str(value) for value in item.data.get("source_terms", []) if value)
+        symbols.extend(str(value) for value in item.data.get("sink_terms", []) if value)
+        for location in item.locations:
+            if location.symbol:
+                symbols.append(location.symbol)
+    return list(dict.fromkeys(symbols))
+
+
+def _business_logic_operations(evidence: Sequence[CodeEvidence]) -> List[str]:
+    text = _evidence_context_text(evidence, source_only=True)
+    operations = []
+    for markers, description in BUSINESS_LOGIC_PATTERNS:
+        if any(marker.lower() in text for marker in markers):
+            operations.append(description)
+    return list(dict.fromkeys(operations))
+
+
+def _sensitive_context_note(evidence: Sequence[CodeEvidence]) -> str:
+    if not _sensitive_info_candidates(evidence):
+        return ""
+    if not _has_source_context(evidence):
+        return "当前缺少报告附近源码上下文，不能仅凭报告字段或变量名判断敏感性。"
+    if _has_crypto_context(evidence):
+        return "代码上下文出现加解密、签名、验签或摘要计算候选语义，应继续确认该变量是否实际参与这些操作。"
+    return "代码上下文未见加解密、签名、凭证校验或密钥派生等操作，这会削弱仅凭 key 等命名认定为密钥的结论。"
+
+
+def _has_crypto_context(evidence: Sequence[CodeEvidence]) -> bool:
+    text = _evidence_context_text(evidence, source_only=True)
+    return any(marker.lower() in text for marker in CRYPTO_CONTEXT_MARKERS)
+
+
+def _sensitive_info_candidates(evidence: Sequence[CodeEvidence]) -> List[Tuple[str, bool]]:
+    text = _sensitive_info_text(evidence)
+    candidates: Dict[str, bool] = {}
+    for term, label, explicit in SENSITIVE_INFO_TERMS:
+        if _contains_sensitive_term(text, term):
+            candidates[label] = candidates.get(label, False) or explicit
+    return list(candidates.items())
+
+
+def _candidate_labels(candidates: Sequence[Tuple[str, bool]]) -> List[str]:
+    return list(dict.fromkeys(label for label, _explicit in candidates))
+
+
+def _has_explicit_sensitive_info_evidence(evidence: Sequence[CodeEvidence]) -> bool:
+    return any(explicit for _label, explicit in _sensitive_info_candidates(evidence))
+
+
+def _is_sensitive_info_challenge(text: str) -> bool:
+    normalized = re.sub(r"\s+", "", str(text or "").lower())
+    if not normalized:
+        return False
+    markers = (
+        "敏感信息",
+        "敏感性",
+        "密钥",
+        "秘钥",
+        "凭证",
+        "密码",
+        "口令",
+        "令牌",
+        "普通标识",
+        "是否敏感",
+        "secret",
+        "credential",
+        "password",
+        "passwd",
+        "token",
+        "apikey",
+        "api_key",
+        "accesskey",
+        "access_key",
+        "privatekey",
+        "private_key",
+    )
+    if any(marker in normalized for marker in markers):
+        return True
+    return bool(re.search(r"(?<![a-z0-9_])key(?![a-z0-9_])", normalized))
+
+
+def _sensitive_info_text(evidence: Sequence[CodeEvidence]) -> str:
+    return _evidence_context_text(evidence, source_only=False)
+
+
+def _evidence_context_text(evidence: Sequence[CodeEvidence], source_only: bool) -> str:
+    chunks: List[str] = []
+    for item in evidence:
+        if source_only and item.kind not in SOURCE_CONTEXT_KINDS:
+            continue
+        chunks.append(item.summary)
+        chunks.append(item.source)
+        if item.snippet:
+            chunks.append(item.snippet[:2000])
+        for location in item.locations[:10]:
+            chunks.append(location.display())
+            if location.symbol:
+                chunks.append(location.symbol)
+        chunks.extend(_string_fragments(item.data))
+    return "\n".join(chunk for chunk in chunks if chunk).lower()[:60000]
+
+
+def _string_fragments(value: Any, depth: int = 0) -> List[str]:
+    if value is None or depth > 3:
+        return []
+    if isinstance(value, (str, int, float, bool)):
+        return [str(value)[:1500]]
+    if isinstance(value, dict):
+        fragments: List[str] = []
+        for key, item in list(value.items())[:40]:
+            fragments.append(str(key)[:200])
+            fragments.extend(_string_fragments(item, depth + 1))
+        return fragments
+    if isinstance(value, (list, tuple, set)):
+        fragments = []
+        for item in list(value)[:40]:
+            fragments.extend(_string_fragments(item, depth + 1))
+        return fragments
+    return [str(value)[:500]]
+
+
+def _contains_sensitive_term(text: str, term: str) -> bool:
+    normalized_term = term.lower()
+    if any(ord(char) > 127 for char in normalized_term) or " " in normalized_term:
+        return normalized_term in text
+    if normalized_term == "key":
+        return bool(re.search(r"(?<![a-z0-9_])key(?![a-z0-9_])", text))
+    return normalized_term in text
 
 
 def _resolved_source_locations(evidence: Sequence[CodeEvidence], fallback: Sequence[SourceLocation]) -> List[SourceLocation]:
