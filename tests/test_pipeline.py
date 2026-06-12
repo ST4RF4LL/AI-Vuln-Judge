@@ -1936,12 +1936,11 @@ for raw in sys.stdin.buffer:
                             "source_path": str(root),
                             "skills_path": str(skills),
                             "enable_external_tools": False,
-                            "include_evidence": True,
-                            "evidence_limit": 5,
                         },
                     )
                 )
                 self.assertEqual(quick["mode"], "one_round_judge")
+                self.assertEqual(quick["response_mode"], "compact")
                 self.assertEqual(quick["configuration"]["max_rounds"], 1)
                 self.assertFalse(quick["configuration"]["enable_llm"])
                 self.assertTrue(quick["saved"])
@@ -1950,13 +1949,28 @@ for raw in sys.stdin.buffer:
                 self.assertEqual(quick["judged_finding_count"], 1)
                 self.assertEqual(quick["selected_finding"]["rule_id"], "python-command-injection")
                 self.assertEqual(quick["verdict"]["verdict"], "TRUE_POSITIVE")
-                self.assertEqual(quick["agent_configs"]["moderator"]["profile_id"], "Moderator_default")
-                self.assertIn("evidence_summary", quick)
-                self.assertIn("missing_evidence", quick)
-                self.assertLessEqual(len(quick["evidence"]), 5)
-                self.assertTrue(quick["debate"])
+                self.assertEqual(quick["verdict"]["label"], "真实漏洞")
+                self.assertIn("path_overview", quick)
+                self.assertIn("call_chain", quick["path_overview"])
+                self.assertIn("data_flow", quick["path_overview"])
+                self.assertIn("app.py:4:11", quick["path_overview"]["data_flow"])
+                self.assertIn("app.py:5:5", quick["path_overview"]["data_flow"])
+                self.assertNotIn("ev-", json.dumps(quick["path_overview"], ensure_ascii=False))
+                self.assertIn("key_gaps", quick)
+                self.assertIn("next_actions", quick)
+                self.assertIn("full_report_access", quick)
+                self.assertEqual(quick["full_report_access"]["mcp_get_finding"]["tool"], "get_finding")
+                self.assertNotIn("agent_configs", quick)
+                self.assertNotIn("evidence_summary", quick)
+                self.assertNotIn("missing_evidence", quick)
+                self.assertNotIn("evidence", quick)
+                self.assertNotIn("debate", quick)
                 quick_runs = mcp_tool_json(client.call_tool("list_runs", {"limit": 5}))
                 self.assertTrue(any(item["run_id"] == quick["run_id"] for item in quick_runs["runs"]))
+                quick_finding_args = quick["full_report_access"]["mcp_get_finding"]["arguments"]
+                quick_finding = mcp_tool_json(client.call_tool("get_finding", quick_finding_args))
+                self.assertEqual(quick_finding["finding_id"], quick["selected_finding"]["finding_id"])
+                self.assertIn("evidence_chain", quick_finding)
 
                 judged = mcp_tool_json(
                     client.call_tool(

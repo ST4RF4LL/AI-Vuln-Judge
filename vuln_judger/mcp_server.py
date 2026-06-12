@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import traceback
 from dataclasses import dataclass
@@ -195,11 +196,19 @@ class JudgerMCPServer:
             self.records.save_payload(run_payload)
         evidence = report_payload.get("evidence_chain") or []
         evidence_limit = int(arguments.get("evidence_limit") or 40)
+        response_mode = _response_mode(arguments)
+        record_path = str(self.records._path(run_id)) if saved else None
+        missing = _missing_evidence(
+            report_payload,
+            bundle.diagnostics,
+            external_tools_enabled=bool(arguments.get("enable_external_tools", True)),
+        )
         result = {
             "mode": "one_round_judge",
+            "response_mode": response_mode,
             "run_id": run_id,
             "saved": saved,
-            "record_path": str(self.records._path(run_id)) if saved else None,
+            "record_path": record_path,
             "configuration": {
                 "max_rounds": 1,
                 "enable_external_tools": bool(arguments.get("enable_external_tools", True)),
@@ -211,25 +220,32 @@ class JudgerMCPServer:
             "finding_count": len(findings),
             "judged_finding_count": 1,
             "selected_finding": _finding_brief(finding),
-            "verdict": _verdict_detail(report_payload),
-            "missing_evidence": _missing_evidence(
-                report_payload,
-                bundle.diagnostics,
-                external_tools_enabled=bool(arguments.get("enable_external_tools", True)),
-            ),
-            "evidence_summary": _evidence_summary(evidence),
-            "source_locations": report_payload.get("source_locations", []),
-            "recommended_next_steps": report_payload.get("recommended_next_steps", []),
-            "disputed_points": report_payload.get("disputed_points", []),
-            "agent_configs": run_payload["agent_configs"],
-            "debate": report_payload.get("debate", []),
-            "diagnostics": run_payload["diagnostics"],
+            "verdict": _compact_verdict_detail(report_payload),
+            "path_overview": _path_overview_payload(report_payload),
+            "key_gaps": _key_gaps(missing),
+            "next_actions": _next_actions(saved),
+            "full_report_access": _full_report_access(run_id, str(report.finding_id), record_path, saved),
         }
-        if bool(arguments.get("include_evidence", True)):
+        if response_mode in {"standard", "full"}:
+            result.update(
+                {
+                    "missing_evidence": missing,
+                    "evidence_summary": _evidence_summary(evidence),
+                    "source_locations": report_payload.get("source_locations", []),
+                    "recommended_next_steps": report_payload.get("recommended_next_steps", []),
+                    "disputed_points": report_payload.get("disputed_points", []),
+                    "diagnostics": run_payload["diagnostics"],
+                }
+            )
+        if response_mode == "full":
+            result["agent_configs"] = run_payload["agent_configs"]
+            result["debate"] = report_payload.get("debate", [])
+        include_evidence_default = response_mode == "full"
+        if bool(arguments.get("include_evidence", include_evidence_default)):
             result["evidence"] = evidence[: max(0, evidence_limit)]
             result["evidence_truncated"] = len(evidence) > max(0, evidence_limit)
             result["evidence_total"] = len(evidence)
-        if bool(arguments.get("include_report", False)):
+        if bool(arguments.get("include_report", False)) or response_mode == "full":
             result["report"] = report_payload
             result["run"] = run_payload
         return result
@@ -390,7 +406,8 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "affirmative_agent_profile": {"type": "string"},
                 "negative_agent_profile": {"type": "string"},
                 "moderator_agent_profile": {"type": "string"},
-                "include_evidence": {"type": "boolean", "default": True},
+                "response_mode": {"type": "string", "enum": ["compact", "standard", "full"], "default": "compact"},
+                "include_evidence": {"type": "boolean", "default": False},
                 "evidence_limit": {"type": "integer", "minimum": 0, "default": 40},
                 "include_report": {"type": "boolean", "default": False},
                 "save": {"type": "boolean", "default": True},
@@ -601,6 +618,157 @@ def _verdict_detail(report: Dict[str, Any]) -> Dict[str, Any]:
         "protection_assessment": report.get("protection_assessment"),
         "impact_assessment": report.get("impact_assessment"),
     }
+
+
+def _response_mode(arguments: Dict[str, Any]) -> str:
+    mode = str(arguments.get("response_mode") or "compact").strip().lower()
+    if mode not in {"compact", "standard", "full"}:
+        raise ValueError(f"Unsupported response_mode: {mode}")
+    return mode
+
+
+def _compact_verdict_detail(report: Dict[str, Any]) -> Dict[str, Any]:
+    conclusion = _without_path_overview(str(report.get("final_conclusion") or ""))
+    summary = str(report.get("reasoning_summary") or "").strip() or conclusion
+    label = _extract_final_label(conclusion) or _verdict_label(str(report.get("verdict") or ""))
+    return {
+        "finding_id": report.get("finding_id"),
+        "rule_id": report.get("rule_id"),
+        "verdict": report.get("verdict"),
+        "label": label,
+        "confidence": report.get("confidence"),
+        "summary": _short_text(summary),
+        "conclusion": _short_text(conclusion),
+    }
+
+
+def _without_path_overview(text: str) -> str:
+    value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    for marker in ("\n### 调用链 / 数据流概览", "\n### 证据串联图"):
+        if marker in value:
+            return value.split(marker, 1)[0].strip()
+    if value.startswith("### 调用链 / 数据流概览") or value.startswith("### 证据串联图"):
+        return ""
+    return value.strip()
+
+
+def _extract_final_label(text: str) -> str:
+    match = re.search(r"【([^】]{1,20})】", str(text or ""))
+    return match.group(1).strip() if match else ""
+
+
+def _verdict_label(verdict: str) -> str:
+    return {
+        "TRUE_POSITIVE": "真实漏洞",
+        "FALSE_POSITIVE": "误报",
+        "INCONCLUSIVE": "证据不足",
+    }.get(str(verdict or ""), str(verdict or ""))
+
+
+def _short_text(text: str, limit: int = 700) -> str:
+    value = _clean_response_text(text)
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1].rstrip() + "…"
+
+
+def _path_overview_payload(report: Dict[str, Any]) -> Dict[str, Any]:
+    graph = report.get("evidence_graph") if isinstance(report.get("evidence_graph"), dict) else {}
+    overview = _clean_response_text(graph.get("path_overview") or "")
+    breaks = _overview_breaks(graph, overview)
+    call_chain = _overview_block(overview, "调用链状态", "数据流状态")
+    data_flow = _overview_block(overview, "数据流状态", "未闭环点：")
+    return {
+        "status": _overview_status(call_chain, data_flow, breaks),
+        "call_chain": call_chain or "调用链：未获得可展示路径。",
+        "data_flow": data_flow or "数据流：未获得可展示路径。",
+        "breaks": breaks,
+    }
+
+
+def _overview_block(text: str, start_marker: str, end_marker: str) -> str:
+    value = str(text or "")
+    start = value.find(start_marker)
+    if start < 0:
+        return ""
+    end = value.find(end_marker, start + len(start_marker))
+    block = value[start:] if end < 0 else value[start:end]
+    return _clean_response_text(block)
+
+
+def _overview_breaks(graph: Dict[str, Any], overview: str) -> List[str]:
+    result: List[str] = []
+    for item in graph.get("breaks") or []:
+        if isinstance(item, dict):
+            reason = _clean_response_text(item.get("label") or item.get("reason") or "")
+            if reason:
+                result.append(reason)
+    if not result and "未闭环点：" in overview:
+        tail = overview.split("未闭环点：", 1)[1]
+        for line in tail.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("-"):
+                result.append(_clean_response_text(stripped[1:].strip()))
+    return _dedupe_strings(result)
+
+
+def _overview_status(call_chain: str, data_flow: str, breaks: Sequence[str]) -> str:
+    combined = "\n".join([call_chain, data_flow])
+    if breaks or "未闭环" in combined or "断链" in combined:
+        return "未闭环"
+    if "部分闭环" in combined or "部分" in combined:
+        return "部分闭环"
+    if "已闭环" in combined:
+        return "已闭环"
+    return "未获得证据"
+
+
+def _key_gaps(missing: Sequence[Dict[str, Any]], limit: int = 5) -> List[str]:
+    gaps = []
+    for item in missing:
+        summary = _clean_response_text(item.get("summary") if isinstance(item, dict) else item)
+        if summary:
+            gaps.append(summary)
+        if len(gaps) >= limit:
+            break
+    return _dedupe_strings(gaps)
+
+
+def _next_actions(saved: bool) -> List[str]:
+    actions = ["需要更多细节时，优先调用 get_finding 读取完整 finding 报告。", "需要人读报告时，调用 export_run_markdown 导出完整 Markdown。"]
+    if not saved:
+        actions.insert(0, "当前未保存 run；如需后续访问完整报告，请重新调用 one_round_judge 并设置 save=true。")
+    return actions
+
+
+def _full_report_access(run_id: str, finding_id: str, record_path: Optional[str], saved: bool) -> Dict[str, Any]:
+    return {
+        "available": saved,
+        "record_path": record_path,
+        "mcp_get_run": {"tool": "get_run", "arguments": {"run_id": run_id, "include_reports": True}} if saved else None,
+        "mcp_get_finding": {"tool": "get_finding", "arguments": {"run_id": run_id, "finding_id": finding_id}} if saved else None,
+        "mcp_export_markdown": {"tool": "export_run_markdown", "arguments": {"run_id": run_id}} if saved else None,
+    }
+
+
+def _clean_response_text(value: Any) -> str:
+    text = str(value or "")
+    text = re.sub(r"\bev-[0-9A-Za-z_-]+\b", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _dedupe_strings(items: Sequence[str]) -> List[str]:
+    seen = set()
+    result = []
+    for item in items:
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _evidence_summary(evidence: Sequence[Dict[str, Any]]) -> Dict[str, Any]:

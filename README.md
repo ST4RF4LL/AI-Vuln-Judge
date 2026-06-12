@@ -112,12 +112,18 @@ uv run vuln-judger mcp \
 可用工具：
 
 - `judge_report`：对 SARIF/Markdown 报告和源码目录运行完整研判，可保存 run 记录。
-- `one_round_judge`：对单个 finding 使用默认配置进行单轮快速验证，默认保存 run 记录，
-  返回缺失证据和补证建议；如不希望 Web 端显示该快速验证记录，可传 `save: false`。
+- `one_round_judge`：对单个 finding 使用默认配置进行单轮快速验证，默认保存 run 记录。
+  默认 `response_mode: compact` 只返回关键结论、调用链/数据流概览、关键缺口和完整报告访问方式，
+  以减少 CLI Agent 上下文占用；如不希望 Web 端显示该快速验证记录，可传 `save: false`。
 - `collect_evidence`：只采集某个 finding 的源码、SARIF、Atlas、检索和影响证据，不运行博弈。
 - `resolve_report_locations`：把报告路径映射到源码树中的真实文件并返回代码片段。
 - `list_runs` / `get_run` / `get_finding`：读取历史研判记录。
 - `export_run_markdown`：导出指定 run 的 Markdown 报告。
+
+`one_round_judge` 的默认返回中会包含 `full_report_access`，指向 `get_run`、`get_finding`
+和 `export_run_markdown` 的调用参数。Agent 需要更多证据、辩论过程或源码片段时，应按该字段
+继续读取完整报告。调试时可传 `response_mode: standard` 返回证据摘要和诊断，或传
+`response_mode: full` 返回完整 run/report 内容。
 
 ### Codex 配置
 
