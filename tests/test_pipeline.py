@@ -610,6 +610,42 @@ for raw in sys.stdin.buffer:
             self.assertFalse(any(item.source == "atlas-mcp" for item in evidence))
             self.assertNotIn("当前 Atlas CLI 未提供 trace 子命令", summaries)
 
+    def test_atlas_mcp_timeout_becomes_diagnostic_and_keeps_source_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".atlas").mkdir()
+            (root / ".atlas" / "atlas.db").write_text("fake", encoding="utf-8")
+            (root / "app.py").write_text(
+                "\n".join(
+                    [
+                        "import os",
+                        "def handler(request):",
+                        "    cmd = request.args['cmd']",
+                        "    os.system(cmd)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_timeout_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-atlas-timeout",
+                rule_id="python-command-injection",
+                message="用户输入可到达命令执行点",
+                level="error",
+                locations=[SourceLocation("app.py", 4, 5)],
+            )
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["python"]),
+                AnalyzerSettings(enabled=True, timeout_seconds=1),
+            )
+            summaries = "\n".join(item.summary for item in evidence)
+            self.assertIn("MCP request timed out after 1s: tools/call:trace", summaries)
+            self.assertTrue(any(item.source == "agentic-source-reader" for item in evidence))
+            self.assertFalse(any("适配器执行失败" in item.summary for item in evidence))
+
     def test_atlas_mcp_uses_resolved_sarif_suffix_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2801,6 +2837,88 @@ for raw in sys.stdin:
             tool_response(request_id, {"results": []})
         elif name == "trace":
             tool_response(request_id, {"ok": False, "partial_result": False, "diagnostics": ["empty"]})
+        elif name == "calls":
+            tool_response(request_id, {"hops": []})
+        else:
+            tool_response(request_id, {"error": "unknown tool"}, True)
+'''
+
+
+def fake_atlas_mcp_timeout_script():
+    return r'''#!/usr/bin/env python3
+import json
+import sys
+import time
+
+if "--help" in sys.argv:
+    print("Commands:")
+    print("  mcp     Start MCP server")
+    sys.exit(0)
+
+if len(sys.argv) < 2 or sys.argv[1] != "mcp":
+    sys.exit(2)
+
+TOOLS = [{"name": name} for name in ("project", "search", "trace", "calls")]
+
+def send(message):
+    print(json.dumps(message, separators=(",", ":")), flush=True)
+
+def tool_response(request_id, payload, is_error=False):
+    send({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(payload, separators=(",", ":"))}],
+            "isError": is_error,
+        },
+    })
+
+for raw in sys.stdin:
+    if not raw.strip():
+        continue
+    message = json.loads(raw)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "atlas-mcp", "version": "fake-timeout"},
+            },
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}})
+    elif method == "tools/call":
+        params = message.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if name == "project" and args.get("action") == "status":
+            tool_response(request_id, {
+                "summary": {"files": 1, "symbols": 1, "edges": 2},
+                "project": {"db_path": ".atlas/atlas.db"},
+                "server": {"atlas_version": "fake-timeout", "tool_contract_version": 1},
+                "language_capabilities": [{"language": "python", "capability_level": "dataflow_full"}],
+            })
+        elif name == "project" and args.get("action") == "files":
+            tool_response(request_id, {"files": [{"path": args.get("path_prefix", "app.py"), "language": "python", "status": "success"}]})
+        elif name == "search":
+            tool_response(request_id, {
+                "results": [{
+                    "name": "handler",
+                    "qualified_name": "handler",
+                    "kind": "function",
+                    "file": "app.py",
+                    "line": 2,
+                }]
+            })
+        elif name == "trace":
+            time.sleep(2)
+            tool_response(request_id, {"ok": True, "partial_result": False, "diagnostics": []})
         elif name == "calls":
             tool_response(request_id, {"hops": []})
         else:

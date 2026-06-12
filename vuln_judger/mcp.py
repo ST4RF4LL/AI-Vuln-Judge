@@ -14,13 +14,16 @@ class MCPError(RuntimeError):
     pass
 
 
+DEFAULT_MCP_TIMEOUT_SECONDS = 120
+
+
 class MCPStdioClient:
     """Minimal newline-delimited MCP stdio client used by Atlas 1.3.x."""
 
-    def __init__(self, command: Sequence[str], cwd: Path, timeout: int = 30, env: Optional[Dict[str, str]] = None):
+    def __init__(self, command: Sequence[str], cwd: Path, timeout: Optional[int] = None, env: Optional[Dict[str, str]] = None):
         self.command = list(command)
         self.cwd = cwd
-        self.timeout = timeout
+        self.timeout = _timeout_seconds(timeout)
         self.env = dict(env or {})
         self._process: Optional[subprocess.Popen[str]] = None
         self._messages: "queue.Queue[Dict[str, Any]]" = queue.Queue()
@@ -75,9 +78,9 @@ class MCPStdioClient:
         return result.get("tools") or []
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        return self.request("tools/call", {"name": name, "arguments": arguments})
+        return self.request("tools/call", {"name": name, "arguments": arguments}, label=f"tools/call:{name}")
 
-    def request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def request(self, method: str, params: Optional[Dict[str, Any]] = None, label: Optional[str] = None) -> Dict[str, Any]:
         process = self._require_process()
         self._next_id += 1
         request_id = self._next_id
@@ -95,7 +98,8 @@ class MCPStdioClient:
                 continue
             if received.get("id") == request_id:
                 return received
-        raise MCPError(f"MCP request timed out: {method}")
+        request_name = label or method
+        raise MCPError(f"MCP request timed out after {self.timeout}s: {request_name}")
 
     def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
         message: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
@@ -150,3 +154,15 @@ class MCPStdioClient:
                 self._messages.put(json.loads(raw))
             except json.JSONDecodeError:
                 self._messages.put({"jsonrpc": "2.0", "error": {"message": raw[:500]}})
+
+
+def _timeout_seconds(value: Optional[int]) -> int:
+    if value is not None:
+        return max(1, int(value))
+    raw = os.environ.get("VULN_JUDGER_MCP_TIMEOUT") or os.environ.get("VULN_JUDGER_ATLAS_MCP_TIMEOUT")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return DEFAULT_MCP_TIMEOUT_SECONDS
+    return DEFAULT_MCP_TIMEOUT_SECONDS

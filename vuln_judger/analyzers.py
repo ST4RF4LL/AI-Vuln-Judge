@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -18,8 +19,16 @@ from .source import ResolvedLocation, SourceIndexer, detect_language, evidence_i
 class AnalyzerSettings:
     enabled: bool = True
     auto_index: bool = False
-    timeout_seconds: int = 30
+    timeout_seconds: int = 120
     mcp_servers_file: Optional[Path] = None
+
+    def __post_init__(self) -> None:
+        raw = os.environ.get("VULN_JUDGER_ATLAS_MCP_TIMEOUT") or os.environ.get("VULN_JUDGER_MCP_TIMEOUT")
+        if raw:
+            try:
+                self.timeout_seconds = max(1, int(raw))
+            except ValueError:
+                pass
 
 
 class Analyzer:
@@ -213,9 +222,7 @@ class AtlasAnalyzer(Analyzer):
                             data={"transport": "mcp", "tools": sorted(str(tool) for tool in tools), "mcp_success": False},
                         )
                     ]
-                status_payload, status_text, status_error = _mcp_tool_payload(
-                    client.call_tool("project", {"action": "status", "verbose": True})
-                )
+                status_payload, status_text, status_error = _safe_mcp_tool_payload(client, "project", {"action": "status", "verbose": True})
                 evidence.append(self._mcp_status_evidence(finding, status_payload, status_text, status_error, "trace" in tools))
                 evidence.extend(self._mcp_indexed_file_evidence(client, finding, indexer))
                 if "trace" in tools:
@@ -269,9 +276,7 @@ class AtlasAnalyzer(Analyzer):
                     )
                 ]
                 if "project" in tools:
-                    status_payload, status_text, status_error = _mcp_tool_payload(
-                        client.call_tool("project", {"action": "status", "verbose": True})
-                    )
+                    status_payload, status_text, status_error = _safe_mcp_tool_payload(client, "project", {"action": "status", "verbose": True})
                     evidence.append(self._agentic_status_evidence(finding, status_payload, status_text, status_error))
                     evidence.extend(self._agentic_file_evidence(client, finding, indexer, path_prefixes))
                 if "search" in tools:
@@ -346,9 +351,7 @@ class AtlasAnalyzer(Analyzer):
     ) -> List[CodeEvidence]:
         matched: Dict[str, Dict[str, Any]] = {}
         for prefix in path_prefixes[:12]:
-            payload, _, is_error = _mcp_tool_payload(
-                client.call_tool("project", {"action": "files", "path_prefix": prefix, "limit": 50})
-            )
+            payload, _, is_error = _safe_mcp_tool_payload(client, "project", {"action": "files", "path_prefix": prefix, "limit": 50})
             if is_error or not isinstance(payload, dict):
                 continue
             for item in payload.get("files") or []:
@@ -386,7 +389,7 @@ class AtlasAnalyzer(Analyzer):
         results: List[Dict[str, Any]] = []
         seen: set[tuple[str, str, int]] = set()
         for term in terms[:12]:
-            payload, _, is_error = _mcp_tool_payload(client.call_tool("search", {"query": term, "limit": 10}))
+            payload, _, is_error = _safe_mcp_tool_payload(client, "search", {"query": term, "limit": 10})
             if is_error or not isinstance(payload, dict):
                 continue
             for item in payload.get("results") or []:
@@ -420,7 +423,7 @@ class AtlasAnalyzer(Analyzer):
                 }
                 if trace_kind == "variable":
                     arguments["max_depth"] = 30
-                payload, raw_text, is_error = _mcp_tool_payload(client.call_tool("trace", arguments))
+                payload, raw_text, is_error = _safe_mcp_tool_payload(client, "trace", arguments)
                 item = _mcp_trace_item(
                     finding,
                     trace_kind,
@@ -454,9 +457,7 @@ class AtlasAnalyzer(Analyzer):
             if not qname or qname in seen:
                 continue
             seen.add(qname)
-            payload, raw_text, is_error = _mcp_tool_payload(
-                client.call_tool("calls", {"symbol": qname, "direction": "both", "depth": 2, "limit": 30})
-            )
+            payload, raw_text, is_error = _safe_mcp_tool_payload(client, "calls", {"symbol": qname, "direction": "both", "depth": 2, "limit": 30})
             location = SourceLocation(
                 file=str(result.get("file") or ""),
                 line=_optional_int(result.get("line")),
@@ -632,9 +633,7 @@ class AtlasAnalyzer(Analyzer):
             resolved = indexer.resolve_location(location)
             if not resolved.exists:
                 continue
-            payload, _, is_error = _mcp_tool_payload(
-                client.call_tool("project", {"action": "files", "path_prefix": resolved.relative_path, "limit": 20})
-            )
+            payload, _, is_error = _safe_mcp_tool_payload(client, "project", {"action": "files", "path_prefix": resolved.relative_path, "limit": 20})
             if is_error or not isinstance(payload, dict):
                 continue
             for item in payload.get("files") or []:
@@ -694,7 +693,7 @@ class AtlasAnalyzer(Analyzer):
                 }
                 if trace_kind == "variable":
                     arguments["max_depth"] = 30
-                payload, raw_text, is_error = _mcp_tool_payload(client.call_tool("trace", arguments))
+                payload, raw_text, is_error = _safe_mcp_tool_payload(client, "trace", arguments)
                 evidence.append(
                     _mcp_trace_item(
                         finding,
@@ -733,9 +732,7 @@ class AtlasAnalyzer(Analyzer):
         evidence: List[CodeEvidence] = []
         seen_symbols: set[str] = set()
         for term in search_terms:
-            payload, _, is_error = _mcp_tool_payload(
-                client.call_tool("search", {"query": term, "limit": 10})
-            )
+            payload, _, is_error = _safe_mcp_tool_payload(client, "search", {"query": term, "limit": 10})
             if is_error or not isinstance(payload, dict):
                 continue
             candidates = payload.get("results") or []
@@ -747,9 +744,7 @@ class AtlasAnalyzer(Analyzer):
             if qname in seen_symbols:
                 continue
             seen_symbols.add(qname)
-            calls_payload, raw_text, calls_error = _mcp_tool_payload(
-                client.call_tool("calls", {"symbol": qname, "direction": "both", "depth": 2, "limit": 30})
-            )
+            calls_payload, raw_text, calls_error = _safe_mcp_tool_payload(client, "calls", {"symbol": qname, "direction": "both", "depth": 2, "limit": 30})
             if calls_error or not isinstance(calls_payload, dict):
                 evidence.append(
                     CodeEvidence(
@@ -907,6 +902,14 @@ def _evidence_from_tool_output(
         locations=list(locations),
         data={"returncode": completed.returncode, "parsed": parsed, "stderr": completed.stderr[:1000]},
     )
+
+
+def _safe_mcp_tool_payload(client: MCPStdioClient, name: str, arguments: Dict[str, Any]) -> tuple[Any, str, bool]:
+    try:
+        return _mcp_tool_payload(client.call_tool(name, arguments))
+    except MCPError as exc:
+        text = str(exc)
+        return {"error": text, "tool": name, "arguments": arguments}, text, True
 
 
 def _mcp_tool_payload(response: Dict[str, Any]) -> tuple[Any, str, bool]:

@@ -198,6 +198,16 @@ opencode 的本地 MCP server 使用 `type: "local"`，并把启动命令及参�
 使用同一个绝对 `--records-dir`，否则 Codex/opencode 与 Web 进程的工作目录不同，会导致
 `one_round_judge` 已保存但 Web 端看不到记录。
 
+大型项目上 Atlas MCP 的 `trace` / `calls` 可能耗时较长。vuln-judger 默认等待单次 MCP
+请求 120 秒；如仍发生超时，可在启动 Web/API 或 MCP Server 前设置：
+
+```bash
+export VULN_JUDGER_ATLAS_MCP_TIMEOUT=300
+```
+
+单个 Atlas MCP 工具调用超时会作为诊断证据写入报告，流程会继续尝试源码阅读和检索补证，
+不会因为某一次 `trace` 或 `calls` 超时直接终止整个 finding。
+
 ## LLM 提供商
 
 提供商配置默认存储在 `.vuln-judger/providers.json`。当前仅支持 OpenAI 兼容的
