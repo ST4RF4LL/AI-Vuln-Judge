@@ -190,7 +190,7 @@ class JudgerMCPServer:
                 "moderator": to_jsonable(self.agent_store.agent("moderator", _optional_text(arguments.get("moderator_agent_profile")))),
             },
         }
-        saved = bool(arguments.get("save", False))
+        saved = bool(arguments.get("save", True))
         if saved:
             self.records.save_payload(run_payload)
         evidence = report_payload.get("evidence_chain") or []
@@ -393,7 +393,7 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "include_evidence": {"type": "boolean", "default": True},
                 "evidence_limit": {"type": "integer", "minimum": 0, "default": 40},
                 "include_report": {"type": "boolean", "default": False},
-                "save": {"type": "boolean", "default": False},
+                "save": {"type": "boolean", "default": True},
                 "run_id": {"type": "string"},
             },
             ["report_path", "source_path"],

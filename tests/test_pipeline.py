@@ -1944,7 +1944,8 @@ for raw in sys.stdin.buffer:
                 self.assertEqual(quick["mode"], "one_round_judge")
                 self.assertEqual(quick["configuration"]["max_rounds"], 1)
                 self.assertFalse(quick["configuration"]["enable_llm"])
-                self.assertFalse(quick["saved"])
+                self.assertTrue(quick["saved"])
+                self.assertTrue(Path(quick["record_path"]).exists())
                 self.assertEqual(quick["finding_count"], 1)
                 self.assertEqual(quick["judged_finding_count"], 1)
                 self.assertEqual(quick["selected_finding"]["rule_id"], "python-command-injection")
@@ -1954,6 +1955,8 @@ for raw in sys.stdin.buffer:
                 self.assertIn("missing_evidence", quick)
                 self.assertLessEqual(len(quick["evidence"]), 5)
                 self.assertTrue(quick["debate"])
+                quick_runs = mcp_tool_json(client.call_tool("list_runs", {"limit": 5}))
+                self.assertTrue(any(item["run_id"] == quick["run_id"] for item in quick_runs["runs"]))
 
                 judged = mcp_tool_json(
                     client.call_tool(

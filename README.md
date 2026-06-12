@@ -102,17 +102,18 @@ Web 端右上角提供 `MCP / Skills` 配置入口，支持 MCP Server 保存、
 
 ```bash
 uv run vuln-judger mcp \
-  --records-dir .vuln-judger/runs \
-  --providers-file .vuln-judger/providers.json \
-  --mcp-servers-file .vuln-judger/mcp.json \
-  --skills-file .vuln-judger/skills.json \
-  --agents-dir agents
+  --records-dir /path/to/vuln_judger/.vuln-judger/runs \
+  --providers-file /path/to/vuln_judger/.vuln-judger/providers.json \
+  --mcp-servers-file /path/to/vuln_judger/.vuln-judger/mcp.json \
+  --skills-file /path/to/vuln_judger/.vuln-judger/skills.json \
+  --agents-dir /path/to/vuln_judger/agents
 ```
 
 可用工具：
 
 - `judge_report`：对 SARIF/Markdown 报告和源码目录运行完整研判，可保存 run 记录。
-- `one_round_judge`：对单个 finding 使用默认配置进行单轮快速验证，返回缺失证据和补证建议。
+- `one_round_judge`：对单个 finding 使用默认配置进行单轮快速验证，默认保存 run 记录，
+  返回缺失证据和补证建议；如不希望 Web 端显示该快速验证记录，可传 `save: false`。
 - `collect_evidence`：只采集某个 finding 的源码、SARIF、Atlas、检索和影响证据，不运行博弈。
 - `resolve_report_locations`：把报告路径映射到源码树中的真实文件并返回代码片段。
 - `list_runs` / `get_run` / `get_finding`：读取历史研判记录。
@@ -187,8 +188,9 @@ startup_timeout_sec = 120
 opencode 的本地 MCP server 使用 `type: "local"`，并把启动命令及参数放在同一个
 `command` 数组中。改完后重启 opencode，或执行 `opencode mcp list` 检查 server 状态。
 
-以上示例中的 `/path/to/vuln_judger` 需要替换为本仓库绝对路径。若 MCP 客户端从本仓库
-目录内启动，也可以把 `.vuln-judger/...`、`agents` 等参数改回相对路径。
+以上示例中的 `/path/to/vuln_judger` 需要替换为本仓库绝对路径。建议 MCP Server 和 Web/API
+使用同一个绝对 `--records-dir`，否则 Codex/opencode 与 Web 进程的工作目录不同，会导致
+`one_round_judge` 已保存但 Web 端看不到记录。
 
 ## LLM 提供商
 
@@ -284,12 +286,12 @@ uv run vuln-judger run \
 uv run vuln-judger api \
   --host 127.0.0.1 \
   --port 8765 \
-  --records-dir .vuln-judger/runs \
-  --providers-file .vuln-judger/providers.json \
-  --agents-dir agents \
-  --mcp-servers-file .vuln-judger/mcp.json \
-  --skills-file .vuln-judger/skills.json \
-  --log-file .vuln-judger/logs/vuln-judger.log
+  --records-dir /path/to/vuln_judger/.vuln-judger/runs \
+  --providers-file /path/to/vuln_judger/.vuln-judger/providers.json \
+  --agents-dir /path/to/vuln_judger/agents \
+  --mcp-servers-file /path/to/vuln_judger/.vuln-judger/mcp.json \
+  --skills-file /path/to/vuln_judger/.vuln-judger/skills.json \
+  --log-file /path/to/vuln_judger/.vuln-judger/logs/vuln-judger.log
 ```
 
 打开 http://127.0.0.1:8765 查看保存的研判记录。页面提供运行历史、结论统计、发现摘要、
@@ -347,7 +349,7 @@ uv run vuln-judger run \
   --source ./target-project \
   --skills ./skills \
   --record \
-  --records-dir .vuln-judger/runs
+  --records-dir /path/to/vuln_judger/.vuln-judger/runs
 ```
 
 ## 工具行为
