@@ -16,6 +16,9 @@ from .models import AgentConfig
 from .models import Finding, SourceLocation
 
 
+MARKDOWN_TO_SARIF_RETRIES = 3
+
+
 @dataclasses.dataclass
 class PreparedReport:
     original_path: Path
@@ -120,7 +123,48 @@ def moderator_markdown_to_sarif(
     if moderator_client is None:
         raise ReportPreparationError("Moderator LLM 不可用，无法将 Markdown 报告转换为 SARIF")
     system, user = _markdown_to_sarif_prompt(text, source_name, moderator_agent)
-    response = moderator_client.complete(system, user)
+    attempts = MARKDOWN_TO_SARIF_RETRIES + 1
+    last_error = "unknown error"
+    for attempt in range(1, attempts + 1):
+        attempt_diagnostics: List[str] = []
+        try:
+            sarif_data = _moderator_markdown_to_sarif_once(
+                text=text,
+                source_name=source_name,
+                moderator_client=moderator_client,
+                moderator_agent=moderator_agent,
+                system=system,
+                user=user,
+                diagnostics=attempt_diagnostics,
+            )
+        except ReportPreparationError as exc:
+            last_error = str(exc)
+            diagnostics.extend(attempt_diagnostics)
+            if attempt < attempts:
+                diagnostics.append(
+                    f"Moderator LLM Markdown 转 SARIF 第 {attempt}/{attempts} 次失败，准备重试：{last_error}"
+                )
+                continue
+            diagnostics.append(f"Moderator LLM Markdown 转 SARIF 第 {attempt}/{attempts} 次失败：{last_error}")
+            break
+        diagnostics.extend(attempt_diagnostics)
+        if attempt > 1:
+            diagnostics.append(f"Moderator LLM Markdown 转 SARIF 第 {attempt}/{attempts} 次尝试成功")
+        diagnostics.append("Moderator LLM 已解读 Markdown 并生成 SARIF")
+        return sarif_data, diagnostics
+    raise ReportPreparationError(f"Moderator LLM Markdown 转 SARIF 在 {attempts} 次尝试后仍失败：{last_error}")
+
+
+def _moderator_markdown_to_sarif_once(
+    text: str,
+    source_name: str,
+    moderator_client: LLMClient,
+    moderator_agent: Optional[AgentConfig],
+    system: str,
+    user: str,
+    diagnostics: List[str],
+) -> Dict[str, Any]:
+    response = _complete_moderator_llm(moderator_client, system, user, "Moderator LLM Markdown 转换")
     if not response:
         raise ReportPreparationError("Moderator LLM 未返回 Markdown 转换结果")
     sarif_data = _extract_json_object(response)
@@ -144,12 +188,11 @@ def moderator_markdown_to_sarif(
             if not repaired_issues:
                 diagnostics.append("Moderator LLM 已根据 SARIF 验证问题修正 Markdown 转换结果")
                 diagnostics.extend(f"Moderator 修复 LLM SARIF：{item}" for item in repair_items)
-                return repaired, diagnostics
+                return repaired
             diagnostics.append("Moderator LLM 修正后的 SARIF 仍未通过验证：" + "；".join(repaired_issues))
         diagnostics.append("Moderator LLM SARIF 未通过格式验证：" + "；".join(issues))
         raise ReportPreparationError("Moderator LLM SARIF 未通过格式验证：" + "；".join(issues))
-    diagnostics.append("Moderator LLM 已解读 Markdown 并生成 SARIF")
-    return sarif_data, diagnostics
+    return sarif_data
 
 
 def validate_sarif_report(data: Dict[str, Any]) -> List[str]:
@@ -284,10 +327,17 @@ def _repair_llm_sarif_with_moderator(
         + json.dumps(previous_sarif, ensure_ascii=False, indent=2, sort_keys=True)
         + f"\n\nsource_report: {source_name}"
     )
-    response = moderator_client.complete(system, user)
+    response = _complete_moderator_llm(moderator_client, system, user, "Moderator LLM SARIF 修复")
     if not response:
         return None
     return _extract_json_object(response)
+
+
+def _complete_moderator_llm(moderator_client: LLMClient, system: str, user: str, action: str) -> Optional[str]:
+    try:
+        return moderator_client.complete(system, user)
+    except Exception as exc:
+        raise ReportPreparationError(f"{action} 调用失败：{exc}") from exc
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:

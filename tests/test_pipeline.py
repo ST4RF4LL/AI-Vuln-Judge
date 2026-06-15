@@ -217,6 +217,57 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(findings[0].message, "LLM 解读：用户输入可到达 os.system。")
             self.assertTrue(any("Moderator LLM 已解读 Markdown 并生成 SARIF" in item for item in prepared.diagnostics))
 
+    def test_markdown_conversion_retries_until_valid_sarif(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markdown = root / "report.md"
+            markdown.write_text("# 报告\n\napp.py 第 5 行存在命令注入，危险函数 os.system。", encoding="utf-8")
+            llm_sarif = {
+                "version": "2.1.0",
+                "runs": [
+                    {
+                        "tool": {"driver": {"name": "moderator-llm"}},
+                        "results": [
+                            {
+                                "ruleId": "LLM-MARKDOWN-COMMAND-INJECTION",
+                                "level": "error",
+                                "message": {"text": "第三次重试后解析成功。"},
+                                "locations": [
+                                    {
+                                        "physicalLocation": {
+                                            "artifactLocation": {"uri": "app.py"},
+                                            "region": {"startLine": 5},
+                                        }
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+            moderator = SequenceLLM(["不是 JSON", "", json.dumps(llm_sarif, ensure_ascii=False)])
+
+            prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
+            findings = load_sarif(prepared.effective_path)
+
+            self.assertEqual(len(moderator.calls), 3)
+            self.assertEqual(findings[0].rule_id, "LLM-MARKDOWN-COMMAND-INJECTION")
+            self.assertTrue(any("第 1/4 次失败" in item for item in prepared.diagnostics))
+            self.assertTrue(any("第 2/4 次失败" in item for item in prepared.diagnostics))
+            self.assertTrue(any("第 3/4 次尝试成功" in item for item in prepared.diagnostics))
+
+    def test_markdown_conversion_fails_after_three_retries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markdown = root / "report.md"
+            markdown.write_text("# 报告\n\n模型持续返回无效内容。", encoding="utf-8")
+            moderator = SequenceLLM(["不是 JSON", "仍然不是 JSON", "bad", "invalid"])
+
+            with self.assertRaisesRegex(ReportPreparationError, "4 次尝试后仍失败"):
+                prepare_report_for_processing(markdown, moderator_client=moderator)
+
+            self.assertEqual(len(moderator.calls), 4)
+
     def test_pipeline_uses_moderator_llm_for_markdown_conversion(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
