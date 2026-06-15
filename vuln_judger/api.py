@@ -3513,13 +3513,13 @@ def app_html() -> str:
 
     function bindFindingRows(findings) {{
       for (const row of el.detail.querySelectorAll('tr[data-finding-id]')) {{
-        row.addEventListener('click', () => selectFinding(row.dataset.findingId));
+        row.addEventListener('click', () => selectFinding(row.dataset.findingId, {{ scrollToDetail: true }}));
       }}
       if (!findings.length) return;
       const selected = state.selectedFinding && findings.some(item => item.finding_id === state.selectedFinding)
         ? state.selectedFinding
         : findings[0].finding_id;
-      selectFinding(selected);
+      selectFinding(selected, {{ scrollToDetail: false }});
     }}
 
     function providerLabel(value, llmEnabled) {{
@@ -3568,20 +3568,31 @@ def app_html() -> str:
       return status === 'completed' || status === 'failed' || status === 'stopped' || status === 'paused';
     }}
 
-    async function selectFinding(findingId) {{
+    async function selectFinding(findingId, options = {{}}) {{
       state.selectedFinding = findingId;
       markSelectedFindingRow(findingId);
       updateSelectedFindingSticky();
       const container = document.getElementById('finding-detail');
       if (!container) return;
       container.innerHTML = '<div class="empty">正在加载发现详情...</div>';
+      if (options.scrollToDetail) scrollFindingDetailIntoView();
       try {{
         const detail = await fetchJson(`/runs/${{encodeURIComponent(state.selectedRun)}}/findings/${{encodeURIComponent(findingId)}}`);
         container.innerHTML = renderFindingDetail(detail);
         updateSelectedFindingSticky();
+        if (options.scrollToDetail) scrollFindingDetailIntoView();
       }} catch (error) {{
         container.innerHTML = `<div class="empty error">${{esc(error.message)}}</div>`;
       }}
+    }}
+
+    function scrollFindingDetailIntoView() {{
+      const container = document.getElementById('finding-detail');
+      if (!container) return;
+      const sticky = document.getElementById('selected-finding-sticky');
+      const stickyHeight = sticky && !sticky.classList.contains('hidden') ? sticky.offsetHeight + 12 : 0;
+      const target = Math.max(0, container.offsetTop - stickyHeight);
+      el.detailScroll.scrollTo({{ top: target, behavior: 'smooth' }});
     }}
 
     function markSelectedFindingRow(findingId) {{
@@ -3622,7 +3633,7 @@ def app_html() -> str:
       const nextIndex = Math.min(Math.max((index < 0 ? 0 : index) + delta, 0), findings.length - 1);
       const next = findings[nextIndex];
       if (!next || next.finding_id === state.selectedFinding) return;
-      selectFinding(next.finding_id);
+      selectFinding(next.finding_id, {{ scrollToDetail: true }});
     }}
 
     function updateStickyFindingVisibility() {{
