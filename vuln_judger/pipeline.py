@@ -273,6 +273,9 @@ def _coerce_verdict_report(value) -> VerdictReport:
         source_locations=[_coerce_source_location(item) for item in value.get("source_locations") or []],
         recommended_next_steps=[str(item) for item in value.get("recommended_next_steps") or []],
         evidence_graph=value.get("evidence_graph") if isinstance(value.get("evidence_graph"), dict) else {},
+        verification_case=value.get("verification_case") if isinstance(value.get("verification_case"), dict) else {},
+        evidence_ledger=value.get("evidence_ledger") if isinstance(value.get("evidence_ledger"), list) else [],
+        scorecard=value.get("scorecard") if isinstance(value.get("scorecard"), dict) else {},
     )
 
 
@@ -302,6 +305,8 @@ def _coerce_debate_turn(value) -> DebateTurn:
         claim=str(data.get("claim") or ""),
         evidence_ids=[str(item) for item in data.get("evidence_ids") or []],
         resolved=bool(data.get("resolved", False)),
+        structured=data.get("structured") if isinstance(data.get("structured"), dict) else {},
+        raw_claim=str(data.get("raw_claim")) if data.get("raw_claim") is not None else None,
     )
 
 

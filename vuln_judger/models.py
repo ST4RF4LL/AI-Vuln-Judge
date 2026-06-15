@@ -128,6 +128,46 @@ class DebateTurn:
     claim: str
     evidence_ids: List[str] = field(default_factory=list)
     resolved: bool = False
+    structured: Dict[str, Any] = field(default_factory=dict)
+    raw_claim: Optional[str] = None
+
+
+@dataclass
+class VerificationCase:
+    vulnerability_type: str = ""
+    reported_message: str = ""
+    reported_location: str = ""
+    reported_source: str = ""
+    reported_sink: str = ""
+    dangerous_function: str = ""
+    expected_attack_path: str = ""
+    required_proof: List[str] = field(default_factory=list)
+
+
+@dataclass
+class EvidenceLedgerItem:
+    id: str
+    type: str
+    claim: str
+    status: str
+    source: str
+    location: str = ""
+    confidence: float = 0.0
+    evidence_ids: List[str] = field(default_factory=list)
+
+
+@dataclass
+class VerificationScorecard:
+    source_location: str = "missing"
+    entry_reachability: str = "missing"
+    call_chain: str = "missing"
+    data_flow: str = "missing"
+    controllability: str = "missing"
+    protection: str = "none"
+    impact: str = "missing"
+    verdict_label: str = ""
+    confidence: float = 0.0
+    rationale: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -146,6 +186,9 @@ class VerdictReport:
     source_locations: List[SourceLocation]
     recommended_next_steps: List[str]
     evidence_graph: Dict[str, Any] = field(default_factory=dict)
+    verification_case: Dict[str, Any] = field(default_factory=dict)
+    evidence_ledger: List[Dict[str, Any]] = field(default_factory=list)
+    scorecard: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

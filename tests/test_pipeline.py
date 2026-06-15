@@ -796,14 +796,16 @@ for raw in sys.stdin.buffer:
             finding = report.reports[0]
             self.assertTrue(any(item.kind == EvidenceKind.REPORT for item in finding.evidence_chain))
             self.assertTrue(any(item.kind == EvidenceKind.SOURCE_ROOT for item in finding.evidence_chain))
-            self.assertIn("正方证据报告", finding.debate[0].claim)
-            self.assertIn("代码上下文业务逻辑说明", finding.debate[0].claim)
-            self.assertIn("行为目的候选", finding.debate[0].claim)
-            self.assertIn("攻击链", finding.debate[0].claim)
-            self.assertIn("攻击前提", finding.debate[0].claim)
-            self.assertIn("攻击影响", finding.debate[0].claim)
-            self.assertIn("反方质疑报告", finding.debate[1].claim)
-            self.assertIn("代码上下文业务逻辑核验", finding.debate[1].claim)
+            self.assertIn("回合摘要", finding.debate[0].claim)
+            self.assertTrue(finding.debate[0].structured)
+            self.assertIn("正方证据报告", finding.debate[0].raw_claim)
+            self.assertIn("代码上下文业务逻辑说明", finding.debate[0].raw_claim)
+            self.assertIn("行为目的候选", finding.debate[0].raw_claim)
+            self.assertIn("攻击链", finding.debate[0].raw_claim)
+            self.assertIn("攻击前提", finding.debate[0].raw_claim)
+            self.assertIn("攻击影响", finding.debate[0].raw_claim)
+            self.assertIn("反方质疑报告", finding.debate[1].raw_claim)
+            self.assertIn("代码上下文业务逻辑核验", finding.debate[1].raw_claim)
             negative_evidence_ids = set(finding.debate[1].evidence_ids)
             report_evidence_ids = {item.evidence_id for item in finding.evidence_chain if item.kind == EvidenceKind.REPORT}
             flow_evidence_ids = {
@@ -814,9 +816,12 @@ for raw in sys.stdin.buffer:
             self.assertTrue(report_evidence_ids.issubset(negative_evidence_ids))
             self.assertTrue(flow_evidence_ids.issubset(negative_evidence_ids))
             self.assertTrue(finding.final_conclusion.startswith("【真实漏洞】"))
-            self.assertEqual(finding.debate[-1].claim, finding.final_conclusion)
+            self.assertEqual(finding.debate[-1].raw_claim, finding.final_conclusion)
             self.assertIn("### 调用链 / 数据流概览", finding.final_conclusion)
             self.assertNotIn("```mermaid", finding.final_conclusion)
+            self.assertTrue(finding.verification_case)
+            self.assertTrue(finding.evidence_ledger)
+            self.assertTrue(finding.scorecard)
             self.assertTrue(finding.evidence_graph["nodes"])
             self.assertTrue(finding.evidence_graph["edges"])
             self.assertIn("path_overview", finding.evidence_graph)
@@ -902,7 +907,7 @@ for raw in sys.stdin.buffer:
                     enable_external_tools=False,
                 )
             )
-            negative_claim = report.reports[0].debate[1].claim
+            negative_claim = report.reports[0].debate[1].raw_claim
             self.assertIn("代码上下文业务逻辑核验", negative_claim)
             self.assertIn("敏感信息真实性", negative_claim)
             self.assertIn("key 可能为密钥", negative_claim)
@@ -1046,8 +1051,8 @@ for raw in sys.stdin.buffer:
             self.assertIn("data_flow", plans[0].data["missing_evidence"])
             self.assertIn("call_chain", plans[0].data["missing_evidence"])
             self.assertTrue(any("Atlas trace" in action for action in plans[0].data["suggested_actions"]))
-            self.assertIn("正方补证策略", finding.debate[0].claim)
-            self.assertIn("应继续主动补证", finding.debate[0].claim)
+            self.assertIn("正方补证策略", finding.debate[0].raw_claim)
+            self.assertIn("应继续主动补证", finding.debate[0].raw_claim)
 
     def test_agentic_rg_is_scoped_to_report_files_for_sink_candidates(self):
         with tempfile.TemporaryDirectory() as tmp:

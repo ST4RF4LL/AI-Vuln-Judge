@@ -14,11 +14,15 @@ from .models import (
     CodeEvidence,
     DebateRole,
     DebateTurn,
+    EvidenceLedgerItem,
     EvidenceKind,
     EvidenceStrength,
     SourceLocation,
     Verdict,
     VerdictReport,
+    VerificationCase,
+    VerificationScorecard,
+    to_jsonable,
 )
 
 
@@ -193,6 +197,11 @@ class DebateOrchestrator:
         decision = self._decide(bundle)
         turns, final_conclusion, decision = self._debate_turns(bundle, decision)
         turns = _dedupe_debate_turns(turns)
+        verification_case = _build_verification_case(bundle)
+        scorecard = _build_verification_scorecard(evidence, decision)
+        decision = _decision_with_scorecard_summary(decision, scorecard)
+        scorecard = _build_verification_scorecard(evidence, decision)
+        evidence_ledger = _build_evidence_ledger(evidence, scorecard)
         evidence_graph = build_evidence_graph(evidence, decision.disputed_points)
         return VerdictReport(
             finding_id=bundle.finding.finding_id,
@@ -209,6 +218,9 @@ class DebateOrchestrator:
             source_locations=_resolved_source_locations(evidence, bundle.finding.locations),
             recommended_next_steps=decision.recommended_next_steps,
             evidence_graph=evidence_graph,
+            verification_case=to_jsonable(verification_case),
+            evidence_ledger=to_jsonable(evidence_ledger),
+            scorecard=to_jsonable(scorecard),
         )
 
     def _debate_turns(
@@ -258,11 +270,13 @@ class DebateOrchestrator:
         ) or _affirmative_evidence_report(bundle, base_decision, challenges)
         turns: List[DebateTurn] = []
         turns.append(
-            DebateTurn(
+            _make_debate_turn(
                 role=DebateRole.AFFIRMATIVE,
                 round_index=1,
                 claim=affirmative_report,
                 evidence_ids=source_root_ids + report_ids + location_ids + flow_ids + impact_ids,
+                decision=base_decision,
+                unresolved=challenges,
             )
         )
         self._emit_progress(bundle, base_decision, turns)
@@ -291,12 +305,14 @@ class DebateOrchestrator:
         )
         negative_report = negative_llm_report or _negative_challenge_report(bundle, challenges, affirmative_report)
         turns.append(
-            DebateTurn(
+            _make_debate_turn(
                 role=DebateRole.NEGATIVE,
                 round_index=1,
                 claim=negative_report,
                 evidence_ids=source_root_ids + report_ids + location_ids + flow_ids + protection_ids + impact_ids + tool_diag_ids,
                 resolved=not challenges,
+                decision=base_decision,
+                unresolved=challenges,
             )
         )
         self._emit_progress(bundle, base_decision, turns)
@@ -312,12 +328,14 @@ class DebateOrchestrator:
             max_regular_round=max_regular_round,
         )
         turns.append(
-            DebateTurn(
+            _make_debate_turn(
                 role=DebateRole.MODERATOR,
                 round_index=1,
                 claim=moderator_decision.summary,
                 evidence_ids=[item.evidence_id for item in evidence],
                 resolved=not moderator_decision.continue_debate,
+                decision=base_decision,
+                unresolved=moderator_decision.unresolved,
             )
         )
         self._emit_progress(bundle, base_decision, turns)
@@ -346,12 +364,14 @@ class DebateOrchestrator:
             ) or _affirmative_clarification_report(bundle, unresolved, round_index)
             answer_ids = source_root_ids + location_ids + flow_ids + protection_ids + impact_ids
             turns.append(
-                DebateTurn(
+                _make_debate_turn(
                     role=DebateRole.AFFIRMATIVE,
                     round_index=round_index,
                     claim=clarification,
                     evidence_ids=answer_ids,
                     resolved=not _material_unresolved(unresolved),
+                    decision=base_decision,
+                    unresolved=unresolved,
                 )
             )
             self._emit_progress(bundle, base_decision, turns)
@@ -377,12 +397,14 @@ class DebateOrchestrator:
                 _negative_disputed_points(negative_review) if negative_llm_review else [],
             )
             turns.append(
-                DebateTurn(
+                _make_debate_turn(
                     role=DebateRole.NEGATIVE,
                     round_index=round_index,
                     claim=negative_review,
                     evidence_ids=source_root_ids + report_ids + location_ids + flow_ids + protection_ids + impact_ids + tool_diag_ids,
                     resolved=not _material_unresolved(next_unresolved),
+                    decision=base_decision,
+                    unresolved=next_unresolved,
                 )
             )
             self._emit_progress(bundle, base_decision, turns)
@@ -397,12 +419,14 @@ class DebateOrchestrator:
                 max_regular_round=max_regular_round,
             )
             turns.append(
-                DebateTurn(
+                _make_debate_turn(
                     role=DebateRole.MODERATOR,
                     round_index=round_index,
                     claim=moderator_decision.summary,
                     evidence_ids=[item.evidence_id for item in evidence],
                     resolved=not moderator_decision.continue_debate,
+                    decision=base_decision,
+                    unresolved=moderator_decision.unresolved,
                 )
             )
             self._emit_progress(bundle, base_decision, turns)
@@ -432,23 +456,27 @@ class DebateOrchestrator:
         tool_diag_ids = _ids(evidence, EvidenceKind.TOOL_DIAGNOSTIC)
         affirmative_final = self._side_conclusion("AFFIRMATIVE", bundle, base_decision, challenges, last_negative)
         turns.append(
-            DebateTurn(
+            _make_debate_turn(
                 role=DebateRole.AFFIRMATIVE,
                 round_index=final_round,
                 claim=f"## 正方结案\n【{affirmative_final.label}】，{affirmative_final.statement}",
                 evidence_ids=source_root_ids + report_ids + location_ids + flow_ids + impact_ids,
                 resolved=True,
+                decision=base_decision,
+                unresolved=challenges,
             )
         )
         self._emit_progress(bundle, base_decision, turns)
         negative_final = self._side_conclusion("NEGATIVE", bundle, base_decision, challenges, last_negative)
         turns.append(
-            DebateTurn(
+            _make_debate_turn(
                 role=DebateRole.NEGATIVE,
                 round_index=final_round,
                 claim=f"## 反方结案\n【{negative_final.label}】，{negative_final.statement}",
                 evidence_ids=source_root_ids + protection_ids + tool_diag_ids + location_ids + flow_ids,
                 resolved=True,
+                decision=base_decision,
+                unresolved=challenges,
             )
         )
         self._emit_progress(bundle, base_decision, turns)
@@ -466,12 +494,14 @@ class DebateOrchestrator:
         final_conclusion = _append_evidence_graph_markdown(moderator_summary or side_final_conclusion, evidence_graph)
         decision = _decision_from_conclusions(base_decision, affirmative_final, negative_final, final_conclusion)
         turns.append(
-            DebateTurn(
+            _make_debate_turn(
                 role=DebateRole.MODERATOR,
                 round_index=final_round,
                 claim=final_conclusion,
                 evidence_ids=[item.evidence_id for item in evidence],
                 resolved=decision.verdict != Verdict.INCONCLUSIVE,
+                decision=decision,
+                unresolved=decision.disputed_points,
             )
         )
         self._emit_progress(bundle, decision, turns, final_conclusion=final_conclusion)
@@ -498,7 +528,7 @@ class DebateOrchestrator:
             repetition_issue=repetition_issue,
         )
         round_context = "\n\n".join(
-            f"{_role_label(turn.role.value)}第 {turn.round_index} 回合：\n{turn.claim}"
+            f"{_role_label(turn.role.value)}第 {turn.round_index} 回合：\n{_turn_prompt_text(turn)}"
             for turn in turns
             if turn.round_index == round_index and turn.role != DebateRole.MODERATOR
         )
@@ -547,6 +577,8 @@ class DebateOrchestrator:
     ) -> None:
         if self.progress_callback is None:
             return
+        verification_case = _build_verification_case(bundle)
+        scorecard = _build_verification_scorecard(bundle.evidence, decision)
         self.progress_callback(
             VerdictReport(
                 finding_id=bundle.finding.finding_id,
@@ -563,6 +595,9 @@ class DebateOrchestrator:
                 source_locations=_resolved_source_locations(bundle.evidence, bundle.finding.locations),
                 recommended_next_steps=decision.recommended_next_steps,
                 evidence_graph=build_evidence_graph(bundle.evidence, decision.disputed_points),
+                verification_case=to_jsonable(verification_case),
+                evidence_ledger=to_jsonable(_build_evidence_ledger(bundle.evidence, scorecard)),
+                scorecard=to_jsonable(scorecard),
             )
         )
 
@@ -606,6 +641,8 @@ class DebateOrchestrator:
         user = (
             f"任务：{task}\n"
             f"发现：{bundle.finding.rule_id} - {bundle.finding.message}\n"
+            f"研判用例：\n{_verification_case_prompt(_build_verification_case(bundle))}\n"
+            f"当前证据评分卡：\n{_scorecard_prompt(_build_verification_scorecard(bundle.evidence, None))}\n"
             f"证据：\n" + _evidence_prompt(bundle.evidence) + "\n"
             "证据解释约束：SOURCE_ROOT 只能证明任务已配置源码根目录，不能替代具体 SOURCE_LOCATION、CALL_CHAIN 或 DATA_FLOW；"
             "rg/grep 证据必须围绕报告位置、报告符号、codeFlow 或调用邻域解释，只能作为候选补证，不能单独证明源汇可达；"
@@ -681,7 +718,7 @@ class DebateOrchestrator:
         turns: Sequence[DebateTurn],
     ) -> Optional[str]:
         turn_context = "\n\n".join(
-            f"{_role_label(turn.role.value)}第 {turn.round_index} 回合：\n{turn.claim}" for turn in turns[-6:]
+            f"{_role_label(turn.role.value)}第 {turn.round_index} 回合：\n{_turn_prompt_text(turn)}" for turn in turns[-6:]
         )
         llm_summary = self._llm_response(
             "MODERATOR",
@@ -896,6 +933,609 @@ def _stage_context(stage: str, prior: str, challenges: Sequence[str], extra: str
     if extra:
         parts.append(extra)
     return "\n\n".join(parts)
+
+
+def _make_debate_turn(
+    role: DebateRole,
+    round_index: int,
+    claim: str,
+    evidence_ids: Sequence[str],
+    resolved: bool = False,
+    decision: Optional[DebateDecision] = None,
+    unresolved: Sequence[str] = (),
+) -> DebateTurn:
+    raw_claim = str(claim or "").strip()
+    unique_evidence_ids = list(dict.fromkeys(str(item) for item in evidence_ids if str(item).strip()))
+    structured = _structure_debate_turn(
+        role=role,
+        round_index=round_index,
+        claim=raw_claim,
+        evidence_ids=unique_evidence_ids,
+        resolved=resolved,
+        decision=decision,
+        unresolved=unresolved,
+    )
+    return DebateTurn(
+        role=role,
+        round_index=round_index,
+        claim=_render_structured_turn(structured),
+        evidence_ids=unique_evidence_ids,
+        resolved=resolved,
+        structured=structured,
+        raw_claim=raw_claim,
+    )
+
+
+def _structure_debate_turn(
+    role: DebateRole,
+    round_index: int,
+    claim: str,
+    evidence_ids: Sequence[str],
+    resolved: bool,
+    decision: Optional[DebateDecision],
+    unresolved: Sequence[str],
+) -> Dict[str, Any]:
+    label = _extract_conclusion_label(claim)
+    if not label and decision is not None:
+        label = _verdict_label(decision.verdict)
+    summary_segments = _clean_statement_segments(claim, max_segments=3, label=label)
+    if not summary_segments:
+        summary_segments = _fallback_turn_segments(claim, max_segments=2)
+    key_points = _extract_turn_marked_lines(
+        claim,
+        (
+            "确认",
+            "已",
+            "存在",
+            "支持",
+            "形成",
+            "闭环",
+            "可解析",
+            "未发现针对报告路径的防护",
+        ),
+        limit=3,
+    )
+    gaps = _merge_challenges(
+        list(unresolved),
+        _extract_turn_marked_lines(
+            claim,
+            (
+                "未",
+                "缺少",
+                "缺乏",
+                "无法",
+                "不能",
+                "不足",
+                "断链",
+                "存疑",
+                "不可达",
+                "跳跃",
+                "复读",
+                "质疑",
+                "限制",
+                "需要补",
+            ),
+            limit=4,
+        ),
+    )
+    return {
+        "role": role.value,
+        "role_label": _role_label(role.value),
+        "round_index": round_index,
+        "position": label,
+        "resolved": resolved,
+        "summary": " ".join(summary_segments).strip()[:700],
+        "key_points": key_points,
+        "unresolved": gaps[:5],
+        "evidence_ids": list(evidence_ids)[:16],
+        "raw_length": len(claim),
+    }
+
+
+def _render_structured_turn(structured: Dict[str, Any]) -> str:
+    role_label = structured.get("role_label") or _role_label(str(structured.get("role") or ""))
+    round_index = structured.get("round_index")
+    lines = [f"## {role_label}第 {round_index} 回合摘要"]
+    position = str(structured.get("position") or "").strip()
+    if position:
+        lines.append(f"结论倾向：{position}")
+    lines.append("状态：" + ("已闭环或进入结案" if structured.get("resolved") else "仍需验证"))
+    summary = str(structured.get("summary") or "").strip()
+    if summary:
+        lines.extend(["核心陈述：", f"- {summary}"])
+    key_points = [str(item).strip() for item in structured.get("key_points") or [] if str(item).strip()]
+    if key_points:
+        lines.append("已支持要点：")
+        lines.extend(f"- {item}" for item in key_points[:3])
+    unresolved = [str(item).strip() for item in structured.get("unresolved") or [] if str(item).strip()]
+    if unresolved:
+        lines.append("未闭环点：")
+        lines.extend(f"- {item}" for item in unresolved[:5])
+    evidence_ids = [str(item).strip() for item in structured.get("evidence_ids") or [] if str(item).strip()]
+    if evidence_ids:
+        suffix = " 等" if len(evidence_ids) > 10 else ""
+        lines.append("引用证据：" + ", ".join(evidence_ids[:10]) + suffix)
+    return "\n".join(lines)
+
+
+def _turn_prompt_text(turn: DebateTurn) -> str:
+    return turn.raw_claim if turn.raw_claim is not None else turn.claim
+
+
+def _extract_conclusion_label(text: str) -> str:
+    for label in FINAL_LABELS:
+        if f"【{label}】" in text:
+            return label
+    normalized = re.sub(r"\s+", "", str(text or ""))
+    for label in FINAL_LABELS:
+        if re.search(rf"(?:结论|标签|方向|倾向)[:：]?{re.escape(label)}", normalized):
+            return label
+    return ""
+
+
+def _fallback_turn_segments(text: str, max_segments: int) -> List[str]:
+    segments: List[str] = []
+    for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = _strip_response_line(raw_line)
+        if not line or _looks_like_task_echo(line):
+            continue
+        if len(line) < 8:
+            continue
+        segments.append(line[:260])
+        if len(segments) >= max_segments:
+            break
+    return segments
+
+
+def _extract_turn_marked_lines(text: str, markers: Sequence[str], limit: int) -> List[str]:
+    lines: List[str] = []
+    seen = set()
+    for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = _strip_response_line(raw_line)
+        if not line:
+            continue
+        normalized = re.sub(r"\s+", "", line.lower())
+        has_marker = any(marker.lower() in normalized for marker in markers)
+        if not has_marker:
+            continue
+        if _looks_like_task_echo(line) and "复读" not in normalized:
+            continue
+        key = normalized[:120]
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(line[:240])
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _build_verification_case(bundle: EvidenceBundle) -> VerificationCase:
+    finding = bundle.finding
+    source_terms = _evidence_data_terms(bundle.evidence, "source_terms")
+    sink_terms = _evidence_data_terms(bundle.evidence, "sink_terms")
+    symbols = _evidence_data_terms(bundle.evidence, "symbols")
+    primary_location = getattr(finding, "primary_location", None)
+    if primary_location is None:
+        locations = getattr(finding, "locations", []) or []
+        primary_location = locations[0] if locations else None
+    reported_location = primary_location.display() if primary_location else ""
+    expected_path = _finding_code_flow_path(getattr(finding, "code_flows", []) or []) or _evidence_flow_path(bundle.evidence)
+    dangerous_function = sink_terms[0] if sink_terms else symbols[0] if symbols else ""
+    return VerificationCase(
+        vulnerability_type=str(getattr(finding, "rule_id", "") or ""),
+        reported_message=str(getattr(finding, "message", "") or ""),
+        reported_location=reported_location,
+        reported_source=", ".join(source_terms[:5]),
+        reported_sink=", ".join(sink_terms[:5]),
+        dangerous_function=dangerous_function,
+        expected_attack_path=expected_path,
+        required_proof=[
+            "报告位置能解析到当前源码树中的真实代码。",
+            "外部输入、文件输入、网络报文、命令行参数、消息载荷或内部接口能够到达漏洞相关函数。",
+            "攻击者可控数据能够沿调用链或数据流传递到危险汇点。",
+            "代码上下文业务逻辑支持变量语义、危险操作和影响归因。",
+            "不存在已证实能覆盖该报告路径的防护消减措施。",
+        ],
+    )
+
+
+def _verification_case_prompt(case: VerificationCase) -> str:
+    lines = [
+        f"- 漏洞类型/规则：{case.vulnerability_type or '未知'}",
+        f"- 报告消息：{case.reported_message or '未知'}",
+        f"- 报告位置：{case.reported_location or '未知'}",
+        f"- 报告源点：{case.reported_source or '未提取'}",
+        f"- 报告汇点/危险函数：{case.reported_sink or case.dangerous_function or '未提取'}",
+        f"- 报告期望路径：{case.expected_attack_path or '未提供 codeFlow'}",
+        "- 必须闭环的证明要件：",
+    ]
+    lines.extend(f"  - {item}" for item in case.required_proof)
+    return "\n".join(lines)
+
+
+def _build_verification_scorecard(
+    evidence: Sequence[CodeEvidence], decision: Optional[DebateDecision]
+) -> VerificationScorecard:
+    source_location = _source_location_score(evidence)
+    entry_reachability = _entry_reachability_score(evidence)
+    call_chain = _call_chain_score(evidence)
+    data_flow = _data_flow_score(evidence)
+    controllability = _controllability_score(evidence, entry_reachability)
+    protection = "candidate" if _has_protection(evidence) else "none"
+    impact = _impact_score(evidence)
+    rationale = _scorecard_rationale(
+        source_location,
+        entry_reachability,
+        call_chain,
+        data_flow,
+        controllability,
+        protection,
+        impact,
+    )
+    if decision is None:
+        return VerificationScorecard(
+            source_location=source_location,
+            entry_reachability=entry_reachability,
+            call_chain=call_chain,
+            data_flow=data_flow,
+            controllability=controllability,
+            protection=protection,
+            impact=impact,
+            confidence=_heuristic_scorecard_confidence(
+                source_location,
+                entry_reachability,
+                call_chain,
+                data_flow,
+                controllability,
+                impact,
+            ),
+            rationale=rationale,
+        )
+    return VerificationScorecard(
+        source_location=source_location,
+        entry_reachability=entry_reachability,
+        call_chain=call_chain,
+        data_flow=data_flow,
+        controllability=controllability,
+        protection=protection,
+        impact=impact,
+        verdict_label=_verdict_label(decision.verdict),
+        confidence=round(float(decision.confidence or 0.0), 2),
+        rationale=rationale,
+    )
+
+
+def _scorecard_prompt(scorecard: VerificationScorecard) -> str:
+    lines = [
+        f"- 源码定位：{_status_label(scorecard.source_location)}",
+        f"- 入口可达：{_status_label(scorecard.entry_reachability)}",
+        f"- 调用链：{_status_label(scorecard.call_chain)}",
+        f"- 数据流：{_status_label(scorecard.data_flow)}",
+        f"- 输入可控性：{_status_label(scorecard.controllability)}",
+        f"- 防护消减：{_status_label(scorecard.protection)}",
+        f"- 影响归因：{_status_label(scorecard.impact)}",
+    ]
+    if scorecard.rationale:
+        lines.append("- 当前阻断/支撑理由：" + "；".join(scorecard.rationale[:5]))
+    return "\n".join(lines)
+
+
+def _build_evidence_ledger(
+    evidence: Sequence[CodeEvidence], scorecard: VerificationScorecard
+) -> List[EvidenceLedgerItem]:
+    return [
+        _ledger_item(
+            "ledger-source-location",
+            "source_location",
+            "报告位置解析到当前源码树",
+            scorecard.source_location,
+            _items_by_kind(evidence, EvidenceKind.SOURCE_ROOT, EvidenceKind.SOURCE_LOCATION),
+        ),
+        _ledger_item(
+            "ledger-entry-reachability",
+            "entry_reachability",
+            "存在外部/内部接口或输入源能够触发漏洞函数",
+            scorecard.entry_reachability,
+            _items_matching_entry(evidence),
+        ),
+        _ledger_item(
+            "ledger-call-chain",
+            "call_chain",
+            "调用链能从入口或上游调用方串到报告函数",
+            scorecard.call_chain,
+            _items_by_kind(evidence, EvidenceKind.CALL_CHAIN, EvidenceKind.SARIF_CODE_FLOW),
+        ),
+        _ledger_item(
+            "ledger-data-flow",
+            "data_flow",
+            "攻击者可控数据能到达危险汇点",
+            scorecard.data_flow,
+            _items_by_kind(evidence, EvidenceKind.DATA_FLOW, EvidenceKind.SARIF_CODE_FLOW),
+        ),
+        _ledger_item(
+            "ledger-controllability",
+            "controllability",
+            "源点或参数具备攻击者可控性",
+            scorecard.controllability,
+            _items_matching_source_terms(evidence),
+        ),
+        _ledger_item(
+            "ledger-business-context",
+            "business_context",
+            "代码上下文支持变量语义和业务目的判断",
+            "confirmed" if _business_logic_operations(evidence) else "candidate" if _has_source_context(evidence) else "missing",
+            _items_by_kind(evidence, EvidenceKind.SOURCE_LOCATION, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN),
+        ),
+        _ledger_item(
+            "ledger-protection",
+            "protection",
+            "源码或项目知识中存在能影响该路径的防护消减证据",
+            scorecard.protection,
+            _items_by_kind(evidence, EvidenceKind.PROTECTION, EvidenceKind.PROJECT_CONTEXT),
+        ),
+        _ledger_item(
+            "ledger-impact",
+            "impact",
+            "影响已关联到资产、权限边界或危险汇点",
+            scorecard.impact,
+            _items_by_kind(evidence, EvidenceKind.IMPACT, EvidenceKind.PROJECT_CONTEXT),
+        ),
+    ]
+
+
+def _decision_with_scorecard_summary(decision: DebateDecision, scorecard: VerificationScorecard) -> DebateDecision:
+    if decision.reasoning_summary and not _looks_like_task_echo(decision.reasoning_summary):
+        return decision
+    summary = "；".join(scorecard.rationale[:4]) or decision.reasoning_summary
+    return DebateDecision(
+        verdict=decision.verdict,
+        confidence=decision.confidence,
+        disputed_points=decision.disputed_points,
+        reasoning_summary=summary,
+        recommended_next_steps=decision.recommended_next_steps,
+    )
+
+
+def _evidence_data_terms(evidence: Sequence[CodeEvidence], key: str) -> List[str]:
+    terms: List[str] = []
+    for item in evidence:
+        value = item.data.get(key)
+        if isinstance(value, (list, tuple, set)):
+            terms.extend(str(entry).strip() for entry in value if str(entry).strip())
+        elif value not in (None, "", [], {}):
+            terms.append(str(value).strip())
+    return list(dict.fromkeys(term for term in terms if term))[:12]
+
+
+def _finding_code_flow_path(code_flows: Sequence[Sequence[SourceLocation]]) -> str:
+    for code_flow in code_flows:
+        locations = [location.display() for location in code_flow if location]
+        if locations:
+            return " -> ".join(locations[:12])
+    return ""
+
+
+def _evidence_flow_path(evidence: Sequence[CodeEvidence]) -> str:
+    for item in evidence:
+        if item.kind not in {EvidenceKind.SARIF_CODE_FLOW, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN}:
+            continue
+        locations = [location.display() for location in item.locations if location]
+        if locations:
+            return " -> ".join(locations[:12])
+    return ""
+
+
+def _source_location_score(evidence: Sequence[CodeEvidence]) -> str:
+    if _all_primary_locations_invalid(evidence):
+        return "invalid"
+    if _has_valid_location(evidence):
+        return "confirmed"
+    if _has_source_root(evidence):
+        return "candidate"
+    return "missing"
+
+
+def _entry_reachability_score(evidence: Sequence[CodeEvidence]) -> str:
+    if _has_entry_reachability(evidence):
+        return "confirmed"
+    if _has_meaningful_flow(evidence):
+        return "candidate"
+    return "missing"
+
+
+def _call_chain_score(evidence: Sequence[CodeEvidence]) -> str:
+    if any(
+        item.kind == EvidenceKind.CALL_CHAIN
+        and item.strength in {EvidenceStrength.STRONG, EvidenceStrength.MEDIUM}
+        and item.source != "code-search"
+        for item in evidence
+    ):
+        return "confirmed"
+    if any(item.kind in {EvidenceKind.CALL_CHAIN, EvidenceKind.SARIF_CODE_FLOW} for item in evidence):
+        return "candidate"
+    return "missing"
+
+
+def _data_flow_score(evidence: Sequence[CodeEvidence]) -> str:
+    if any(
+        item.kind in {EvidenceKind.DATA_FLOW, EvidenceKind.SARIF_CODE_FLOW}
+        and item.strength in {EvidenceStrength.STRONG, EvidenceStrength.MEDIUM}
+        and item.source != "code-search"
+        for item in evidence
+    ):
+        return "confirmed"
+    if _has_weak_source_sink(evidence) or any(item.kind == EvidenceKind.DATA_FLOW for item in evidence):
+        return "candidate"
+    return "missing"
+
+
+def _controllability_score(evidence: Sequence[CodeEvidence], entry_reachability: str) -> str:
+    if entry_reachability == "confirmed" and _items_matching_source_terms(evidence):
+        return "confirmed"
+    if _items_matching_source_terms(evidence) or entry_reachability == "candidate":
+        return "candidate"
+    return "missing"
+
+
+def _impact_score(evidence: Sequence[CodeEvidence]) -> str:
+    if any(item.kind == EvidenceKind.IMPACT for item in evidence):
+        return "confirmed"
+    if any(item.kind == EvidenceKind.PROJECT_CONTEXT for item in evidence):
+        return "candidate"
+    return "missing"
+
+
+def _scorecard_rationale(
+    source_location: str,
+    entry_reachability: str,
+    call_chain: str,
+    data_flow: str,
+    controllability: str,
+    protection: str,
+    impact: str,
+) -> List[str]:
+    rationale: List[str] = []
+    if source_location == "invalid":
+        rationale.append("报告位置未能映射到当前源码，源码真实性不成立。")
+    elif source_location == "confirmed":
+        rationale.append("报告位置已解析到当前源码。")
+    else:
+        rationale.append("报告位置尚未被强证据确认。")
+    if entry_reachability != "confirmed":
+        rationale.append("入口可达性未闭环，需要证明外部输入或内部接口能调用到漏洞函数。")
+    if call_chain != "confirmed":
+        rationale.append("调用链未达到强确认状态，需要补齐上游调用方到报告函数的连续路径。")
+    if data_flow != "confirmed":
+        rationale.append("源到汇数据流未达到强确认状态，需要证明可控数据传递到危险汇点。")
+    if controllability == "missing":
+        rationale.append("攻击者输入可控性缺少证据。")
+    if protection == "candidate":
+        rationale.append("存在防护候选证据，需要判断是否覆盖报告路径。")
+    if impact == "missing":
+        rationale.append("影响尚未关联到资产、权限边界或可达危险汇点。")
+    if (
+        source_location == "confirmed"
+        and entry_reachability == "confirmed"
+        and call_chain == "confirmed"
+        and data_flow == "confirmed"
+        and impact in {"confirmed", "candidate"}
+        and protection == "none"
+    ):
+        rationale.append("源码定位、入口可达、调用链、数据流和影响证据已形成当前自动研判闭环。")
+    return list(dict.fromkeys(rationale))[:8]
+
+
+def _heuristic_scorecard_confidence(
+    source_location: str,
+    entry_reachability: str,
+    call_chain: str,
+    data_flow: str,
+    controllability: str,
+    impact: str,
+) -> float:
+    values = [source_location, entry_reachability, call_chain, data_flow, controllability, impact]
+    score = 0.0
+    for value in values:
+        if value == "confirmed":
+            score += 1.0
+        elif value == "candidate":
+            score += 0.5
+    return round(min(0.95, score / max(1, len(values))), 2)
+
+
+def _status_label(status: str) -> str:
+    labels = {
+        "confirmed": "已确认",
+        "candidate": "候选/部分",
+        "missing": "缺失",
+        "invalid": "无效",
+        "none": "未发现",
+        "blocks": "已阻断",
+    }
+    return labels.get(status, status or "未知")
+
+
+def _ledger_item(
+    item_id: str,
+    item_type: str,
+    claim: str,
+    status: str,
+    evidence_items: Sequence[CodeEvidence],
+) -> EvidenceLedgerItem:
+    evidence_ids = [item.evidence_id for item in evidence_items if item.evidence_id]
+    return EvidenceLedgerItem(
+        id=item_id,
+        type=item_type,
+        claim=claim,
+        status=status,
+        source=_ledger_source(evidence_items),
+        location=_ledger_location(evidence_items),
+        confidence=_ledger_confidence(status),
+        evidence_ids=list(dict.fromkeys(evidence_ids))[:12],
+    )
+
+
+def _ledger_source(evidence_items: Sequence[CodeEvidence]) -> str:
+    sources = list(dict.fromkeys(item.source for item in evidence_items if item.source))
+    return ", ".join(sources[:4]) if sources else "not-collected"
+
+
+def _ledger_location(evidence_items: Sequence[CodeEvidence]) -> str:
+    for item in evidence_items:
+        if item.locations:
+            return item.locations[0].display()
+    return ""
+
+
+def _ledger_confidence(status: str) -> float:
+    values = {
+        "confirmed": 0.85,
+        "candidate": 0.55,
+        "missing": 0.15,
+        "invalid": 0.05,
+        "none": 0.5,
+        "blocks": 0.8,
+    }
+    return values.get(status, 0.3)
+
+
+def _items_by_kind(evidence: Sequence[CodeEvidence], *kinds: EvidenceKind) -> List[CodeEvidence]:
+    accepted = set(kinds)
+    return [item for item in evidence if item.kind in accepted]
+
+
+def _items_matching_entry(evidence: Sequence[CodeEvidence]) -> List[CodeEvidence]:
+    matched = []
+    for item in evidence:
+        text = _evidence_item_text(item).lower()
+        if any(marker.lower() in text for marker in ENTRY_REACHABILITY_MARKERS):
+            matched.append(item)
+    return matched
+
+
+def _items_matching_source_terms(evidence: Sequence[CodeEvidence]) -> List[CodeEvidence]:
+    matched = []
+    for item in evidence:
+        if item.data.get("source_terms"):
+            matched.append(item)
+            continue
+        text = _evidence_item_text(item).lower()
+        if any(marker.lower() in text for marker in ("request", "param", "query", "body", "stdin", "argv", "recv", "用户输入", "请求参数")):
+            matched.append(item)
+    return matched
+
+
+def _evidence_item_text(item: CodeEvidence) -> str:
+    parts = [item.summary, item.source]
+    if item.snippet:
+        parts.append(item.snippet[:2000])
+    for location in item.locations[:10]:
+        parts.append(location.display())
+        if location.symbol:
+            parts.append(location.symbol)
+    parts.extend(_string_fragments(item.data))
+    return "\n".join(part for part in parts if part)
 
 
 def _evidence_prompt(evidence: Sequence[CodeEvidence]) -> str:
@@ -1285,13 +1925,13 @@ def _moderator_repetition_issue(turns: Sequence[DebateTurn]) -> Optional[str]:
     latest = turns[-1]
     if latest.role == DebateRole.MODERATOR:
         return None
-    latest_text = _normalize_claim_for_repetition(latest.claim)
+    latest_text = _normalize_claim_for_repetition(_turn_prompt_text(latest))
     if len(latest_text) < 24:
         return None
     for previous in turns[:-1]:
         if previous.role == DebateRole.MODERATOR:
             continue
-        previous_text = _normalize_claim_for_repetition(previous.claim)
+        previous_text = _normalize_claim_for_repetition(_turn_prompt_text(previous))
         if len(previous_text) < 24:
             continue
         similarity = difflib.SequenceMatcher(None, latest_text, previous_text).ratio()
@@ -1316,13 +1956,13 @@ def _roles_with_repeated_turns(turns: Sequence[DebateTurn]) -> List[str]:
     for index, turn in enumerate(turns):
         if turn.role == DebateRole.MODERATOR:
             continue
-        current = _normalize_claim_for_repetition(turn.claim)
+        current = _normalize_claim_for_repetition(_turn_prompt_text(turn))
         if len(current) < 24:
             continue
         for previous in turns[:index]:
             if previous.role != turn.role:
                 continue
-            previous_text = _normalize_claim_for_repetition(previous.claim)
+            previous_text = _normalize_claim_for_repetition(_turn_prompt_text(previous))
             if len(previous_text) < 24:
                 continue
             similarity = difflib.SequenceMatcher(None, current, previous_text).ratio()

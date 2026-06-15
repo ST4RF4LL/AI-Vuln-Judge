@@ -1008,6 +1008,18 @@ def _export_run_markdown(run: dict) -> str:
                 "",
                 str(report.get("reasoning_summary") or "无"),
                 "",
+                "### 研判用例",
+                "",
+                _verification_case_markdown(report),
+                "",
+                "### 证据评分卡",
+                "",
+                _scorecard_markdown(report),
+                "",
+                "### 证据台账",
+                "",
+                _evidence_ledger_markdown(report),
+                "",
                 "### 源码位置",
                 "",
             ]
@@ -1051,6 +1063,21 @@ def _export_run_markdown(run: dict) -> str:
                 evidence_ids = turn.get("evidence_ids") or []
                 if evidence_ids:
                     lines.extend(["引用证据：" + ", ".join(evidence_ids), ""])
+                raw_claim = str(turn.get("raw_claim") or "").strip()
+                claim = str(turn.get("claim") or "").strip()
+                if raw_claim and raw_claim != claim:
+                    lines.extend(
+                        [
+                            "<details><summary>原始输出</summary>",
+                            "",
+                            "```text",
+                            raw_claim.rstrip(),
+                            "```",
+                            "",
+                            "</details>",
+                            "",
+                        ]
+                    )
         else:
             lines.extend(["无博弈过程记录。", ""])
         lines.extend(["### 证据链", ""])
@@ -1070,6 +1097,80 @@ def _export_run_markdown(run: dict) -> str:
             lines.append("- 无")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _verification_case_markdown(report: dict) -> str:
+    case = report.get("verification_case") if isinstance(report.get("verification_case"), dict) else {}
+    if not case:
+        return "无"
+    lines = [
+        f"- 漏洞类型/规则：{case.get('vulnerability_type') or '未知'}",
+        f"- 报告消息：{case.get('reported_message') or '未知'}",
+        f"- 报告位置：{case.get('reported_location') or '未知'}",
+        f"- 报告源点：{case.get('reported_source') or '未提取'}",
+        f"- 报告汇点/危险函数：{case.get('reported_sink') or case.get('dangerous_function') or '未提取'}",
+        f"- 报告期望路径：{case.get('expected_attack_path') or '未提供 codeFlow'}",
+    ]
+    proof = case.get("required_proof") if isinstance(case.get("required_proof"), list) else []
+    if proof:
+        lines.append("- 必须闭环的证明要件：")
+        lines.extend(f"  - {item}" for item in proof)
+    return "\n".join(lines)
+
+
+def _scorecard_markdown(report: dict) -> str:
+    scorecard = report.get("scorecard") if isinstance(report.get("scorecard"), dict) else {}
+    if not scorecard:
+        return "无"
+    rows = [
+        ("源码定位", scorecard.get("source_location")),
+        ("入口可达", scorecard.get("entry_reachability")),
+        ("调用链", scorecard.get("call_chain")),
+        ("数据流", scorecard.get("data_flow")),
+        ("输入可控性", scorecard.get("controllability")),
+        ("防护消减", scorecard.get("protection")),
+        ("影响归因", scorecard.get("impact")),
+    ]
+    lines = [f"- {name}：{_status_text(status)}" for name, status in rows]
+    if scorecard.get("verdict_label"):
+        lines.append(f"- 结论标签：{scorecard.get('verdict_label')}")
+    if scorecard.get("confidence") not in (None, ""):
+        lines.append(f"- 置信度：{scorecard.get('confidence')}")
+    rationale = scorecard.get("rationale") if isinstance(scorecard.get("rationale"), list) else []
+    if rationale:
+        lines.append("- 理由：")
+        lines.extend(f"  - {item}" for item in rationale)
+    return "\n".join(lines)
+
+
+def _evidence_ledger_markdown(report: dict) -> str:
+    ledger = report.get("evidence_ledger") if isinstance(report.get("evidence_ledger"), list) else []
+    if not ledger:
+        return "无"
+    lines = []
+    for item in ledger:
+        if not isinstance(item, dict):
+            continue
+        evidence_ids = item.get("evidence_ids") if isinstance(item.get("evidence_ids"), list) else []
+        evidence_text = "；证据：" + ", ".join(str(value) for value in evidence_ids[:8]) if evidence_ids else ""
+        location = f"；位置：{item.get('location')}" if item.get("location") else ""
+        lines.append(
+            f"- {item.get('claim') or item.get('type') or item.get('id')}：{_status_text(item.get('status'))}"
+            f"；来源：{item.get('source') or 'not-collected'}{location}{evidence_text}"
+        )
+    return "\n".join(lines) if lines else "无"
+
+
+def _status_text(status) -> str:
+    labels = {
+        "confirmed": "已确认",
+        "candidate": "候选/部分",
+        "missing": "缺失",
+        "invalid": "无效",
+        "none": "未发现",
+        "blocks": "已阻断",
+    }
+    return labels.get(str(status or ""), str(status or "未知"))
 
 
 def _report_evidence_graph(report: dict) -> dict:
@@ -1264,6 +1365,97 @@ def app_html() -> str:
     .chip.run-stop, .chip.run-pause, .chip.run-resume {{ cursor: pointer; color: var(--accent); }}
     .chip.run-stop:hover, .chip.run-pause:hover, .chip.run-resume:hover {{ border-color: var(--accent); background: #edf7fb; }}
     .content {{ padding: 16px; display: grid; gap: 16px; }}
+    .detail-pane {{
+      min-height: 0;
+    }}
+    .run-overview {{
+      flex: 0 0 auto;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+      height: min(50vh, 500px);
+      min-height: 260px;
+      overflow: hidden;
+    }}
+    .run-overview:empty {{ display: none; }}
+    .run-overview-grid {{
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      height: 100%;
+      min-height: 0;
+      padding: 12px;
+    }}
+    .overview-card {{
+      min-width: 0;
+      min-height: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }}
+    .metadata-card {{
+      flex: 0 0 auto;
+      max-height: 260px;
+    }}
+    .metadata-card .overview-body {{
+      max-height: 205px;
+    }}
+    .findings-card {{
+      flex: 1 1 auto;
+      min-height: 132px;
+    }}
+    .findings-card .overview-body {{
+      flex: 1 1 auto;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }}
+    .overview-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-height: 42px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfe;
+    }}
+    .overview-head h3 {{ margin: 0; font-size: 14px; line-height: 1.25; }}
+    .overview-head button {{ padding: 5px 8px; min-height: 28px; }}
+    .overview-body {{
+      min-height: 0;
+      padding: 12px;
+      overflow: auto;
+      display: grid;
+      gap: 10px;
+      align-content: start;
+    }}
+    .overview-body.collapsed {{ display: none; }}
+    .overview-summary {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(86px, 1fr));
+      gap: 8px;
+      margin-bottom: 2px;
+    }}
+    .overview-metric {{
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px;
+      background: #fbfcfe;
+    }}
+    .overview-metric .label {{ color: var(--muted); font-size: 11px; }}
+    .overview-metric .value {{ margin-top: 4px; font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }}
+    .findings-table-wrap {{
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+    }}
+    .findings-table-wrap table {{ min-width: 620px; }}
+    .findings-table-wrap tr.active {{ background: #edf7fb; box-shadow: inset 4px 0 0 var(--accent); }}
+    .detail-scroll {{ flex: 1 1 auto; }}
     .summary-grid {{
       display: grid;
       grid-template-columns: repeat(4, minmax(120px, 1fr));
@@ -1524,6 +1716,8 @@ def app_html() -> str:
       header {{ align-items: flex-start; flex-direction: column; }}
       main {{ grid-template-columns: 1fr; height: auto; min-height: 0; }}
       .pane {{ min-height: 360px; }}
+      .run-overview {{ height: min(58vh, 520px); }}
+      .overview-summary {{ grid-template-columns: repeat(2, minmax(86px, 1fr)); }}
       .summary-grid {{ grid-template-columns: repeat(2, minmax(120px, 1fr)); }}
       .form-grid {{ grid-template-columns: 1fr; }}
       .run-agent-grid {{ grid-template-columns: 1fr; }}
@@ -1557,12 +1751,13 @@ def app_html() -> str:
         <div class="run-list" id="run-list"></div>
       </div>
     </section>
-    <section class="pane" aria-label="运行详情和提供商设置">
+    <section class="pane detail-pane" aria-label="运行详情和提供商设置">
       <div class="pane-title">
         <h2 id="detail-title">运行详情</h2>
         <span class="muted" id="detail-status">未选择任务</span>
       </div>
-      <div class="scroll">
+      <div class="run-overview" id="run-overview"></div>
+      <div class="scroll detail-scroll">
         <div class="content" id="detail"></div>
       </div>
     </section>
@@ -1781,10 +1976,19 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false }};
+    function initialMetadataCollapsed() {{
+      try {{
+        return window.localStorage.getItem('vulnJudgerRunMetadataCollapsed') === 'true';
+      }} catch (_error) {{
+        return false;
+      }}
+    }}
+
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, runMetadataCollapsed: initialMetadataCollapsed() }};
     const el = {{
       list: document.getElementById('run-list'),
       count: document.getElementById('run-count'),
+      overview: document.getElementById('run-overview'),
       detail: document.getElementById('detail'),
       title: document.getElementById('detail-title'),
       status: document.getElementById('detail-status'),
@@ -3097,9 +3301,6 @@ def app_html() -> str:
     }}
 
     function renderRunDetail(run, findings) {{
-      const counts = run.verdict_counts || {{}};
-      const providers = run.llm_providers || {{}};
-      const agents = run.agent_configs || {{}};
       const status = run.status || 'completed';
       const resumeIndex = run.resume_from_finding_index;
       const resumeFinding = run.resume_from_finding_id || '';
@@ -3132,73 +3333,121 @@ def app_html() -> str:
             ? '任务正在后台运行。自动刷新开启，每完成一次 LLM 对话，本页面会自动加载当前信息。'
             : '任务正在后台运行。自动刷新已关闭，可手动点击“刷新”加载当前信息。';
       el.status.textContent = `${{statusLabel(status)}} / ${{findings.length}} 个发现`;
-      const statusCard = `
-        <div class="detail">
-          <h3>运行状态</h3>
-          <div class="detail-body">
-            <div class="chips"><span class="chip">${{esc(statusLabel(status))}}</span></div>
-            <div class="toolbar">
-              ${{detailControls}}
-              <button type="button" data-run-export="markdown" data-run-id="${{esc(run.run_id)}}">导出 Markdown</button>
-              <button type="button" data-run-export="json" data-run-id="${{esc(run.run_id)}}">导出 JSON</button>
-            </div>
-            <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
-            <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
-            <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
-            <div><strong>发现进度：</strong> ${{esc(run.completed_finding_count ?? findings.length)}} / ${{esc(run.finding_count || findings.length)}}</div>
-            ${{currentHint ? `<div><strong>当前状态：</strong> ${{esc(currentHint)}}</div>` : ''}}
-            ${{resumeHint ? `<div><strong>恢复点：</strong> ${{esc(resumeHint)}}</div>` : ''}}
-            <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
-            <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
-            <div><strong>主持人 LLM：</strong> ${{esc(providerLabel(providers.moderator, providers.enabled))}}</div>
-            <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
-            <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
-            <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
-            ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}
-            ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : `<div class="muted">${{esc(runningMessage)}}</div>`}}
-            ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
-          </div>
-        </div>`;
       if (status !== 'completed') {{
-        el.detail.innerHTML = statusCard + (findings.length ? renderFindingsSection(findings) : '');
-        bindRunExportButtons();
-        bindRunControlButtons(el.detail);
+        el.overview.innerHTML = renderRunOverview(run, findings, status, detailControls, runningMessage, currentHint, resumeHint);
+        el.detail.innerHTML = findings.length
+          ? '<div id="finding-detail"></div>'
+          : '<div class="empty">任务正在运行，尚未生成可展示的漏洞发现详情。</div>';
+        bindRunExportButtons(el.overview);
+        bindRunControlButtons(el.overview);
+        bindRunOverviewControls();
         bindFindingRows(findings);
         return;
       }}
-      el.detail.innerHTML = `
-        <div class="summary-grid">
-          <div class="metric"><div class="label">发现数</div><div class="value">${{esc(run.finding_count)}}</div></div>
-          <div class="metric"><div class="label">真实漏洞</div><div class="value">${{counts.TRUE_POSITIVE || 0}}</div></div>
-          <div class="metric"><div class="label">误报</div><div class="value">${{counts.FALSE_POSITIVE || 0}}</div></div>
-          <div class="metric"><div class="label">证据不足</div><div class="value">${{counts.INCONCLUSIVE || 0}}</div></div>
-        </div>
-        <div class="detail">
+      el.overview.innerHTML = renderRunOverview(run, findings, status, detailControls, runningMessage, currentHint, resumeHint);
+      el.detail.innerHTML = findings.length
+        ? '<div id="finding-detail"></div>'
+        : '<div class="empty">暂无漏洞发现记录。</div>';
+      bindRunExportButtons(el.overview);
+      bindRunControlButtons(el.overview);
+      bindRunOverviewControls();
+      bindFindingRows(findings);
+    }}
+
+    function renderRunOverview(run, findings, status, detailControls, runningMessage, currentHint, resumeHint) {{
+      return `<div class="run-overview-grid">
+        ${{renderRunMetadataCard(run, findings, status, detailControls, runningMessage, currentHint, resumeHint)}}
+        ${{renderFindingsSection(findings)}}
+      </div>`;
+    }}
+
+    function renderRunMetadataCard(run, findings, status, detailControls, runningMessage, currentHint, resumeHint) {{
+      const counts = run.verdict_counts || {{}};
+      const providers = run.llm_providers || {{}};
+      const agents = run.agent_configs || {{}};
+      const collapsed = state.runMetadataCollapsed;
+      return `<div class="overview-card metadata-card">
+        <div class="overview-head">
           <h3>运行元数据</h3>
-          <div class="detail-body">
-            <div class="toolbar">
-              <button type="button" data-run-export="markdown" data-run-id="${{esc(run.run_id)}}">导出 Markdown</button>
-              <button type="button" data-run-export="json" data-run-id="${{esc(run.run_id)}}">导出 JSON</button>
-            </div>
-            <div><strong>创建时间：</strong> ${{esc(fmtDate(run.created_at))}}</div>
-            <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
-            <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
-            <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
-            <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
-            <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
-            <div><strong>主持人 LLM：</strong> ${{esc(providerLabel(providers.moderator, providers.enabled))}}</div>
-            <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
-            <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
-            <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
-            ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}
-            ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
+          <div class="chips">
+            <span class="chip">${{esc(statusLabel(status))}}</span>
+            <span class="chip">${{esc(findings.length)}} 个发现</span>
+            <button type="button" data-run-metadata-toggle="true" aria-expanded="${{collapsed ? 'false' : 'true'}}">${{collapsed ? '展开' : '收起'}}</button>
           </div>
         </div>
-        ${{renderFindingsSection(findings)}}
-      `;
-      bindRunExportButtons();
-      bindRunControlButtons(el.detail);
-      bindFindingRows(findings);
+        <div class="overview-body ${{collapsed ? 'collapsed' : ''}}">
+          <div class="overview-summary">
+            <div class="overview-metric"><div class="label">发现数</div><div class="value">${{esc(run.finding_count || findings.length)}}</div></div>
+            <div class="overview-metric"><div class="label">真实漏洞</div><div class="value">${{counts.TRUE_POSITIVE || 0}}</div></div>
+            <div class="overview-metric"><div class="label">误报</div><div class="value">${{counts.FALSE_POSITIVE || 0}}</div></div>
+            <div class="overview-metric"><div class="label">证据不足</div><div class="value">${{counts.INCONCLUSIVE || 0}}</div></div>
+          </div>
+          <div class="toolbar">
+            ${{detailControls}}
+            <button type="button" data-run-export="markdown" data-run-id="${{esc(run.run_id)}}">导出 Markdown</button>
+            <button type="button" data-run-export="json" data-run-id="${{esc(run.run_id)}}">导出 JSON</button>
+          </div>
+          <div><strong>创建时间：</strong> ${{esc(fmtDate(run.created_at))}}</div>
+          <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
+          <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
+          <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
+          <div><strong>发现进度：</strong> ${{esc(run.completed_finding_count ?? findings.length)}} / ${{esc(run.finding_count || findings.length)}}</div>
+          ${{currentHint ? `<div><strong>当前状态：</strong> ${{esc(currentHint)}}</div>` : ''}}
+          ${{resumeHint ? `<div><strong>恢复点：</strong> ${{esc(resumeHint)}}</div>` : ''}}
+          <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
+          <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
+          <div><strong>主持人 LLM：</strong> ${{esc(providerLabel(providers.moderator, providers.enabled))}}</div>
+          <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
+          <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
+          <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
+          ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}
+          ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : `<div class="muted">${{esc(runningMessage)}}</div>`}}
+          ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
+        </div>
+      </div>`;
+    }}
+
+    function renderFindingsOverview(findings) {{
+      return `<div class="overview-card findings-card">
+        <div class="overview-head">
+          <h3>漏洞发现</h3>
+          <span class="muted">${{esc(findings.length)}} 个</span>
+        </div>
+        <div class="overview-body">
+          ${{findings.length ? `<div class="findings-table-wrap">
+            <table>
+              <thead><tr><th>结论</th><th>规则</th><th>置信度</th><th>摘要</th></tr></thead>
+              <tbody>
+                ${{findings.map(item => `<tr class="clickable ${{state.selectedFinding === item.finding_id ? 'active' : ''}}" data-finding-id="${{esc(item.finding_id)}}">
+                  <td><span class="chip ${{verdictClass(item.verdict)}}">${{esc(verdictLabel(item.verdict))}}</span></td>
+                  <td>${{esc(item.rule_id)}}<div class="path">${{esc(item.finding_id)}}</div></td>
+                  <td>${{esc(item.confidence)}}</td>
+                  <td><span class="plain-inline">${{plainInlineText(item.summary)}}</span><div class="path">${{esc((item.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div></td>
+                </tr>`).join('')}}
+              </tbody>
+            </table>
+          </div>` : '<div class="muted">暂无漏洞发现。</div>'}}
+        </div>
+      </div>`;
+    }}
+
+    function renderFindingsSection(findings) {{
+      return renderFindingsOverview(findings);
+    }}
+
+    function bindRunOverviewControls() {{
+      const button = el.overview.querySelector('[data-run-metadata-toggle]');
+      if (!button) return;
+      button.addEventListener('click', () => {{
+        state.runMetadataCollapsed = !state.runMetadataCollapsed;
+        try {{
+          window.localStorage.setItem('vulnJudgerRunMetadataCollapsed', state.runMetadataCollapsed ? 'true' : 'false');
+        }} catch (_error) {{}}
+        const body = el.overview.querySelector('.metadata-card .overview-body');
+        if (body) body.classList.toggle('collapsed', state.runMetadataCollapsed);
+        button.textContent = state.runMetadataCollapsed ? '展开' : '收起';
+        button.setAttribute('aria-expanded', state.runMetadataCollapsed ? 'false' : 'true');
+      }});
     }}
 
     function bindRunControlButtons(root) {{
@@ -3223,7 +3472,8 @@ def app_html() -> str:
     }}
 
     function bindRunExportButtons() {{
-      for (const button of el.detail.querySelectorAll('[data-run-export]')) {{
+      const root = arguments.length ? arguments[0] : el.detail;
+      for (const button of root.querySelectorAll('[data-run-export]')) {{
         button.addEventListener('click', () => exportRun(button.dataset.runId, button.dataset.runExport));
       }}
     }}
@@ -3239,29 +3489,8 @@ def app_html() -> str:
       link.remove();
     }}
 
-    function renderFindingsSection(findings) {{
-      return `
-        <div class="detail">
-          <h3>漏洞发现</h3>
-          <div class="scroll">
-            <table>
-              <thead><tr><th>结论</th><th>规则</th><th>置信度</th><th>摘要</th></tr></thead>
-              <tbody>
-                ${{findings.map(item => `<tr class="clickable" data-finding-id="${{esc(item.finding_id)}}">
-                  <td><span class="chip ${{verdictClass(item.verdict)}}">${{esc(verdictLabel(item.verdict))}}</span></td>
-                  <td>${{esc(item.rule_id)}}<div class="path">${{esc(item.finding_id)}}</div></td>
-                  <td>${{esc(item.confidence)}}</td>
-                  <td><span class="plain-inline">${{plainInlineText(item.summary)}}</span><div class="path">${{esc((item.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div></td>
-                </tr>`).join('')}}
-              </tbody>
-            </table>
-          </div>
-        </div>
-        <div id="finding-detail"></div>`;
-    }}
-
     function bindFindingRows(findings) {{
-      for (const row of el.detail.querySelectorAll('tr[data-finding-id]')) {{
+      for (const row of el.overview.querySelectorAll('tr[data-finding-id]')) {{
         row.addEventListener('click', () => selectFinding(row.dataset.findingId));
       }}
       if (!findings.length) return;
@@ -3319,15 +3548,21 @@ def app_html() -> str:
 
     async function selectFinding(findingId) {{
       state.selectedFinding = findingId;
+      markSelectedFindingRow(findingId);
       const container = document.getElementById('finding-detail');
       if (!container) return;
       container.innerHTML = '<div class="empty">正在加载发现详情...</div>';
       try {{
         const detail = await fetchJson(`/runs/${{encodeURIComponent(state.selectedRun)}}/findings/${{encodeURIComponent(findingId)}}`);
         container.innerHTML = renderFindingDetail(detail);
-        container.scrollIntoView({{ block: 'nearest' }});
       }} catch (error) {{
         container.innerHTML = `<div class="empty error">${{esc(error.message)}}</div>`;
+      }}
+    }}
+
+    function markSelectedFindingRow(findingId) {{
+      for (const row of el.overview.querySelectorAll('tr[data-finding-id]')) {{
+        row.classList.toggle('active', row.dataset.findingId === findingId);
       }}
     }}
 
@@ -3543,6 +3778,88 @@ def app_html() -> str:
       return String(value ?? '').replace(/\\bev-[0-9A-Za-z_-]+\\b/g, '').replace(/\\s+/g, ' ').trim() || '未命名节点';
     }}
 
+    function renderVerificationCaseSection(detail) {{
+      const item = detail.verification_case && typeof detail.verification_case === 'object' ? detail.verification_case : null;
+      if (!item || !Object.keys(item).length) return '';
+      const proof = Array.isArray(item.required_proof) ? item.required_proof : [];
+      return `<div class="detail">
+        <h3>研判用例</h3>
+        <div class="detail-body">
+          <div><strong>漏洞类型/规则：</strong> <span class="plain-text">${{plainText(item.vulnerability_type || '未知')}}</span></div>
+          <div><strong>报告消息：</strong> <span class="plain-text">${{plainText(item.reported_message || '未知')}}</span></div>
+          <div><strong>报告位置：</strong> <span class="plain-text">${{plainText(item.reported_location || '未知')}}</span></div>
+          <div><strong>报告源点：</strong> <span class="plain-text">${{plainText(item.reported_source || '未提取')}}</span></div>
+          <div><strong>报告汇点/危险函数：</strong> <span class="plain-text">${{plainText(item.reported_sink || item.dangerous_function || '未提取')}}</span></div>
+          <div><strong>报告期望路径：</strong> <span class="plain-text">${{plainText(item.expected_attack_path || '未提供 codeFlow')}}</span></div>
+          ${{proof.length ? `<div><strong>证明要件：</strong><ul>${{proof.map(value => `<li><span class="plain-text">${{plainText(value)}}</span></li>`).join('')}}</ul></div>` : ''}}
+        </div>
+      </div>`;
+    }}
+
+    function renderScorecardSection(detail) {{
+      const scorecard = detail.scorecard && typeof detail.scorecard === 'object' ? detail.scorecard : null;
+      if (!scorecard || !Object.keys(scorecard).length) return '';
+      const rows = [
+        ['源码定位', scorecard.source_location],
+        ['入口可达', scorecard.entry_reachability],
+        ['调用链', scorecard.call_chain],
+        ['数据流', scorecard.data_flow],
+        ['输入可控性', scorecard.controllability],
+        ['防护消减', scorecard.protection],
+        ['影响归因', scorecard.impact],
+      ];
+      const rationale = Array.isArray(scorecard.rationale) ? scorecard.rationale : [];
+      return `<div class="detail">
+        <h3>证据评分卡</h3>
+        <div class="detail-body">
+          <div class="chips">
+            ${{rows.map(([name, status]) => `<span class="chip">${{esc(name)}}：${{esc(statusLabel(status))}}</span>`).join('')}}
+            ${{scorecard.verdict_label ? `<span class="chip">${{esc(scorecard.verdict_label)}}</span>` : ''}}
+            ${{scorecard.confidence !== undefined && scorecard.confidence !== null ? `<span class="chip">评分 ${{esc(scorecard.confidence)}}</span>` : ''}}
+          </div>
+          ${{rationale.length ? `<div><strong>理由：</strong><ul>${{rationale.map(value => `<li><span class="plain-text">${{plainText(value)}}</span></li>`).join('')}}</ul></div>` : ''}}
+        </div>
+      </div>`;
+    }}
+
+    function renderEvidenceLedgerSection(detail) {{
+      const ledger = Array.isArray(detail.evidence_ledger) ? detail.evidence_ledger : [];
+      if (!ledger.length) return '';
+      return `<div class="detail">
+        <h3>证据台账</h3>
+        <div class="detail-body">
+          ${{ledger.map(item => `<div>
+            <div class="chips">
+              <span class="chip">${{esc(item.claim || item.type || item.id || '证据项')}}</span>
+              <span class="chip">${{esc(statusLabel(item.status))}}</span>
+              <span class="chip">${{esc(item.source || 'not-collected')}}</span>
+            </div>
+            ${{item.location ? `<div class="path">位置：${{esc(item.location)}}</div>` : ''}}
+            ${{Array.isArray(item.evidence_ids) && item.evidence_ids.length ? `<div class="path">证据：${{esc(item.evidence_ids.join(', '))}}</div>` : ''}}
+          </div>`).join('')}}
+        </div>
+      </div>`;
+    }}
+
+    function renderRawTurn(turn) {{
+      const raw = String(turn.raw_claim || '').trim();
+      const claim = String(turn.claim || '').trim();
+      if (!raw || raw === claim) return '';
+      return `<details class="raw-debug"><summary>原始输出</summary><pre>${{esc(raw)}}</pre></details>`;
+    }}
+
+    function statusLabel(status) {{
+      const labels = {{
+        confirmed: '已确认',
+        candidate: '候选/部分',
+        missing: '缺失',
+        invalid: '无效',
+        none: '未发现',
+        blocks: '已阻断',
+      }};
+      return labels[String(status || '')] || String(status || '未知');
+    }}
+
     function renderFindingDetail(detail) {{
       const evidence = detail.evidence_chain || [];
       const debate = uniqueDebateTurns(detail.debate || []);
@@ -3564,7 +3881,10 @@ def app_html() -> str:
             ${{(detail.disputed_points || []).length ? `<div><strong>争议点：</strong><ul>${{detail.disputed_points.map(point => `<li><span class="plain-text">${{plainText(point)}}</span></li>`).join('')}}</ul></div>` : ''}}
           </div>
         </div>
+        ${{renderVerificationCaseSection(detail)}}
+        ${{renderScorecardSection(detail)}}
         ${{renderPathOverviewSection(detail)}}
+        ${{renderEvidenceLedgerSection(detail)}}
         <div class="detail">
           <h3>博弈过程</h3>
           <div class="detail-body">
@@ -3572,6 +3892,7 @@ def app_html() -> str:
               <strong>${{esc(roleLabel(turn.role))}} 第 ${{esc(turn.round_index)}} 回合</strong>
               <div class="plain-text">${{plainText(turn.claim)}}</div>
               <div class="path">证据：${{esc((turn.evidence_ids || []).join(', '))}}</div>
+              ${{renderRawTurn(turn)}}
             </div>`).join('') || '<div class="muted">暂无博弈回合记录。</div>'}}
           </div>
         </div>
@@ -3605,6 +3926,7 @@ def app_html() -> str:
     function renderEmpty(message) {{
       el.title.textContent = '运行详情';
       el.status.textContent = '未选择任务';
+      el.overview.innerHTML = '';
       el.detail.innerHTML = `<div class="empty">${{esc(message)}}</div>`;
     }}
     function renderError(error) {{
