@@ -1372,17 +1372,13 @@ def app_html() -> str:
       flex: 0 0 auto;
       border-bottom: 1px solid var(--line);
       background: #f8fafc;
-      height: min(50vh, 500px);
-      min-height: 260px;
-      overflow: hidden;
+      max-height: min(34vh, 330px);
+      overflow: auto;
     }}
     .run-overview:empty {{ display: none; }}
     .run-overview-grid {{
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      height: 100%;
-      min-height: 0;
+      display: grid;
+      gap: 0;
       padding: 12px;
     }}
     .overview-card {{
@@ -1391,23 +1387,6 @@ def app_html() -> str:
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #ffffff;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-    }}
-    .metadata-card {{
-      flex: 0 0 auto;
-      max-height: 260px;
-    }}
-    .metadata-card .overview-body {{
-      max-height: 205px;
-    }}
-    .findings-card {{
-      flex: 1 1 auto;
-      min-height: 132px;
-    }}
-    .findings-card .overview-body {{
-      flex: 1 1 auto;
       overflow: hidden;
       display: flex;
       flex-direction: column;
@@ -1423,7 +1402,6 @@ def app_html() -> str:
       background: #fbfcfe;
     }}
     .overview-head h3 {{ margin: 0; font-size: 14px; line-height: 1.25; }}
-    .overview-head button {{ padding: 5px 8px; min-height: 28px; }}
     .overview-body {{
       min-height: 0;
       padding: 12px;
@@ -1432,7 +1410,6 @@ def app_html() -> str:
       gap: 10px;
       align-content: start;
     }}
-    .overview-body.collapsed {{ display: none; }}
     .overview-summary {{
       display: grid;
       grid-template-columns: repeat(4, minmax(86px, 1fr));
@@ -1449,12 +1426,63 @@ def app_html() -> str:
     .overview-metric .label {{ color: var(--muted); font-size: 11px; }}
     .overview-metric .value {{ margin-top: 4px; font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }}
     .findings-table-wrap {{
-      flex: 1 1 auto;
       min-height: 0;
-      overflow: auto;
+      overflow-x: auto;
+      overflow-y: visible;
     }}
     .findings-table-wrap table {{ min-width: 620px; }}
     .findings-table-wrap tr.active {{ background: #edf7fb; box-shadow: inset 4px 0 0 var(--accent); }}
+    .findings-section {{
+      overflow: visible;
+    }}
+    .selected-finding-sticky {{
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      box-shadow: 0 8px 18px rgba(15, 23, 42, 0.12);
+      padding: 10px 12px;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+    }}
+    .selected-finding-sticky.hidden {{ display: none; }}
+    .finding-nav-button {{
+      width: 38px;
+      height: 38px;
+      min-width: 38px;
+      padding: 0;
+      border-radius: 999px;
+      border-color: #b9d7e5;
+      background: #edf7fb;
+      color: #0d4f6f;
+      font-size: 20px;
+      font-weight: 700;
+      line-height: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: inset 0 0 0 1px rgba(20, 108, 148, 0.08);
+    }}
+    .finding-nav-button:hover {{
+      border-color: var(--accent);
+      background: #dff0f7;
+      color: #08384f;
+    }}
+    .finding-nav-button:disabled {{
+      background: #f8fafc;
+      color: #a5afbd;
+      border-color: var(--line);
+      box-shadow: none;
+    }}
+    .selected-finding-main {{
+      min-width: 0;
+      display: grid;
+      gap: 6px;
+    }}
     .detail-scroll {{ flex: 1 1 auto; }}
     .summary-grid {{
       display: grid;
@@ -1716,7 +1744,6 @@ def app_html() -> str:
       header {{ align-items: flex-start; flex-direction: column; }}
       main {{ grid-template-columns: 1fr; height: auto; min-height: 0; }}
       .pane {{ min-height: 360px; }}
-      .run-overview {{ height: min(58vh, 520px); }}
       .overview-summary {{ grid-template-columns: repeat(2, minmax(86px, 1fr)); }}
       .summary-grid {{ grid-template-columns: repeat(2, minmax(120px, 1fr)); }}
       .form-grid {{ grid-template-columns: 1fr; }}
@@ -1757,7 +1784,7 @@ def app_html() -> str:
         <span class="muted" id="detail-status">未选择任务</span>
       </div>
       <div class="run-overview" id="run-overview"></div>
-      <div class="scroll detail-scroll">
+      <div class="scroll detail-scroll" id="detail-scroll">
         <div class="content" id="detail"></div>
       </div>
     </section>
@@ -1976,20 +2003,13 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    function initialMetadataCollapsed() {{
-      try {{
-        return window.localStorage.getItem('vulnJudgerRunMetadataCollapsed') === 'true';
-      }} catch (_error) {{
-        return false;
-      }}
-    }}
-
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, runMetadataCollapsed: initialMetadataCollapsed() }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false }};
     const el = {{
       list: document.getElementById('run-list'),
       count: document.getElementById('run-count'),
       overview: document.getElementById('run-overview'),
       detail: document.getElementById('detail'),
+      detailScroll: document.getElementById('detail-scroll'),
       title: document.getElementById('detail-title'),
       status: document.getElementById('detail-status'),
       subtitle: document.getElementById('subtitle'),
@@ -2104,9 +2124,11 @@ def app_html() -> str:
     }});
     document.getElementById('refresh').addEventListener('click', refreshAll);
     el.autoRefresh.addEventListener('click', toggleAutoRefresh);
+    el.detailScroll.addEventListener('scroll', updateStickyFindingVisibility);
     document.getElementById('clear-selection').addEventListener('click', () => {{
       state.selectedRun = null;
       state.selectedFinding = null;
+      state.currentFindings = [];
       renderRuns();
       renderEmpty('选择一个任务查看发现、证据和博弈回合。');
     }});
@@ -3301,6 +3323,7 @@ def app_html() -> str:
     }}
 
     function renderRunDetail(run, findings) {{
+      state.currentFindings = findings || [];
       const status = run.status || 'completed';
       const resumeIndex = run.resume_from_finding_index;
       const resumeFinding = run.resume_from_finding_id || '';
@@ -3333,49 +3356,33 @@ def app_html() -> str:
             ? '任务正在后台运行。自动刷新开启，每完成一次 LLM 对话，本页面会自动加载当前信息。'
             : '任务正在后台运行。自动刷新已关闭，可手动点击“刷新”加载当前信息。';
       el.status.textContent = `${{statusLabel(status)}} / ${{findings.length}} 个发现`;
-      if (status !== 'completed') {{
-        el.overview.innerHTML = renderRunOverview(run, findings, status, detailControls, runningMessage, currentHint, resumeHint);
-        el.detail.innerHTML = findings.length
-          ? '<div id="finding-detail"></div>'
-          : '<div class="empty">任务正在运行，尚未生成可展示的漏洞发现详情。</div>';
-        bindRunExportButtons(el.overview);
-        bindRunControlButtons(el.overview);
-        bindRunOverviewControls();
-        bindFindingRows(findings);
-        return;
-      }}
-      el.overview.innerHTML = renderRunOverview(run, findings, status, detailControls, runningMessage, currentHint, resumeHint);
-      el.detail.innerHTML = findings.length
-        ? '<div id="finding-detail"></div>'
-        : '<div class="empty">暂无漏洞发现记录。</div>';
-      bindRunExportButtons(el.overview);
-      bindRunControlButtons(el.overview);
-      bindRunOverviewControls();
+      el.overview.innerHTML = '';
+      el.detail.innerHTML = renderFindingWorkspace(
+        run,
+        findings,
+        status,
+        detailControls,
+        runningMessage,
+        currentHint,
+        resumeHint,
+        status !== 'completed' ? '任务正在运行，尚未生成可展示的漏洞发现详情。' : '暂无漏洞发现记录。'
+      );
+      bindRunExportButtons(el.detail);
+      bindRunControlButtons(el.detail);
       bindFindingRows(findings);
-    }}
-
-    function renderRunOverview(run, findings, status, detailControls, runningMessage, currentHint, resumeHint) {{
-      return `<div class="run-overview-grid">
-        ${{renderRunMetadataCard(run, findings, status, detailControls, runningMessage, currentHint, resumeHint)}}
-        ${{renderFindingsSection(findings)}}
-      </div>`;
     }}
 
     function renderRunMetadataCard(run, findings, status, detailControls, runningMessage, currentHint, resumeHint) {{
       const counts = run.verdict_counts || {{}};
       const providers = run.llm_providers || {{}};
       const agents = run.agent_configs || {{}};
-      const collapsed = state.runMetadataCollapsed;
-      return `<div class="overview-card metadata-card">
-        <div class="overview-head">
-          <h3>运行元数据</h3>
+      return `<div class="detail metadata-section">
+        <h3>运行元数据</h3>
+        <div class="detail-body">
           <div class="chips">
             <span class="chip">${{esc(statusLabel(status))}}</span>
             <span class="chip">${{esc(findings.length)}} 个发现</span>
-            <button type="button" data-run-metadata-toggle="true" aria-expanded="${{collapsed ? 'false' : 'true'}}">${{collapsed ? '展开' : '收起'}}</button>
           </div>
-        </div>
-        <div class="overview-body ${{collapsed ? 'collapsed' : ''}}">
           <div class="overview-summary">
             <div class="overview-metric"><div class="label">发现数</div><div class="value">${{esc(run.finding_count || findings.length)}}</div></div>
             <div class="overview-metric"><div class="label">真实漏洞</div><div class="value">${{counts.TRUE_POSITIVE || 0}}</div></div>
@@ -3408,12 +3415,13 @@ def app_html() -> str:
     }}
 
     function renderFindingsOverview(findings) {{
-      return `<div class="overview-card findings-card">
-        <div class="overview-head">
-          <h3>漏洞发现</h3>
-          <span class="muted">${{esc(findings.length)}} 个</span>
-        </div>
-        <div class="overview-body">
+      return `<div class="detail findings-section" id="findings-section">
+        <h3>漏洞发现</h3>
+        <div class="detail-body">
+          <div class="chips">
+            <span class="chip">${{esc(findings.length)}} 个发现</span>
+            <span class="chip">默认完整展示</span>
+          </div>
           ${{findings.length ? `<div class="findings-table-wrap">
             <table>
               <thead><tr><th>结论</th><th>规则</th><th>置信度</th><th>摘要</th></tr></thead>
@@ -3431,23 +3439,37 @@ def app_html() -> str:
       </div>`;
     }}
 
-    function renderFindingsSection(findings) {{
-      return renderFindingsOverview(findings);
+    function renderFindingWorkspace(run, findings, status, detailControls, runningMessage, currentHint, resumeHint, emptyMessage) {{
+      return `
+        ${{renderRunMetadataCard(run, findings, status, detailControls, runningMessage, currentHint, resumeHint)}}
+        <div class="selected-finding-sticky hidden" id="selected-finding-sticky"></div>
+        ${{findings.length ? renderFindingsSection(findings) : `<div class="empty">${{esc(emptyMessage)}}</div>`}}
+        ${{findings.length ? '<div id="finding-detail"></div>' : ''}}
+      `;
     }}
 
-    function bindRunOverviewControls() {{
-      const button = el.overview.querySelector('[data-run-metadata-toggle]');
-      if (!button) return;
-      button.addEventListener('click', () => {{
-        state.runMetadataCollapsed = !state.runMetadataCollapsed;
-        try {{
-          window.localStorage.setItem('vulnJudgerRunMetadataCollapsed', state.runMetadataCollapsed ? 'true' : 'false');
-        }} catch (_error) {{}}
-        const body = el.overview.querySelector('.metadata-card .overview-body');
-        if (body) body.classList.toggle('collapsed', state.runMetadataCollapsed);
-        button.textContent = state.runMetadataCollapsed ? '展开' : '收起';
-        button.setAttribute('aria-expanded', state.runMetadataCollapsed ? 'false' : 'true');
-      }});
+    function renderSelectedFindingSticky(finding) {{
+      if (!finding) return '';
+      const index = selectedFindingIndex();
+      const total = (state.currentFindings || []).length;
+      return `
+        <button type="button" class="finding-nav-button" data-finding-nav="prev" title="上一个漏洞" ${{index <= 0 ? 'disabled' : ''}}>‹</button>
+        <div class="selected-finding-main">
+          <div class="chips">
+            <span class="chip ${{verdictClass(finding.verdict)}}">${{esc(verdictLabel(finding.verdict))}}</span>
+            <span class="chip">${{esc(index + 1)}} / ${{esc(total)}}</span>
+            <span class="chip">置信度 ${{esc(finding.confidence)}}</span>
+            <span class="chip">${{esc(finding.rule_id)}}</span>
+          </div>
+          <div><strong>当前漏洞：</strong> <span class="plain-inline">${{plainInlineText(finding.summary || finding.finding_id || '')}}</span></div>
+          <div class="path">${{esc((finding.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div>
+        </div>
+        <button type="button" class="finding-nav-button" data-finding-nav="next" title="下一个漏洞" ${{index >= total - 1 ? 'disabled' : ''}}>›</button>
+      `;
+    }}
+
+    function renderFindingsSection(findings) {{
+      return renderFindingsOverview(findings);
     }}
 
     function bindRunControlButtons(root) {{
@@ -3490,7 +3512,7 @@ def app_html() -> str:
     }}
 
     function bindFindingRows(findings) {{
-      for (const row of el.overview.querySelectorAll('tr[data-finding-id]')) {{
+      for (const row of el.detail.querySelectorAll('tr[data-finding-id]')) {{
         row.addEventListener('click', () => selectFinding(row.dataset.findingId));
       }}
       if (!findings.length) return;
@@ -3549,21 +3571,68 @@ def app_html() -> str:
     async function selectFinding(findingId) {{
       state.selectedFinding = findingId;
       markSelectedFindingRow(findingId);
+      updateSelectedFindingSticky();
       const container = document.getElementById('finding-detail');
       if (!container) return;
       container.innerHTML = '<div class="empty">正在加载发现详情...</div>';
       try {{
         const detail = await fetchJson(`/runs/${{encodeURIComponent(state.selectedRun)}}/findings/${{encodeURIComponent(findingId)}}`);
         container.innerHTML = renderFindingDetail(detail);
+        updateSelectedFindingSticky();
       }} catch (error) {{
         container.innerHTML = `<div class="empty error">${{esc(error.message)}}</div>`;
       }}
     }}
 
     function markSelectedFindingRow(findingId) {{
-      for (const row of el.overview.querySelectorAll('tr[data-finding-id]')) {{
+      for (const row of el.detail.querySelectorAll('tr[data-finding-id]')) {{
         row.classList.toggle('active', row.dataset.findingId === findingId);
       }}
+    }}
+
+    function selectedFindingSummary() {{
+      return (state.currentFindings || []).find(item => item.finding_id === state.selectedFinding) || null;
+    }}
+
+    function selectedFindingIndex() {{
+      return (state.currentFindings || []).findIndex(item => item.finding_id === state.selectedFinding);
+    }}
+
+    function updateSelectedFindingSticky() {{
+      const sticky = document.getElementById('selected-finding-sticky');
+      if (!sticky) return;
+      const finding = selectedFindingSummary();
+      sticky.innerHTML = renderSelectedFindingSticky(finding);
+      bindStickyFindingNav();
+      updateStickyFindingVisibility();
+    }}
+
+    function bindStickyFindingNav() {{
+      const sticky = document.getElementById('selected-finding-sticky');
+      if (!sticky) return;
+      for (const button of sticky.querySelectorAll('[data-finding-nav]')) {{
+        button.addEventListener('click', () => switchFinding(button.dataset.findingNav === 'prev' ? -1 : 1));
+      }}
+    }}
+
+    function switchFinding(delta) {{
+      const findings = state.currentFindings || [];
+      if (!findings.length) return;
+      const index = selectedFindingIndex();
+      const nextIndex = Math.min(Math.max((index < 0 ? 0 : index) + delta, 0), findings.length - 1);
+      const next = findings[nextIndex];
+      if (!next || next.finding_id === state.selectedFinding) return;
+      selectFinding(next.finding_id);
+    }}
+
+    function updateStickyFindingVisibility() {{
+      const sticky = document.getElementById('selected-finding-sticky');
+      const section = document.getElementById('findings-section');
+      if (!sticky || !section || !selectedFindingSummary()) return;
+      const containerRect = el.detailScroll.getBoundingClientRect();
+      const sectionRect = section.getBoundingClientRect();
+      const shouldShow = sectionRect.bottom <= containerRect.top + 8;
+      sticky.classList.toggle('hidden', !shouldShow);
     }}
 
     function findingReportEvidence(detail) {{
@@ -3926,6 +3995,7 @@ def app_html() -> str:
     function renderEmpty(message) {{
       el.title.textContent = '运行详情';
       el.status.textContent = '未选择任务';
+      state.currentFindings = [];
       el.overview.innerHTML = '';
       el.detail.innerHTML = `<div class="empty">${{esc(message)}}</div>`;
     }}
