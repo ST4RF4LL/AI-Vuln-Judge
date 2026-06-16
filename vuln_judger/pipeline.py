@@ -93,6 +93,7 @@ def run_judgement(
         enabled=config.enable_external_tools,
         auto_index=config.auto_index_tools,
         mcp_servers_file=config.mcp_servers_file,
+        agent_managed_atlas=config.enable_llm,
     )
     collector = EvidenceCollector(
         indexer=indexer,
@@ -109,6 +110,9 @@ def run_judgement(
         affirmative_agent=config.affirmative_agent,
         negative_agent=config.negative_agent,
         moderator_agent=config.moderator_agent,
+        source_path=source_path,
+        mcp_servers_file=config.mcp_servers_file,
+        enable_atlas_tools=config.enable_external_tools,
     )
     llm_providers = _llm_provider_metadata(
         config.enable_llm,
@@ -203,6 +207,9 @@ def run_judgement(
             negative_agent=config.negative_agent,
             moderator_agent=config.moderator_agent,
             progress_callback=on_finding_progress,
+            source_path=source_path,
+            mcp_servers_file=config.mcp_servers_file,
+            enable_atlas_tools=config.enable_external_tools,
         )
         verdict = orchestrator.adjudicate(bundle)
         reports.append(verdict)

@@ -21,6 +21,7 @@ class AnalyzerSettings:
     auto_index: bool = False
     timeout_seconds: int = 120
     mcp_servers_file: Optional[Path] = None
+    agent_managed_atlas: bool = False
 
     def __post_init__(self) -> None:
         raw = os.environ.get("VULN_JUDGER_ATLAS_MCP_TIMEOUT") or os.environ.get("VULN_JUDGER_MCP_TIMEOUT")
@@ -78,6 +79,22 @@ class AtlasAnalyzer(Analyzer):
         resolved_locations = self._resolved_locations(finding, indexer)
         atlas_db = indexer.source_root / ".atlas" / "atlas.db"
         diagnostics: List[CodeEvidence] = []
+        if settings.agent_managed_atlas:
+            diagnostics.append(
+                CodeEvidence(
+                    evidence_id=evidence_id(finding.finding_id, self.name, "agent-managed"),
+                    kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                    strength=EvidenceStrength.MEDIUM,
+                    summary="启用 LLM Agent 自主 Atlas MCP 调用；预分析器不执行固定 Atlas MCP trace/calls 流程",
+                    source=self.name,
+                    data={
+                        "agent_managed_atlas": True,
+                        "database": str(atlas_db) if atlas_db.exists() else None,
+                        "focus_runtime": True,
+                    },
+                )
+            )
+            return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
         mcp_supported = self._supports_mcp(settings)
         if not mcp_supported:
             if settings.auto_index and self.binary:
@@ -99,7 +116,7 @@ class AtlasAnalyzer(Analyzer):
                     evidence_id=evidence_id(finding.finding_id, self.name, "database-present"),
                     kind=EvidenceKind.TOOL_DIAGNOSTIC,
                     strength=EvidenceStrength.MEDIUM,
-                    summary="检测到 Atlas 持久缓存 .atlas/atlas.db，将通过 AI 自主 Atlas MCP 输出数据流、调用图和源码上下文",
+                    summary="检测到 Atlas 持久缓存 .atlas/atlas.db，将通过 Atlas MCP 预分析输出数据流、调用图和源码上下文",
                     source=self.name,
                     data={"database": str(atlas_db), "mcp_preferred": True, "focus_runtime": True},
                 )
@@ -275,7 +292,7 @@ class AtlasAnalyzer(Analyzer):
                         kind=EvidenceKind.TOOL_DIAGNOSTIC,
                         strength=EvidenceStrength.MEDIUM,
                         summary=(
-                            "AI 自主 Atlas MCP 补证启动：基于报告文本、路径片段和符号生成查询计划；"
+                            "Atlas MCP 预分析补证启动：基于报告文本、路径片段和符号生成查询计划；"
                             f"候选词 {', '.join(terms[:8]) or '无'}；候选路径 {', '.join(path_prefixes[:5]) or '无'}"
                         ),
                         source="atlas-agent-mcp",
@@ -294,28 +311,59 @@ class AtlasAnalyzer(Analyzer):
                     status_payload, status_text, status_error = _safe_mcp_tool_payload(client, "project", {"action": "status", "verbose": True})
                     evidence.append(self._agentic_status_evidence(finding, status_payload, status_text, status_error))
                     evidence.extend(self._agentic_file_evidence(client, finding, indexer, path_prefixes))
+                focus_scan_state: Dict[str, Any] = {"attempted": False, "succeeded": False, "project_path": str(indexer.source_root)}
                 if "search" in tools:
-                    search_results = self._agentic_search_results(client, terms)
+                    search_scopes = _agentic_focus_scopes(
+                        [item.relative_path for item in resolved_locations] + list(path_prefixes)
+                    )
+                    search_results = self._agentic_search_results(client, terms, search_scopes)
                     if search_results:
                         evidence.append(_agentic_search_evidence(finding, search_results))
                         trace_locations = _agentic_locations_from_search(search_results, limit=6)
                         if "trace" in tools:
-                            evidence.extend(self._agentic_trace_evidence(client, finding, trace_locations))
+                            evidence.extend(
+                                self._agentic_trace_evidence(
+                                    client,
+                                    finding,
+                                    trace_locations,
+                                    tools,
+                                    settings,
+                                    focus_scan_state,
+                                )
+                            )
                         if "calls" in tools:
-                            evidence.extend(self._agentic_call_evidence(client, finding, search_results))
+                            evidence.extend(
+                                self._agentic_call_evidence(
+                                    client,
+                                    finding,
+                                    search_results,
+                                    tools,
+                                    settings,
+                                    focus_scan_state,
+                                )
+                            )
                     else:
                         evidence.append(
                             CodeEvidence(
                                 evidence_id=evidence_id(finding.finding_id, self.name, "agentic-search-empty", ",".join(terms[:8])),
                                 kind=EvidenceKind.TOOL_DIAGNOSTIC,
                                 strength=EvidenceStrength.WEAK,
-                                summary="AI 自主 Atlas MCP search 未找到报告相关符号或路径候选",
+                                summary="Atlas MCP 预分析 search 未找到报告相关符号或路径候选",
                                 source="atlas-agent-mcp",
                                 data={"transport": "mcp", "mcp_tool": "search", "mcp_success": False, "query_terms": terms},
                             )
                         )
                 if resolved_locations and "trace" in tools:
-                    evidence.extend(self._agentic_trace_evidence(client, finding, [_display_resolved_location(item) for item in resolved_locations[:4]]))
+                    evidence.extend(
+                        self._agentic_trace_evidence(
+                            client,
+                            finding,
+                            [_display_resolved_location(item) for item in resolved_locations[:4]],
+                            tools,
+                            settings,
+                            focus_scan_state,
+                        )
+                    )
                 return evidence
         except (MCPError, OSError, ValueError) as exc:
             return [
@@ -323,7 +371,7 @@ class AtlasAnalyzer(Analyzer):
                     evidence_id=evidence_id(finding.finding_id, self.name, "agentic-mcp-failed"),
                     kind=EvidenceKind.TOOL_DIAGNOSTIC,
                     strength=EvidenceStrength.WEAK,
-                    summary=f"AI 自主 Atlas MCP 补证失败：{exc}",
+                    summary=f"Atlas MCP 预分析补证失败：{exc}",
                     source="atlas-agent-mcp",
                     data={"transport": "mcp", "agentic_atlas": True, "mcp_success": False},
                 )
@@ -333,14 +381,18 @@ class AtlasAnalyzer(Analyzer):
         self, client: MCPStdioClient, finding: Finding, indexer: SourceIndexer, settings: AnalyzerSettings
     ) -> CodeEvidence:
         storage = "persistent" if settings.auto_index else "auto"
-        arguments = {"action": "open", "project_path": str(indexer.source_root), "storage": storage}
+        arguments = {
+            "action": "open",
+            "project_path": str(indexer.source_root),
+            "storage": storage,
+        }
         payload, raw_text, is_error = _safe_mcp_tool_payload(client, "project", arguments)
         if is_error or not isinstance(payload, dict):
             return CodeEvidence(
                 evidence_id=evidence_id(finding.finding_id, self.name, "agentic-open"),
                 kind=EvidenceKind.TOOL_DIAGNOSTIC,
                 strength=EvidenceStrength.WEAK,
-                summary="AI 自主 Atlas MCP project/open 未确认项目激活；将继续使用 MCP 启动目录尝试查询"
+                summary="Atlas MCP 预分析 project/open 未确认项目激活；将继续使用 MCP 启动目录尝试查询"
                 + (f"：{raw_text[:240]}" if raw_text else ""),
                 source="atlas-agent-mcp",
                 data={
@@ -358,7 +410,7 @@ class AtlasAnalyzer(Analyzer):
             evidence_id=evidence_id(finding.finding_id, self.name, "agentic-open"),
             kind=EvidenceKind.TOOL_DIAGNOSTIC,
             strength=EvidenceStrength.MEDIUM,
-            summary=f"AI 自主 Atlas MCP project/open 已激活项目：storage={storage}",
+            summary=f"Atlas MCP 预分析 project/open 已激活项目：storage={storage}",
             source="atlas-agent-mcp",
             data={
                 "transport": "mcp",
@@ -381,7 +433,7 @@ class AtlasAnalyzer(Analyzer):
                 evidence_id=evidence_id(finding.finding_id, self.name, "agentic-status"),
                 kind=EvidenceKind.TOOL_DIAGNOSTIC,
                 strength=EvidenceStrength.WEAK,
-                summary="AI 自主 Atlas MCP project/status 未返回可解析状态" + (f"：{raw_text[:240]}" if raw_text else ""),
+                summary="Atlas MCP 预分析 project/status 未返回可解析状态" + (f"：{raw_text[:240]}" if raw_text else ""),
                 source="atlas-agent-mcp",
                 data={"transport": "mcp", "mcp_tool": "project/status", "mcp_success": False, "raw": raw_text[:1000]},
             )
@@ -397,7 +449,7 @@ class AtlasAnalyzer(Analyzer):
             evidence_id=evidence_id(finding.finding_id, self.name, "agentic-status"),
             kind=EvidenceKind.TOOL_DIAGNOSTIC,
             strength=EvidenceStrength.MEDIUM,
-            summary="AI 自主 Atlas MCP project/status 确认项目状态" + ("：" + "，".join(bits) if bits else ""),
+            summary="Atlas MCP 预分析 project/status 确认项目状态" + ("：" + "，".join(bits) if bits else ""),
             source="atlas-agent-mcp",
             data={
                 "transport": "mcp",
@@ -439,7 +491,7 @@ class AtlasAnalyzer(Analyzer):
                 evidence_id=evidence_id(finding.finding_id, self.name, "agentic-files", *sorted(matched)[:12]),
                 kind=EvidenceKind.SOURCE_LOCATION,
                 strength=EvidenceStrength.MEDIUM,
-                summary="AI 自主 Atlas MCP project/files 找到报告路径候选：" + status_text,
+                summary="Atlas MCP 预分析 project/files 找到报告路径候选：" + status_text,
                 source="atlas-agent-mcp",
                 locations=locations,
                 data={
@@ -453,11 +505,22 @@ class AtlasAnalyzer(Analyzer):
             )
         ]
 
-    def _agentic_search_results(self, client: MCPStdioClient, terms: Sequence[str]) -> List[Dict[str, Any]]:
+    def _agentic_search_results(
+        self, client: MCPStdioClient, terms: Sequence[str], scopes: Sequence[str] = ()
+    ) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
         seen: set[tuple[str, str, int]] = set()
-        for term in terms[:12]:
-            payload, _, is_error = _safe_mcp_tool_payload(client, "search", {"query": term, "limit": 10})
+        search_specs: List[Dict[str, Any]] = []
+        focus_scopes = _agentic_focus_scopes(scopes, limit=8)
+        if focus_scopes:
+            for scope in focus_scopes[:6]:
+                for term in terms[:4]:
+                    search_specs.append({"query": term, "scope": scope, "limit": 10})
+        else:
+            for term in terms[:8]:
+                search_specs.append({"query": term, "limit": 10})
+        for arguments in search_specs[:32]:
+            payload, _, is_error = _safe_mcp_tool_payload(client, "search", arguments)
             if is_error or not isinstance(payload, dict):
                 continue
             for item in _mcp_results(payload):
@@ -468,30 +531,61 @@ class AtlasAnalyzer(Analyzer):
                     continue
                 seen.add(marker)
                 copied = dict(item)
-                copied["query"] = term
+                copied["query"] = arguments.get("query")
+                if arguments.get("scope"):
+                    copied["scope"] = arguments.get("scope")
                 results.append(copied)
                 if len(results) >= 30:
                     return results
+            if focus_scopes and results:
+                return results
         return results
 
     def _agentic_trace_evidence(
-        self, client: MCPStdioClient, finding: Finding, locations: Sequence[SourceLocation]
+        self,
+        client: MCPStdioClient,
+        finding: Finding,
+        locations: Sequence[SourceLocation],
+        tools: set[Any],
+        settings: AnalyzerSettings,
+        focus_scan_state: Dict[str, Any],
     ) -> List[CodeEvidence]:
         evidence: List[CodeEvidence] = []
         for location in locations[:6]:
             if not location.file or not location.line:
                 continue
             column = location.column or 1
-            for trace_kind in ("point", "variable"):
-                arguments: Dict[str, Any] = {
-                    "kind": trace_kind,
-                    "file_path": location.file,
-                    "line": location.line,
-                    "column": column,
-                }
-                if trace_kind == "variable":
-                    arguments["max_depth"] = 30
+            trace_kinds = ["point", "variable"]
+            if location.symbol:
+                trace_kinds.append("callers")
+            for trace_kind in trace_kinds:
+                if trace_kind == "callers":
+                    arguments = {"kind": trace_kind, "symbol": location.symbol, "max_depth": 12}
+                else:
+                    arguments = {
+                        "kind": trace_kind,
+                        "file_path": location.file,
+                        "line": location.line,
+                        "column": column,
+                    }
+                    if trace_kind == "variable":
+                        arguments["max_depth"] = 30
                 payload, raw_text, is_error = _safe_mcp_tool_payload(client, "trace", arguments)
+                retried_after_focus_scan = False
+                if _mcp_needs_materialized_facts(payload, raw_text):
+                    focus_scan_evidence = self._agentic_focus_rescan_evidence(
+                        client,
+                        finding,
+                        tools,
+                        settings,
+                        focus_scan_state,
+                        "trace",
+                        [location.file],
+                    )
+                    evidence.extend(focus_scan_evidence)
+                    if focus_scan_state.get("succeeded"):
+                        payload, raw_text, is_error = _safe_mcp_tool_payload(client, "trace", arguments)
+                        retried_after_focus_scan = True
                 item = _mcp_trace_item(
                     finding,
                     trace_kind,
@@ -510,13 +604,25 @@ class AtlasAnalyzer(Analyzer):
                     str(location.line),
                     str(column),
                 )
-                item.summary = "AI 自主 " + item.summary
+                if item.summary.startswith("Atlas MCP "):
+                    item.summary = "Atlas MCP 预分析 " + item.summary[len("Atlas MCP ") :]
+                else:
+                    item.summary = "预分析 " + item.summary
                 item.data["agentic_atlas"] = True
+                if retried_after_focus_scan:
+                    item.summary += "；已在 MCP Focus scoped search 触发项目事实后重试"
+                    item.data["focus_scan_retry"] = True
                 evidence.append(item)
         return evidence
 
     def _agentic_call_evidence(
-        self, client: MCPStdioClient, finding: Finding, search_results: Sequence[Dict[str, Any]]
+        self,
+        client: MCPStdioClient,
+        finding: Finding,
+        search_results: Sequence[Dict[str, Any]],
+        tools: set[Any],
+        settings: AnalyzerSettings,
+        focus_scan_state: Dict[str, Any],
     ) -> List[CodeEvidence]:
         evidence: List[CodeEvidence] = []
         seen: set[str] = set()
@@ -526,6 +632,25 @@ class AtlasAnalyzer(Analyzer):
                 continue
             seen.add(qname)
             payload, raw_text, is_error = _safe_mcp_tool_payload(client, "calls", {"symbol": qname, "direction": "both", "depth": 2, "limit": 30})
+            retried_after_focus_scan = False
+            if _mcp_needs_materialized_facts(payload, raw_text):
+                focus_scan_evidence = self._agentic_focus_rescan_evidence(
+                    client,
+                    finding,
+                    tools,
+                    settings,
+                    focus_scan_state,
+                    "calls",
+                    [str(result.get("file") or "")],
+                )
+                evidence.extend(focus_scan_evidence)
+                if focus_scan_state.get("succeeded"):
+                    payload, raw_text, is_error = _safe_mcp_tool_payload(
+                        client,
+                        "calls",
+                        {"symbol": qname, "direction": "both", "depth": 2, "limit": 30},
+                    )
+                    retried_after_focus_scan = True
             location = SourceLocation(
                 file=str(result.get("file") or ""),
                 line=_optional_int(result.get("line")),
@@ -537,7 +662,7 @@ class AtlasAnalyzer(Analyzer):
                         evidence_id=evidence_id(finding.finding_id, self.name, "agentic-calls", qname),
                         kind=EvidenceKind.TOOL_DIAGNOSTIC,
                         strength=EvidenceStrength.WEAK,
-                        summary=f"AI 自主 Atlas MCP calls 未能解析 `{qname}` 的调用图：{raw_text[:240]}",
+                        summary=f"Atlas MCP 预分析 calls 未能解析 `{qname}` 的调用图：{raw_text[:240]}",
                         source="atlas-agent-mcp",
                         locations=[location] if location.file else [],
                         data={"transport": "mcp", "mcp_tool": "calls", "mcp_success": False, "agentic_atlas": True, "symbols": [qname]},
@@ -555,7 +680,10 @@ class AtlasAnalyzer(Analyzer):
                     evidence_id=evidence_id(finding.finding_id, self.name, "agentic-calls", qname),
                     kind=EvidenceKind.CALL_CHAIN,
                     strength=EvidenceStrength.MEDIUM,
-                    summary=f"AI 自主 Atlas MCP calls 提取 `{qname}` 调用图：调用方 {len(callers)} 个，被调用方 {len(callees)} 个",
+                    summary=(
+                        f"Atlas MCP 预分析 calls 提取 `{qname}` 调用图：调用方 {len(callers)} 个，被调用方 {len(callees)} 个"
+                        + ("；已在 MCP Focus scoped search 触发项目事实后重试" if retried_after_focus_scan else "")
+                    ),
                     source="atlas-agent-mcp",
                     locations=locations,
                     data={
@@ -563,6 +691,7 @@ class AtlasAnalyzer(Analyzer):
                         "mcp_tool": "calls",
                         "mcp_success": True,
                         "agentic_atlas": True,
+                        "focus_scan_retry": retried_after_focus_scan,
                         "symbols": [qname],
                         "callers": callers[:10],
                         "callees": callees[:10],
@@ -570,6 +699,120 @@ class AtlasAnalyzer(Analyzer):
                 )
             )
         return evidence
+
+    def _agentic_focus_rescan_evidence(
+        self,
+        client: MCPStdioClient,
+        finding: Finding,
+        tools: set[Any],
+        settings: AnalyzerSettings,
+        focus_scan_state: Dict[str, Any],
+        reason: str,
+        focus_paths: Sequence[str],
+    ) -> List[CodeEvidence]:
+        if focus_scan_state.get("attempted"):
+            return []
+        focus_scan_state["attempted"] = True
+        if "search" not in tools:
+            return [
+                CodeEvidence(
+                    evidence_id=evidence_id(finding.finding_id, self.name, "agentic-focus-rescan", "project-missing"),
+                    kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                    strength=EvidenceStrength.WEAK,
+                    summary=(
+                        "Atlas MCP 返回 No project facts have been materialized yet，"
+                        "但当前 MCP Server 未暴露 search 工具，无法通过 scoped search 触发 Focus 分析"
+                    ),
+                    source="atlas-agent-mcp",
+                    data={
+                        "transport": "mcp",
+                        "mcp_tool": "search",
+                        "mcp_success": False,
+                        "agentic_atlas": True,
+                        "focus_scan_reason": reason,
+                        "tools": sorted(str(tool) for tool in tools),
+                    },
+                )
+            ]
+
+        terms = _agentic_query_terms(finding, limit=8)
+        scopes = _agentic_focus_scopes(list(focus_paths) + _agentic_path_prefixes(finding), limit=8)
+        search_attempts: List[Dict[str, Any]] = []
+        search_ok = False
+        for arguments in _focus_search_specs(terms, scopes, limit=24):
+            payload, raw_text, is_error = _safe_mcp_tool_payload(client, "search", arguments)
+            results = _mcp_results(payload) if isinstance(payload, dict) else []
+            search_attempts.append(
+                {
+                    "arguments": arguments,
+                    "ok": not is_error,
+                    "result_count": len(results),
+                    "raw": raw_text[:500],
+                }
+            )
+            if not is_error:
+                search_ok = True
+            if search_ok and results:
+                break
+
+        files_results: List[Dict[str, Any]] = []
+        if "project" in tools:
+            for focus_path in scopes[:6]:
+                files_payload, files_raw, files_error = _safe_mcp_tool_payload(
+                    client,
+                    "project",
+                    {"action": "files", "path_prefix": focus_path, "limit": 20},
+                )
+                files_results.append(
+                    {
+                        "path_prefix": focus_path,
+                        "ok": not files_error,
+                        "raw": files_raw[:500],
+                        "files": _mcp_files(files_payload) if isinstance(files_payload, dict) else [],
+                    }
+                )
+
+        status_payload: Any = None
+        status_raw = ""
+        status_error = False
+        if "project" in tools:
+            status_payload, status_raw, status_error = _safe_mcp_tool_payload(
+                client,
+                "project",
+                {"action": "status", "verbose": True},
+            )
+
+        success = search_ok and not _mcp_needs_materialized_facts(status_payload, status_raw)
+        focus_scan_state["succeeded"] = success
+        summary = "Atlas MCP 预分析 Focus scoped search "
+        if success:
+            summary += f"已触发项目事实；触发原因：{reason} 返回 No project facts have been materialized yet"
+        else:
+            details = next((item.get("raw") for item in search_attempts if item.get("raw")), "") or status_raw
+            summary += "触发项目事实失败"
+            if details:
+                summary += f"：{details[:240]}"
+        return [
+            CodeEvidence(
+                evidence_id=evidence_id(finding.finding_id, self.name, "agentic-focus-rescan", reason),
+                kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                strength=EvidenceStrength.MEDIUM if success else EvidenceStrength.WEAK,
+                summary=summary,
+                source="atlas-agent-mcp",
+                data={
+                    "transport": "mcp",
+                    "mcp_tool": "search",
+                    "mcp_success": success,
+                    "agentic_atlas": True,
+                    "focus_scan_reason": reason,
+                    "search_attempts": search_attempts,
+                    "focus_paths": list(focus_paths),
+                    "files_results": files_results,
+                    "status": status_payload if isinstance(status_payload, dict) and not status_error else None,
+                    "status_raw": status_raw[:1000],
+                },
+            )
+        ]
 
     def _agentic_source_reading_evidence(self, finding: Finding, indexer: SourceIndexer) -> List[CodeEvidence]:
         terms = _agentic_query_terms(finding)
@@ -759,15 +1002,21 @@ class AtlasAnalyzer(Analyzer):
         for resolved in resolved_locations[:6]:
             line = resolved.requested.line or 1
             column = _trace_column(indexer, resolved, line)
-            for trace_kind in ("point", "variable"):
-                arguments: Dict[str, Any] = {
-                    "kind": trace_kind,
-                    "file_path": resolved.relative_path,
-                    "line": line,
-                    "column": column,
-                }
-                if trace_kind == "variable":
-                    arguments["max_depth"] = 30
+            trace_kinds = ["point", "variable"]
+            if resolved.symbol:
+                trace_kinds.append("callers")
+            for trace_kind in trace_kinds:
+                if trace_kind == "callers":
+                    arguments = {"kind": trace_kind, "symbol": resolved.symbol, "max_depth": 12}
+                else:
+                    arguments = {
+                        "kind": trace_kind,
+                        "file_path": resolved.relative_path,
+                        "line": line,
+                        "column": column,
+                    }
+                    if trace_kind == "variable":
+                        arguments["max_depth"] = 30
                 payload, raw_text, is_error = _safe_mcp_tool_payload(client, "trace", arguments)
                 evidence.append(
                     _mcp_trace_item(
@@ -1001,6 +1250,30 @@ def _mcp_tool_payload(response: Dict[str, Any]) -> tuple[Any, str, bool]:
     return parsed if parsed is not None else text, text, is_error
 
 
+def _mcp_needs_materialized_facts(payload: Any, raw_text: str = "") -> bool:
+    text = " ".join([raw_text or "", _mcp_error_text(payload)]).lower()
+    return "no project facts have been materialized yet" in text
+
+
+def _mcp_error_text(value: Any) -> str:
+    if value in (None, "", [], {}):
+        return ""
+    if isinstance(value, str):
+        return value[:2000]
+    if isinstance(value, dict):
+        chunks = []
+        for key in ("error", "message", "diagnostic", "diagnostics", "raw"):
+            if key in value:
+                chunks.append(_mcp_error_text(value.get(key)))
+        result = value.get("result")
+        if isinstance(result, dict):
+            chunks.append(_mcp_error_text(result))
+        return " ".join(chunk for chunk in chunks if chunk)[:4000]
+    if isinstance(value, list):
+        return " ".join(_mcp_error_text(item) for item in value[:20])[:4000]
+    return str(value)[:1000]
+
+
 _TRACE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][\w:]*")
 _TRACE_SKIP_IDENTIFIERS = {
     "auto",
@@ -1144,7 +1417,15 @@ def _mcp_trace_item(
     ok = bool(payload.get("ok"))
     partial = bool(payload.get("partial_result"))
     diagnostics = _mcp_diagnostic_messages(payload.get("diagnostics"))
-    kind = EvidenceKind.DATA_FLOW if trace_kind == "variable" and ok else EvidenceKind.TOOL_DIAGNOSTIC
+    focus_locations = _locations_from_mcp_trace_payload(payload)
+    locations = _dedupe_locations([location] + focus_locations)
+    has_focus_path = _mcp_trace_payload_has_path_facts(payload)
+    if ok and trace_kind == "callers" and (has_focus_path or focus_locations):
+        kind = EvidenceKind.CALL_CHAIN
+    elif ok and (trace_kind in {"variable", "forward"} or has_focus_path):
+        kind = EvidenceKind.DATA_FLOW
+    else:
+        kind = EvidenceKind.TOOL_DIAGNOSTIC
     if ok and not partial and not diagnostics:
         strength = EvidenceStrength.MEDIUM
     elif ok:
@@ -1167,6 +1448,8 @@ def _mcp_trace_item(
     work = payload.get("work")
     if isinstance(work, dict) and work:
         summary += "，包含 Focus 后台工作信息"
+    if focus_locations:
+        summary += f"，已提取 Focus 路径位置 {len(focus_locations)} 个"
     return CodeEvidence(
         evidence_id=evidence_id(
             finding.finding_id,
@@ -1201,6 +1484,8 @@ def _mcp_trace_item(
             "trace_file": location.file,
             "trace_line": location.line,
             "trace_column": location.column,
+            "focus_path": [item.display() for item in focus_locations],
+            "focus_path_facts": has_focus_path,
             "result": _compact_mcp_trace_result(payload.get("result")),
         },
     )
@@ -1237,16 +1522,144 @@ def _choose_mcp_symbol(candidates: Sequence[Dict[str, Any]], relative_path: str,
 def _mcp_call_entries(payload: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
     seen = set()
+    roots = _mcp_payload_roots(payload)
+    aliases = [key]
+    if key == "callers":
+        aliases.extend(["incoming", "sources", "predecessors"])
+    elif key == "callees":
+        aliases.extend(["outgoing", "targets", "successors"])
+    for root in roots:
+        for alias in aliases:
+            for item in _coerce_list(root.get(alias)):
+                entry = _mcp_entry_from_value(item)
+                if entry:
+                    marker = (entry.get("qualified_name"), entry.get("file"), entry.get("line"), entry.get("edge"))
+                    if marker not in seen:
+                        seen.add(marker)
+                        entries.append(entry)
+        for hop in _coerce_list(root.get("hops")):
+            if not isinstance(hop, dict):
+                continue
+            for item in _coerce_list(hop.get(key)):
+                entry = _mcp_entry_from_value(item)
+                if entry:
+                    marker = (entry.get("qualified_name"), entry.get("file"), entry.get("line"), entry.get("edge"))
+                    if marker not in seen:
+                        seen.add(marker)
+                        entries.append(entry)
+        node_lookup = _mcp_node_lookup(root)
+        for edge in _coerce_list(root.get("edges")) + _coerce_list(root.get("relationships")):
+            entry = _mcp_entry_from_edge(edge, key, node_lookup)
+            if entry:
+                marker = (entry.get("qualified_name"), entry.get("file"), entry.get("line"), entry.get("edge"))
+                if marker not in seen:
+                    seen.add(marker)
+                    entries.append(entry)
+        for item in _mcp_path_entries(root, key):
+            marker = (item.get("qualified_name"), item.get("file"), item.get("line"), item.get("edge"))
+            if marker not in seen:
+                seen.add(marker)
+                entries.append(item)
+    return entries
+
+
+def _mcp_payload_roots(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    roots = [payload]
     result = _mcp_result_dict(payload)
-    for hop in payload.get("hops") or result.get("hops") or []:
-        for item in hop.get(key) or []:
-            if not isinstance(item, dict):
-                continue
-            marker = (item.get("qualified_name"), item.get("file"), item.get("line"))
-            if marker in seen:
-                continue
-            seen.add(marker)
-            entries.append(item)
+    if result and result is not payload:
+        roots.append(result)
+    return roots
+
+
+def _coerce_list(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    if value in (None, "", {}):
+        return []
+    return [value]
+
+
+def _mcp_entry_from_value(value: Any, edge: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if isinstance(value, dict):
+        entry = dict(value)
+    elif isinstance(value, str) and value.strip():
+        entry = {"qualified_name": value.strip(), "name": value.strip()}
+    else:
+        return None
+    if edge and not entry.get("edge"):
+        entry["edge"] = edge
+    if not entry.get("qualified_name"):
+        for key in ("symbol", "name", "id"):
+            if entry.get(key):
+                entry["qualified_name"] = str(entry.get(key))
+                break
+    if not entry.get("name") and entry.get("qualified_name"):
+        entry["name"] = str(entry.get("qualified_name")).split(".")[-1].split("::")[-1]
+    return entry if entry.get("qualified_name") or entry.get("file") else None
+
+
+def _mcp_node_lookup(root: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for node in _coerce_list(root.get("nodes")):
+        if not isinstance(node, dict):
+            continue
+        for key in ("id", "symbol", "qualified_name", "name"):
+            value = node.get(key)
+            if value not in (None, ""):
+                lookup[str(value)] = node
+    return lookup
+
+
+def _mcp_entry_from_edge(edge: Any, key: str, nodes: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(edge, dict):
+        return None
+    if key == "callers":
+        raw = edge.get("from") or edge.get("source") or edge.get("caller") or edge.get("caller_symbol")
+    else:
+        raw = edge.get("to") or edge.get("target") or edge.get("callee") or edge.get("callee_symbol")
+    if isinstance(raw, dict):
+        entry = _mcp_entry_from_value(raw, edge=str(edge.get("kind") or edge.get("edge") or "calls"))
+    elif raw not in (None, ""):
+        entry = _mcp_entry_from_value(nodes.get(str(raw)) or str(raw), edge=str(edge.get("kind") or edge.get("edge") or "calls"))
+    else:
+        prefix = "from" if key == "callers" else "to"
+        entry = _mcp_entry_from_value(
+            {
+                "qualified_name": edge.get(f"{prefix}_symbol") or edge.get(f"{prefix}_name"),
+                "name": edge.get(f"{prefix}_name"),
+                "file": edge.get(f"{prefix}_file"),
+                "line": edge.get(f"{prefix}_line"),
+                "edge": edge.get("kind") or edge.get("edge") or "calls",
+            }
+        )
+    return entry
+
+
+def _mcp_path_entries(root: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    raw_paths = []
+    for path_key in ("paths", "path", "chains", "chain"):
+        value = root.get(path_key)
+        if value:
+            if path_key in {"path", "chain"} and isinstance(value, list):
+                raw_paths.append(value)
+            else:
+                raw_paths.extend(_coerce_list(value))
+    for raw_path in raw_paths:
+        if isinstance(raw_path, dict):
+            steps = raw_path.get("steps") or raw_path.get("nodes") or raw_path.get("path") or []
+        else:
+            steps = raw_path
+        step_values = _coerce_list(steps)
+        if not step_values:
+            continue
+        relevant = step_values[:-1] if key == "callers" else step_values[1:]
+        if not relevant and step_values:
+            relevant = step_values
+        for step in relevant:
+            entry = _mcp_entry_from_value(step, edge="path")
+            if entry:
+                entries.append(entry)
     return entries
 
 
@@ -1258,6 +1671,120 @@ def _locations_from_mcp_entries(entries: Sequence[Dict[str, Any]], limit: int) -
             continue
         locations.append(SourceLocation(file=str(file), line=_optional_int(item.get("line"))))
     return locations
+
+
+def _locations_from_mcp_trace_payload(payload: Dict[str, Any]) -> List[SourceLocation]:
+    result = payload.get("result")
+    if result in (None, "", [], {}):
+        return []
+    locations: List[SourceLocation] = []
+    seen: set[tuple[str, Optional[int], Optional[int], Optional[str]]] = set()
+    for value in _walk_mcp_values(result):
+        if not isinstance(value, dict):
+            continue
+        location = _source_location_from_mcp_mapping(value)
+        if location is None:
+            continue
+        marker = (location.file, location.line, location.column, location.symbol)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        locations.append(location)
+        if len(locations) >= 24:
+            break
+    return locations
+
+
+def _walk_mcp_values(value: Any) -> List[Any]:
+    values: List[Any] = []
+    stack = [value]
+    while stack and len(values) < 500:
+        current = stack.pop()
+        values.append(current)
+        if isinstance(current, dict):
+            for child in reversed(list(current.values())):
+                if isinstance(child, (dict, list)):
+                    stack.append(child)
+        elif isinstance(current, list):
+            for child in reversed(current):
+                if isinstance(child, (dict, list)):
+                    stack.append(child)
+    return values
+
+
+def _source_location_from_mcp_mapping(value: Dict[str, Any]) -> Optional[SourceLocation]:
+    file_value = value.get("file") or value.get("file_path") or value.get("relative_path") or value.get("path")
+    if not file_value or not isinstance(file_value, str):
+        return None
+    line = _optional_int(value.get("line") or value.get("start_line") or value.get("startLine"))
+    column = _optional_int(value.get("column") or value.get("start_column") or value.get("startColumn"))
+    range_value = value.get("range")
+    if isinstance(range_value, dict):
+        start = range_value.get("start") or {}
+        if isinstance(start, dict):
+            line = line or _optional_int(start.get("line") or start.get("row"))
+            column = column or _optional_int(start.get("column") or start.get("col"))
+        line = line or _optional_int(range_value.get("start_line") or range_value.get("startLine"))
+        column = column or _optional_int(range_value.get("start_column") or range_value.get("startColumn"))
+    symbol = value.get("qualified_name") or value.get("symbol") or value.get("name")
+    return SourceLocation(
+        file=file_value,
+        line=line,
+        column=column,
+        symbol=str(symbol) if symbol not in (None, "") else None,
+    )
+
+
+def _mcp_trace_payload_has_path_facts(payload: Dict[str, Any]) -> bool:
+    result = payload.get("result")
+    if result in (None, "", [], {}):
+        return False
+    return _mcp_trace_result_has_path_facts(result)
+
+
+def _mcp_trace_result_has_path_facts(value: Any) -> bool:
+    path_keys = {
+        "path",
+        "paths",
+        "steps",
+        "incoming",
+        "outgoing",
+        "edges",
+        "nodes",
+        "sources",
+        "sinks",
+        "flows",
+        "flow",
+        "chain",
+        "chains",
+        "callers",
+        "callees",
+    }
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in path_keys and isinstance(child, (dict, list)) and child:
+                return True
+            if isinstance(child, (dict, list)) and _mcp_trace_result_has_path_facts(child):
+                return True
+    elif isinstance(value, list):
+        if len(value) >= 2 and any(isinstance(item, dict) and _source_location_from_mcp_mapping(item) for item in value):
+            return True
+        return any(_mcp_trace_result_has_path_facts(item) for item in value if isinstance(item, (dict, list)))
+    return False
+
+
+def _dedupe_locations(locations: Sequence[SourceLocation]) -> List[SourceLocation]:
+    result: List[SourceLocation] = []
+    seen: set[tuple[str, Optional[int], Optional[int], Optional[str]]] = set()
+    for location in locations:
+        if not location or not location.file:
+            continue
+        marker = (location.file, location.line, location.column, location.symbol)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(location)
+    return result
 
 
 def _agentic_query_terms(finding: Finding, limit: int = 24) -> List[str]:
@@ -1315,6 +1842,36 @@ def _agentic_path_prefixes(finding: Finding, limit: int = 16) -> List[str]:
     return _dedupe_text(prefixes, limit=limit)
 
 
+def _agentic_focus_scopes(paths: Sequence[str], limit: int = 12) -> List[str]:
+    scopes: List[str] = []
+    for raw in paths:
+        normalized = str(raw or "").replace("\\", "/").strip()
+        normalized = re.sub(r"^\./", "", normalized).strip("/")
+        if not normalized or normalized in {".", ".."}:
+            continue
+        parts = [part for part in normalized.split("/") if part and part not in {".", ".."}]
+        if not parts:
+            continue
+        scopes.append("/".join(parts))
+        if "." in parts[-1]:
+            for size in range(min(4, len(parts)), 0, -1):
+                scopes.append("/".join(parts[-size:]))
+    return _dedupe_text(scopes, limit=limit)
+
+
+def _focus_search_specs(terms: Sequence[str], scopes: Sequence[str], limit: int) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    focus_scopes = _agentic_focus_scopes(scopes, limit=8)
+    if focus_scopes:
+        for scope in focus_scopes[:6]:
+            for term in terms[:4]:
+                specs.append({"query": term, "scope": scope, "limit": 10})
+    else:
+        for term in terms[:8]:
+            specs.append({"query": term, "limit": 10})
+    return specs[:limit]
+
+
 def _agentic_search_evidence(finding: Finding, results: Sequence[Dict[str, Any]]) -> CodeEvidence:
     locations = _agentic_locations_from_search(results, limit=12)
     names = _dedupe_text([str(item.get("qualified_name") or item.get("name") or "") for item in results], limit=8)
@@ -1323,7 +1880,7 @@ def _agentic_search_evidence(finding: Finding, results: Sequence[Dict[str, Any]]
         evidence_id=evidence_id(finding.finding_id, "atlas", "agentic-search", *names[:8]),
         kind=EvidenceKind.SOURCE_LOCATION,
         strength=EvidenceStrength.MEDIUM if locations else EvidenceStrength.WEAK,
-        summary=f"AI 自主 Atlas MCP search 找到 {len(results)} 个报告相关候选符号：" + ", ".join(names[:8]),
+        summary=f"Atlas MCP 预分析 search 找到 {len(results)} 个报告相关候选符号：" + ", ".join(names[:8]),
         source="atlas-agent-mcp",
         locations=locations,
         data={
@@ -1501,9 +2058,20 @@ def _try_json(text: str):
     if not text:
         return None
     try:
-        return json.loads(text)
+        parsed: Any = json.loads(text)
     except json.JSONDecodeError:
         return None
+    for _ in range(2):
+        if not isinstance(parsed, str):
+            return parsed
+        stripped = parsed.strip()
+        if not stripped or stripped[0] not in "{[":
+            return parsed
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return parsed
+    return parsed
 
 
 def _text(value) -> str:

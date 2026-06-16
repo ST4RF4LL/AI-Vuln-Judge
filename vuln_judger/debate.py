@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import difflib
+import json
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
+import shutil
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_NEGATIVE_AGENT
 from .evidence import EvidenceBundle
 from .evidence_graph import build_evidence_graph, graph_to_markdown
+from .logging_config import logger
 from .llm import LLMClient
+from .mcp import MCPError, MCPStdioClient
+from .mcp_config import MCPServerStore
 from .models import (
     AgentConfig,
     CodeEvidence,
@@ -24,6 +31,11 @@ from .models import (
     VerificationScorecard,
     to_jsonable,
 )
+from .source import evidence_id
+
+
+LOG = logger("debate")
+DEFAULT_AGENT_ATLAS_TOOL_ROUNDS = 2
 
 
 @dataclass
@@ -50,6 +62,19 @@ class ModeratorRoundDecision:
 
 
 FINAL_LABELS = ("真实漏洞", "误报", "证据不足", "可达性存疑")
+
+
+AGENT_ATLAS_ALLOWED_TOOLS = {
+    "project",
+    "search",
+    "symbol",
+    "calls",
+    "trace",
+    "path",
+    "impact",
+    "file_dependencies",
+    "explore",
+}
 
 
 ENTRY_REACHABILITY_MARKERS = (
@@ -182,6 +207,9 @@ class DebateOrchestrator:
         negative_agent: Optional[AgentConfig] = None,
         moderator_agent: Optional[AgentConfig] = None,
         progress_callback: Optional[Callable[[VerdictReport], None]] = None,
+        source_path: Optional[Path] = None,
+        mcp_servers_file: Optional[Path] = None,
+        enable_atlas_tools: bool = True,
     ):
         self.max_rounds = max_rounds
         self.affirmative_client = affirmative_client or llm_client
@@ -191,6 +219,9 @@ class DebateOrchestrator:
         self.negative_agent = _agent_or_default(negative_agent, DEFAULT_NEGATIVE_AGENT)
         self.moderator_agent = _agent_or_default(moderator_agent, DEFAULT_MODERATOR_AGENT)
         self.progress_callback = progress_callback
+        self.source_path = source_path
+        self.mcp_servers_file = mcp_servers_file
+        self.enable_atlas_tools = enable_atlas_tools
 
     def adjudicate(self, bundle: EvidenceBundle) -> VerdictReport:
         evidence = bundle.evidence
@@ -646,13 +677,164 @@ class DebateOrchestrator:
             f"证据：\n" + _evidence_prompt(bundle.evidence) + "\n"
             "证据解释约束：SOURCE_ROOT 只能证明任务已配置源码根目录，不能替代具体 SOURCE_LOCATION、CALL_CHAIN 或 DATA_FLOW；"
             "rg/grep 证据必须围绕报告位置、报告符号、codeFlow 或调用邻域解释，只能作为候选补证，不能单独证明源汇可达；"
-            "若存在 atlas-agent-mcp 证据，应优先按 MCP 的 project/status、project/files、trace、calls 结果研判；"
+            "若存在 agent-atlas-mcp 或 atlas-agent-mcp 证据，应优先按 MCP 的 project/status、project/files、trace、calls 结果研判；"
             "若 Atlas 数据库存在但 trace 结果为 empty/partial/No data node，应转而从 calls 调用图和源码片段交叉验证重构数据流；"
             "若 Atlas 数据库存在但 trace_supported=false，只能说明当前工具无法导出 trace，不得说 .atlas 缺失或未构建。\n"
             f"补充上下文或质疑：\n{extra}\n"
             f"{output_instruction}"
         )
-        return client.complete(system, user)
+        return self._complete_with_agent_atlas_tools(client, role, system, user, bundle)
+
+    def _complete_with_agent_atlas_tools(
+        self, client: LLMClient, role: str, system: str, user: str, bundle: EvidenceBundle
+    ) -> Optional[str]:
+        if not self._atlas_tools_available():
+            return client.complete(system, user)
+        tool_user = user + "\n\n" + _agent_atlas_tool_instruction(self.source_path)
+        mcp_client: Optional[MCPStdioClient] = None
+        try:
+            for round_index in range(_agent_atlas_tool_round_limit()):
+                response = client.complete(system, tool_user)
+                if not response:
+                    return None
+                calls = _parse_agent_atlas_tool_calls(response)
+                if not calls:
+                    return _parse_agent_final_text(response) or response
+                LOG.info(
+                    "%s Agent 请求 Atlas MCP 工具 round=%s tools=%s",
+                    _role_label(role),
+                    round_index + 1,
+                    [str(call.get("tool") or call.get("name") or "").strip() for call in calls[:6]],
+                )
+                if mcp_client is None:
+                    mcp_client = self._start_atlas_mcp_client()
+                observations = self._execute_agent_atlas_tool_calls(mcp_client, role, bundle, calls)
+                tool_user += (
+                    "\n\nAtlas MCP 工具观察（这些观察已作为新证据加入 evidence_chain，后续论断必须引用对应 evidence_id）：\n"
+                    + "\n".join(observations)
+                    + "\n\n请基于当前证据继续。若仍需 Atlas，请再次只输出 atlas_tool_calls JSON；"
+                    "若证据已足够，请输出本回合正文，不要再输出工具 JSON。"
+                )
+            response = client.complete(
+                system,
+                tool_user
+                + "\n\nAtlas MCP 工具调用轮次已经用完。现在必须只输出本回合中文 Markdown 正文，"
+                "禁止再输出 atlas_tool_calls、tool_calls 或任何 JSON。若证据仍不足，请在正文中说明已尝试的工具路径和剩余缺口。",
+            )
+            if not response:
+                return None
+            if _parse_agent_atlas_tool_calls(response):
+                bundle.evidence.append(
+                    CodeEvidence(
+                        evidence_id=evidence_id(bundle.finding.finding_id, "agent-atlas", role.lower(), "rounds-exhausted"),
+                        kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                        strength=EvidenceStrength.WEAK,
+                        summary=f"{_role_label(role)} Agent Atlas MCP 工具轮次耗尽后仍请求工具；已忽略该 JSON 并回退到静态正文",
+                        source=f"agent-atlas-mcp:{role.lower()}",
+                        data={"agent_atlas_tool": True, "mcp_success": False, "rounds_exhausted": True},
+                    )
+                )
+                return _parse_agent_final_text(response) or None
+            return _parse_agent_final_text(response) or response
+        except (MCPError, OSError, ValueError) as exc:
+            bundle.evidence.append(
+                CodeEvidence(
+                    evidence_id=evidence_id(bundle.finding.finding_id, "agent-atlas", role.lower(), "failed"),
+                    kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                    strength=EvidenceStrength.WEAK,
+                    summary=f"{_role_label(role)} Agent 自主 Atlas MCP 会话失败：{exc}",
+                    source=f"agent-atlas-mcp:{role.lower()}",
+                    data={"agent_atlas_tool": True, "mcp_success": False, "error": str(exc)},
+                )
+            )
+            return client.complete(system, user)
+        finally:
+            if mcp_client is not None:
+                mcp_client.close()
+
+    def _atlas_tools_available(self) -> bool:
+        return bool(self.enable_atlas_tools and self.source_path)
+
+    def _start_atlas_mcp_client(self) -> MCPStdioClient:
+        if self.source_path is None:
+            raise ValueError("未配置源码路径，无法启动 Atlas MCP")
+        source_path = self.source_path.expanduser().resolve()
+        command: List[str]
+        cwd = source_path
+        env: Dict[str, str] = {}
+        if self.mcp_servers_file is not None:
+            server = MCPServerStore(self.mcp_servers_file).default_for_kind("atlas")
+            if server is not None:
+                command, cwd, env = server.command_for_project(source_path)
+            else:
+                binary = shutil.which("atlas")
+                if not binary:
+                    raise ValueError("未配置 Atlas MCP Server，且 PATH 中未找到 atlas")
+                command = [binary, "mcp", "--log-format", "json"]
+        else:
+            binary = shutil.which("atlas")
+            if not binary:
+                raise ValueError("未配置 Atlas MCP Server，且 PATH 中未找到 atlas")
+            command = [binary, "mcp", "--log-format", "json"]
+        client = MCPStdioClient(command, cwd=cwd, env=env)
+        client.start()
+        return client
+
+    def _execute_agent_atlas_tool_calls(
+        self, client: MCPStdioClient, role: str, bundle: EvidenceBundle, calls: Sequence[Dict[str, Any]]
+    ) -> List[str]:
+        observations: List[str] = []
+        for index, call in enumerate(calls[:6], start=1):
+            tool = str(call.get("tool") or call.get("name") or "").strip()
+            arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+            arguments = _normalize_agent_atlas_tool_arguments(tool, arguments, self.source_path, bundle)
+            if tool not in AGENT_ATLAS_ALLOWED_TOOLS:
+                evidence = CodeEvidence(
+                    evidence_id=evidence_id(bundle.finding.finding_id, "agent-atlas", role.lower(), str(len(bundle.evidence)), "blocked", tool),
+                    kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                    strength=EvidenceStrength.WEAK,
+                    summary=f"{_role_label(role)} Agent 请求了不允许的 Atlas MCP 工具 `{tool}`；已拒绝执行",
+                    source=f"agent-atlas-mcp:{role.lower()}",
+                    data={"agent_atlas_tool": True, "mcp_tool": tool, "mcp_success": False, "blocked": True},
+                )
+                bundle.evidence.append(evidence)
+                observations.append(f"- `{evidence.evidence_id}` blocked `{tool}`")
+                continue
+            LOG.info("%s Agent 调用 Atlas MCP tool=%s arguments=%s", _role_label(role), tool, _compact_agent_log_json(arguments))
+            try:
+                payload, raw_text, is_error = _agent_mcp_tool_payload(client.call_tool(tool, arguments))
+            except (MCPError, OSError, ValueError) as exc:
+                evidence = _agent_atlas_tool_failure_evidence(
+                    bundle.finding.finding_id,
+                    role,
+                    len(bundle.evidence) + index,
+                    tool,
+                    arguments,
+                    exc,
+                )
+                bundle.evidence.append(evidence)
+                observations.append(f"- `{evidence.evidence_id}` {evidence.summary}；结果摘要：{_compact_text(str(exc), 1200)}")
+                LOG.warning("%s Agent Atlas MCP tool=%s failed: %s", _role_label(role), tool, exc)
+                break
+            evidence = _agent_atlas_tool_evidence(
+                bundle.finding.finding_id,
+                role,
+                len(bundle.evidence) + index,
+                tool,
+                arguments,
+                payload,
+                raw_text,
+                is_error,
+            )
+            bundle.evidence.append(evidence)
+            observations.append(
+                f"- `{evidence.evidence_id}` {evidence.summary}；位置："
+                + (" -> ".join(location.display() for location in evidence.locations[:8]) if evidence.locations else "无")
+                + "；结果摘要："
+                + _compact_text(raw_text or json.dumps(payload, ensure_ascii=False), 1200)
+            )
+            LOG.info("%s Agent Atlas MCP tool=%s success=%s evidence=%s", _role_label(role), tool, not is_error, evidence.evidence_id)
+        return observations
 
     def _client_for_role(self, role: str) -> Optional[LLMClient]:
         if role == "AFFIRMATIVE":
@@ -923,6 +1105,457 @@ def _negative_review_report(
             _negative_review_summary(bundle.evidence, unresolved),
         ]
     )
+
+
+def _agent_atlas_tool_instruction(source_path: Optional[Path]) -> str:
+    return (
+        "Atlas MCP 自主工具调用：\n"
+        f"- 源码根目录：{source_path}\n"
+        "- 你可以自主决定是否调用 Atlas MCP；如需调用，当前回复必须只输出 JSON，不要夹杂解释。\n"
+        "- JSON 格式：{\"atlas_tool_calls\":[{\"tool\":\"project\",\"arguments\":{\"action\":\"open\",\"project_path\":\"源码根目录\",\"storage\":\"auto\"}}]}\n"
+        "- 可用工具：project, search, symbol, calls, trace, path, impact, file_dependencies, explore。\n"
+        "- 禁止调用 index；project/open 只用于激活项目，不能附加 scan_files 或 background。\n"
+        "- Atlas Focus 由 search 触发：open 后优先围绕报告中的文件、符号和行号调用 search，并给 search 传入尽量窄的 scope，"
+        "例如 {\"query\":\"危险函数或类名\",\"scope\":\"项目相对路径\",\"limit\":20}。\n"
+        "- 如果 project/status 提示 No project facts have been materialized yet，这不是 Atlas 不可用；应先执行 scoped search，"
+        "再继续 calls、trace、symbol、path 等追溯。\n"
+        "- 大型项目禁止一上来做全项目宽泛 search；先用报告位置的项目相对文件路径作为 scope。\n"
+        "- 每次最多 6 个 tool call。工具观察返回后，你可以继续请求工具，也可以输出本回合正文。\n"
+    )
+
+
+def _agent_atlas_tool_round_limit() -> int:
+    raw = os.environ.get("VULN_JUDGER_AGENT_ATLAS_TOOL_ROUNDS")
+    if raw:
+        try:
+            return max(0, min(6, int(raw)))
+        except ValueError:
+            pass
+    return DEFAULT_AGENT_ATLAS_TOOL_ROUNDS
+
+
+def _normalize_agent_atlas_tool_arguments(
+    tool: str,
+    arguments: Dict[str, Any],
+    source_path: Optional[Path],
+    bundle: Optional[EvidenceBundle] = None,
+) -> Dict[str, Any]:
+    normalized = dict(arguments)
+    if tool == "project" and str(normalized.get("action") or "").strip().lower() == "open":
+        normalized.pop("scan_files", None)
+        normalized.pop("background", None)
+        if source_path is not None and not normalized.get("project_path"):
+            normalized["project_path"] = str(source_path)
+        normalized.setdefault("storage", "auto")
+    if tool == "search":
+        normalized.setdefault("limit", 20)
+        if _optional_int(normalized.get("limit")) and int(normalized["limit"]) > 50:
+            normalized["limit"] = 50
+        if bundle is not None and source_path is not None and not normalized.get("scope"):
+            scope = _agent_atlas_default_search_scope(bundle, source_path)
+            if scope:
+                normalized["scope"] = scope
+        if bundle is not None and source_path is not None and normalized.get("scope"):
+            file_scope = _agent_atlas_file_scope_for_directory(bundle, source_path, str(normalized.get("scope") or ""))
+            if file_scope:
+                normalized["scope"] = file_scope
+    if tool in {"calls", "impact", "explore"}:
+        _promote_agent_symbol_alias(normalized)
+        _promote_agent_include_code_alias(normalized)
+        if tool == "calls" and isinstance(normalized.get("direction"), str):
+            normalized["direction"] = _normalize_agent_calls_direction(str(normalized["direction"]))
+        normalized.pop("function", None)
+        normalized.pop("name", None)
+        normalized.pop("query", None)
+        normalized.pop("scope", None)
+        if tool in {"calls", "impact"}:
+            normalized.pop("includeCode", None)
+    if tool == "symbol":
+        _promote_agent_symbol_alias(normalized)
+        _promote_agent_include_code_alias(normalized)
+        if normalized.get("scope") and not normalized.get("file_path"):
+            normalized["file_path"] = normalized.get("scope")
+        normalized.pop("name", None)
+        normalized.pop("kind", None)
+        normalized.pop("query", None)
+        normalized.pop("scope", None)
+    if tool == "trace":
+        if normalized.get("start") and not normalized.get("from"):
+            normalized["from"] = normalized.get("start")
+        if normalized.get("end") and not normalized.get("to"):
+            normalized["to"] = normalized.get("end")
+        if not normalized.get("kind"):
+            if normalized.get("from") and normalized.get("to"):
+                normalized["kind"] = "forward"
+            elif normalized.get("file_path") or normalized.get("file"):
+                normalized["kind"] = "point"
+        if normalized.get("file") and not normalized.get("file_path"):
+            normalized["file_path"] = normalized.get("file")
+        normalized.pop("start", None)
+        normalized.pop("end", None)
+        normalized.pop("file", None)
+        normalized.pop("variables", None)
+    return normalized
+
+
+def _promote_agent_symbol_alias(arguments: Dict[str, Any]) -> None:
+    if arguments.get("symbol"):
+        return
+    for key in ("qualified_name", "function", "name", "query"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            arguments["symbol"] = value.strip()
+            return
+
+
+def _promote_agent_include_code_alias(arguments: Dict[str, Any]) -> None:
+    if "include_details" in arguments:
+        if "includeCode" not in arguments:
+            arguments["includeCode"] = bool(arguments.get("include_details"))
+        arguments.pop("include_details", None)
+
+
+def _normalize_agent_calls_direction(value: str) -> str:
+    normalized = value.strip().lower()
+    aliases = {
+        "upstream": "incoming",
+        "up": "incoming",
+        "callers": "incoming",
+        "caller": "incoming",
+        "incoming": "incoming",
+        "downstream": "outgoing",
+        "down": "outgoing",
+        "callees": "outgoing",
+        "callee": "outgoing",
+        "outgoing": "outgoing",
+        "both": "both",
+    }
+    return aliases.get(normalized, value)
+
+
+def _agent_atlas_default_search_scope(bundle: EvidenceBundle, source_path: Path) -> str:
+    source_root = source_path.expanduser().resolve()
+    source_name = source_root.name
+    for location in getattr(bundle.finding, "locations", []) or []:
+        raw_file = str(getattr(location, "file", "") or "").strip()
+        if not raw_file:
+            continue
+        candidates = _agent_atlas_scope_candidates(raw_file, source_root, source_name)
+        for candidate in candidates:
+            if (source_root / candidate).exists():
+                return candidate
+        if candidates:
+            return candidates[0]
+    return ""
+
+
+def _agent_atlas_file_scope_for_directory(bundle: EvidenceBundle, source_path: Path, scope: str) -> str:
+    cleaned_scope = scope.replace("\\", "/").strip().strip("/")
+    if not cleaned_scope:
+        return ""
+    source_root = source_path.expanduser().resolve()
+    scope_path = source_root / cleaned_scope
+    if not scope_path.is_dir():
+        return ""
+    source_name = source_root.name
+    for location in getattr(bundle.finding, "locations", []) or []:
+        raw_file = str(getattr(location, "file", "") or "").strip()
+        for candidate in _agent_atlas_scope_candidates(raw_file, source_root, source_name):
+            if candidate == cleaned_scope or candidate.startswith(cleaned_scope + "/"):
+                candidate_path = source_root / candidate
+                if candidate_path.is_file():
+                    return candidate
+    return ""
+
+
+def _agent_atlas_scope_candidates(raw_file: str, source_root: Path, source_name: str) -> List[str]:
+    cleaned = raw_file.replace("\\", "/").strip()
+    candidates: List[str] = []
+    path = Path(cleaned)
+    if path.is_absolute():
+        try:
+            candidates.append(path.resolve().relative_to(source_root).as_posix())
+        except ValueError:
+            candidates.append(path.name)
+    else:
+        candidates.append(cleaned)
+        parts = cleaned.split("/")
+        if len(parts) > 1 and parts[0] == parts[1]:
+            candidates.append("/".join(parts[1:]))
+        prefix = source_name + "/"
+        while cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :]
+            candidates.append(cleaned)
+    result: List[str] = []
+    for candidate in candidates:
+        candidate = candidate.lstrip("/")
+        if candidate and candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def _parse_agent_atlas_tool_calls(response: str) -> List[Dict[str, Any]]:
+    payload = _json_object_from_text(response)
+    if not isinstance(payload, dict):
+        return []
+    calls = payload.get("atlas_tool_calls") or payload.get("tool_calls") or []
+    if not isinstance(calls, list):
+        return []
+    return [item for item in calls if isinstance(item, dict)]
+
+
+def _parse_agent_final_text(response: str) -> str:
+    payload = _json_object_from_text(response)
+    if isinstance(payload, dict):
+        for key in ("final", "final_answer", "content", "message"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _json_object_from_text(text: str) -> Optional[Dict[str, Any]]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    candidates = [stripped]
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, flags=re.DOTALL)
+    if fence:
+        candidates.insert(0, fence.group(1).strip())
+    first = stripped.find("{")
+    last = stripped.rfind("}")
+    if first >= 0 and last > first:
+        candidates.append(stripped[first : last + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _agent_mcp_tool_payload(response: Dict[str, Any]) -> Tuple[Any, str, bool]:
+    if response.get("error"):
+        return response.get("error"), str(response.get("error")), True
+    result = response.get("result") or {}
+    is_error = bool(result.get("isError"))
+    content = result.get("content") or []
+    texts = [str(item.get("text") or "") for item in content if item.get("type") == "text"]
+    text = "\n".join(item for item in texts if item)
+    payload = _parse_agent_mcp_text_payload(text) if text else {}
+    return payload, text, is_error
+
+
+def _parse_agent_mcp_text_payload(text: str) -> Any:
+    try:
+        parsed: Any = json.loads(text)
+    except json.JSONDecodeError:
+        return _agent_mcp_partial_json(text) or text
+    for _ in range(2):
+        if not isinstance(parsed, str):
+            return parsed
+        stripped = parsed.strip()
+        if not stripped or stripped[0] not in "{[":
+            return parsed
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return _agent_mcp_partial_json(stripped) or parsed
+    return parsed
+
+
+def _agent_mcp_partial_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text.lstrip().startswith("{"):
+        return None
+    result: Dict[str, Any] = {"truncated_json": True}
+    for key in ("ok", "partial_result"):
+        match = re.search(rf'"{key}"\s*:\s*(true|false)', text)
+        if match:
+            result[key] = match.group(1) == "true"
+    for key in ("kind", "query_id"):
+        match = re.search(rf'"{key}"\s*:\s*"([^"]+)"', text)
+        if match:
+            result[key] = match.group(1)
+    language = _first_regex_group(r'"language"\s*:\s*"([^"]+)"', text)
+    capability_level = _first_regex_group(r'"capability_level"\s*:\s*"([^"]+)"', text)
+    if language or capability_level:
+        result["capability"] = {"language": language, "capability_level": capability_level}
+    return result if len(result) > 1 else None
+
+
+def _first_regex_group(pattern: str, text: str) -> Optional[str]:
+    match = re.search(pattern, text)
+    return match.group(1) if match else None
+
+
+def _agent_atlas_tool_evidence(
+    finding_id: str,
+    role: str,
+    sequence: int,
+    tool: str,
+    arguments: Dict[str, Any],
+    payload: Any,
+    raw_text: str,
+    is_error: bool,
+) -> CodeEvidence:
+    locations = _dedupe_agent_atlas_locations(
+        _agent_atlas_argument_locations(tool, arguments) + _agent_atlas_locations(payload)
+    )
+    success = not is_error
+    kind = EvidenceKind.TOOL_DIAGNOSTIC
+    if success and tool in {"search", "symbol"}:
+        kind = EvidenceKind.SOURCE_LOCATION
+    elif success and tool == "project" and str(arguments.get("action") or "") == "files":
+        kind = EvidenceKind.SOURCE_LOCATION
+    elif success and tool in {"calls", "path"}:
+        kind = EvidenceKind.CALL_CHAIN
+    elif success and tool == "trace":
+        trace_kind = str(arguments.get("kind") or "")
+        kind = EvidenceKind.CALL_CHAIN if trace_kind == "callers" else EvidenceKind.DATA_FLOW
+    elif success and tool in {"impact", "file_dependencies", "explore"} and locations:
+        kind = EvidenceKind.CALL_CHAIN
+    strength = EvidenceStrength.MEDIUM if success else EvidenceStrength.WEAK
+    if success and tool == "trace" and isinstance(payload, dict) and payload.get("partial_result"):
+        strength = EvidenceStrength.PARTIAL
+    summary = f"{_role_label(role)} Agent 自主调用 Atlas MCP `{tool}`" + (" 成功" if success else " 失败")
+    if locations:
+        summary += f"，提取位置 {len(locations)} 个"
+    return CodeEvidence(
+        evidence_id=evidence_id(finding_id, "agent-atlas", role.lower(), str(sequence), tool),
+        kind=kind,
+        strength=strength,
+        summary=summary,
+        source=f"agent-atlas-mcp:{role.lower()}",
+        locations=locations[:16],
+        data={
+            "agent_atlas_tool": True,
+            "mcp_tool": tool,
+            "mcp_success": success,
+            "arguments": arguments,
+            "payload": _compact_agent_atlas_payload(payload),
+            "raw": raw_text[:2000],
+        },
+    )
+
+
+def _agent_atlas_tool_failure_evidence(
+    finding_id: str,
+    role: str,
+    sequence: int,
+    tool: str,
+    arguments: Dict[str, Any],
+    exc: BaseException,
+) -> CodeEvidence:
+    return CodeEvidence(
+        evidence_id=evidence_id(finding_id, "agent-atlas", role.lower(), str(sequence), tool, "failed"),
+        kind=EvidenceKind.TOOL_DIAGNOSTIC,
+        strength=EvidenceStrength.WEAK,
+        summary=f"{_role_label(role)} Agent 自主调用 Atlas MCP `{tool}` 失败：{exc}",
+        source=f"agent-atlas-mcp:{role.lower()}",
+        locations=_agent_atlas_argument_locations(tool, arguments),
+        data={
+            "agent_atlas_tool": True,
+            "mcp_tool": tool,
+            "mcp_success": False,
+            "arguments": arguments,
+            "error": str(exc),
+        },
+    )
+
+
+def _agent_atlas_locations(payload: Any) -> List[SourceLocation]:
+    locations: List[SourceLocation] = []
+    seen: set[Tuple[str, Optional[int], Optional[int], Optional[str]]] = set()
+    for value in _walk_values(payload):
+        if not isinstance(value, dict):
+            continue
+        file = value.get("file") or value.get("file_path") or value.get("path") or value.get("relative_path")
+        if not isinstance(file, str) or not file:
+            continue
+        line = _optional_int(value.get("line") or value.get("start_line") or value.get("startLine"))
+        column = _optional_int(value.get("column") or value.get("start_column") or value.get("startColumn"))
+        range_value = value.get("range")
+        if isinstance(range_value, dict):
+            start = range_value.get("start") or {}
+            if isinstance(start, dict):
+                line = line or _optional_int(start.get("line") or start.get("row"))
+                column = column or _optional_int(start.get("column") or start.get("col"))
+        symbol = value.get("qualified_name") or value.get("symbol") or value.get("name")
+        location = SourceLocation(file=file, line=line, column=column, symbol=str(symbol) if symbol else None)
+        marker = (location.file, location.line, location.column, location.symbol)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        locations.append(location)
+        if len(locations) >= 32:
+            break
+    return locations
+
+
+def _agent_atlas_argument_locations(tool: str, arguments: Dict[str, Any]) -> List[SourceLocation]:
+    if tool == "trace":
+        file = arguments.get("file_path") or arguments.get("file") or arguments.get("path")
+        line = _optional_int(arguments.get("line") or arguments.get("start_line"))
+        column = _optional_int(arguments.get("column") or arguments.get("start_column"))
+        if isinstance(file, str) and file:
+            return [SourceLocation(file=file, line=line, column=column, symbol=str(arguments.get("symbol") or "") or None)]
+    if tool == "file_dependencies":
+        file = arguments.get("file_path")
+        if isinstance(file, str) and file:
+            return [SourceLocation(file=file)]
+    return []
+
+
+def _dedupe_agent_atlas_locations(locations: Sequence[SourceLocation]) -> List[SourceLocation]:
+    result: List[SourceLocation] = []
+    seen: set[Tuple[str, Optional[int], Optional[int], Optional[str]]] = set()
+    for location in locations:
+        marker = (location.file, location.line, location.column, location.symbol)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        result.append(location)
+    return result
+
+
+def _walk_values(value: Any) -> List[Any]:
+    result: List[Any] = []
+    stack = [value]
+    while stack and len(result) < 800:
+        current = stack.pop()
+        result.append(current)
+        if isinstance(current, dict):
+            stack.extend(reversed([item for item in current.values() if isinstance(item, (dict, list))]))
+        elif isinstance(current, list):
+            stack.extend(reversed([item for item in current if isinstance(item, (dict, list))]))
+    return result
+
+
+def _compact_agent_atlas_payload(payload: Any) -> Any:
+    text = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(text) <= 4000:
+        return payload
+    return {"truncated": True, "excerpt": text[:4000]}
+
+
+def _compact_text(text: str, limit: int) -> str:
+    normalized = " ".join(str(text or "").split())
+    return normalized[:limit]
+
+
+def _compact_agent_log_json(value: Any) -> str:
+    return _compact_text(json.dumps(value, ensure_ascii=False, default=str), 600)
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _stage_context(stage: str, prior: str, challenges: Sequence[str], extra: str) -> str:
@@ -1578,6 +2211,8 @@ def _data_excerpt(item: CodeEvidence) -> str:
         "truncated_json",
         "diagnostics",
         "query_id",
+        "focus_path",
+        "focus_path_facts",
         "callers",
         "callees",
         "symbols",

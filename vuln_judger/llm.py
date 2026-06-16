@@ -39,6 +39,15 @@ class OpenAICompatibleLLM(LLMClient):
     def complete(self, system_prompt: str, user_prompt: str) -> Optional[str]:
         result = self.request(system_prompt, user_prompt)
         if not result["ok"]:
+            if result.get("reasoning_content"):
+                retry = self.request(
+                    system_prompt,
+                    user_prompt
+                    + "\n\n上一次响应只包含 reasoning_content，message.content 为空。"
+                    "请不要输出推理过程，只把最终可审计答案写入 message.content。",
+                )
+                if retry["ok"]:
+                    return retry.get("content")
             return None
         return result.get("content")
 
@@ -113,7 +122,8 @@ class OpenAICompatibleLLM(LLMClient):
             return _failure(status, started, "响应中没有 choices")
         message = choices[0].get("message") or {}
         content = message.get("content")
-        if not content:
+        if not str(content or "").strip():
+            reasoning_content = str(message.get("reasoning_content") or "").strip()
             LOG.warning(
                 "LLM 响应缺少 message.content provider=%s status=%s latency_ms=%s body=%s",
                 self.provider_id or self.provider_name or "unknown",
@@ -121,7 +131,10 @@ class OpenAICompatibleLLM(LLMClient):
                 _latency_ms(started),
                 body_text[:500],
             )
-            return _failure(status, started, "响应中没有 message.content")
+            failure = _failure(status, started, "响应中没有 message.content")
+            if reasoning_content:
+                failure["reasoning_content"] = reasoning_content[:4000]
+            return failure
         LOG.info(
             "LLM 请求完成 provider=%s status=%s latency_ms=%s content_chars=%s",
             self.provider_id or self.provider_name or "unknown",

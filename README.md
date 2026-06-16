@@ -53,22 +53,24 @@ uv run vuln-judger run \
 
 Atlas 证据基于 [Atlas](https://github.com/LordCasser/atlas) MCP。当前适配 Atlas
 v1.5.0+ 的 Focus Runtime：即使源码目录尚未存在 `.atlas/atlas.db`，也会通过 MCP
-按查询范围进行增量分析，不要求用户预先执行 `atlas index`。平台只走 AI 自主 Atlas
-补证路径：系统会从 finding 文本、路径片段和符号中生成查询计划，先调用
-`project(action="open", storage="auto")` 激活项目，再调用 `project/status`、
-`project/files`、`search`、`trace` 和 `calls`，并输出
-`atlas-agent-mcp` 来源的 `SOURCE_LOCATION`、`DATA_FLOW`、`CALL_CHAIN`、
-`TOOL_DIAGNOSTIC` 证据。平台不再提供基于报告行号的固定函数调用 Atlas 分支；
-AI 自主源码阅读会同时运行，输出 `agentic-source-reader` 来源的源码分析证据。MCP 不可用时
-也会保留该源码阅读路径。
+按查询范围进行增量分析，不要求用户预先执行 `atlas index`。启用 LLM 时，平台不再由
+预分析器写死 `trace/calls` 调用流程，而是在正方、反方和 Moderator 的回合中开放 Atlas
+MCP 工具循环：Agent 自主决定是否请求 `project`、`search`、`symbol`、`trace`、
+`calls`、`path`、`impact`、`file_dependencies` 或 `explore`，平台只负责执行这些
+MCP 工具调用、把 observation 转换为 `agent-atlas-mcp:<role>` 来源的证据并回灌给同一
+Agent 继续分析。默认不开放 `index` 工具；`project(action="open", storage="auto")`
+只负责激活项目，Focus 由 Agent 围绕报告文件和符号主动调用 scoped `search(query, scope)`
+触发，然后继续 `trace` / `calls` / `symbol` 等追溯。未启用 LLM
+时，Atlas 预分析器仍可作为非 LLM 模式的兼容补证路径。AI 自主源码阅读会同时运行，输出
+`agentic-source-reader` 来源的源码分析证据。MCP 不可用时也会保留该源码阅读路径。
 
 相关运行参数：
 
 - `--auto-index-tools`：可选预热 Atlas 持久缓存；不再是使用 Atlas MCP 的前置条件。
 
-Web 端启动任务弹窗不再提供 Atlas 执行分支开关。MCP Server 的 `judge_report`、
-`one_round_judge` 和 `collect_evidence` 工具同样固定使用 AI 自主 Atlas MCP 和
-AI 自主源码阅读路径。
+Web 端启动任务弹窗不再提供 Atlas 执行分支开关。MCP Server 的 `judge_report` 和
+`one_round_judge` 在启用 LLM 时同样使用 Agent 自主 Atlas MCP 工具循环；
+`collect_evidence` 作为纯证据收集工具仍返回预分析证据和源码阅读证据。
 
 ## MCP 和 Skills 管理
 

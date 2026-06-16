@@ -591,9 +591,9 @@ class PipelineTests(unittest.TestCase):
             )
             summaries = "\n".join(item.summary for item in evidence)
             self.assertIn("检测到 Atlas 持久缓存", summaries)
-            self.assertIn("AI 自主 Atlas MCP project/open 已激活项目", summaries)
-            self.assertIn("AI 自主 Atlas MCP project/status 确认项目状态", summaries)
-            self.assertIn("AI 自主 Atlas MCP project/files 找到报告路径候选", summaries)
+            self.assertIn("Atlas MCP 预分析 project/open 已激活项目", summaries)
+            self.assertIn("Atlas MCP 预分析 project/status 确认项目状态", summaries)
+            self.assertIn("Atlas MCP 预分析 project/files 找到报告路径候选", summaries)
             self.assertNotIn("缺少 .atlas/atlas.db", summaries)
             self.assertTrue(any(item.data.get("mcp_success") for item in evidence))
             self.assertTrue(any(item.data.get("focus_runtime") for item in evidence))
@@ -625,8 +625,8 @@ class PipelineTests(unittest.TestCase):
 
             self.assertIn("未检测到 Atlas 持久缓存", summaries)
             self.assertIn("无需预先执行 atlas index", summaries)
-            self.assertIn("AI 自主 Atlas MCP project/open 已激活项目", summaries)
-            self.assertIn("AI 自主 Atlas MCP project/status 确认项目状态", summaries)
+            self.assertIn("Atlas MCP 预分析 project/open 已激活项目", summaries)
+            self.assertIn("Atlas MCP 预分析 project/status 确认项目状态", summaries)
             self.assertTrue(any(item.data.get("mcp_tool") == "trace" and item.data.get("precision") for item in evidence))
             self.assertFalse(any("缺少 .atlas/atlas.db" in item.summary for item in evidence))
 
@@ -707,15 +707,118 @@ for raw in sys.stdin.buffer:
                 AnalyzerSettings(enabled=True),
             )
             summaries = "\n".join(item.summary for item in evidence)
-            self.assertIn("AI 自主 Atlas MCP project/status 确认项目状态", summaries)
-            self.assertIn("AI 自主 Atlas MCP project/files 找到报告路径候选", summaries)
-            self.assertIn("AI 自主 Atlas MCP trace variable 返回 ok=True", summaries)
-            self.assertIn("AI 自主 Atlas MCP calls 提取 `handler` 调用图", summaries)
+            self.assertIn("Atlas MCP 预分析 project/status 确认项目状态", summaries)
+            self.assertIn("Atlas MCP 预分析 project/files 找到报告路径候选", summaries)
+            self.assertIn("Atlas MCP 预分析 trace variable 返回 ok=True", summaries)
+            self.assertIn("Atlas MCP 预分析 calls 提取 `handler` 调用图", summaries)
             self.assertTrue(any(item.kind == EvidenceKind.DATA_FLOW and item.source == "atlas-agent-mcp" for item in evidence))
             self.assertTrue(any(item.kind == EvidenceKind.CALL_CHAIN and item.source == "atlas-agent-mcp" for item in evidence))
             self.assertTrue(any(item.source == "agentic-source-reader" for item in evidence))
             self.assertFalse(any(item.source == "atlas-mcp" for item in evidence))
             self.assertNotIn("当前 Atlas CLI 未提供 trace 子命令", summaries)
+
+    def test_atlas_focus_path_facts_are_flow_and_call_chain_evidence(self):
+        from vuln_judger.debate import _build_verification_scorecard
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "\n".join(
+                    [
+                        "def route(request):",
+                        "    return handler(request)",
+                        "def handler(request):",
+                        "    payload = request.args['cmd']",
+                        "    return sink(payload)",
+                        "def sink(value):",
+                        "    return value",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_focus_graph_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-atlas-focus-graph",
+                rule_id="python-command-injection",
+                message="handler data reaches sink",
+                level="error",
+                locations=[SourceLocation("app.py", 5, 12)],
+            )
+
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["python"]),
+                AnalyzerSettings(enabled=True),
+            )
+
+            point_flow = next(
+                item
+                for item in evidence
+                if item.kind == EvidenceKind.DATA_FLOW
+                and item.source == "atlas-agent-mcp"
+                and item.data.get("trace_kind") == "point"
+            )
+            call_chain = next(
+                item
+                for item in evidence
+                if item.kind == EvidenceKind.CALL_CHAIN
+                and item.source == "atlas-agent-mcp"
+                and item.data.get("mcp_tool") == "calls"
+            )
+            scorecard = _build_verification_scorecard(evidence, None)
+
+            self.assertTrue(point_flow.data["focus_path_facts"])
+            self.assertIn("app.py:4", [location.display() for location in point_flow.locations])
+            self.assertIn("app.py:5", [location.display() for location in point_flow.locations])
+            self.assertEqual(point_flow.strength, EvidenceStrength.MEDIUM)
+            self.assertEqual(call_chain.strength, EvidenceStrength.MEDIUM)
+            self.assertEqual(scorecard.data_flow, "confirmed")
+            self.assertEqual(scorecard.call_chain, "confirmed")
+
+    def test_atlas_focus_rescan_retries_trace_without_index_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "\n".join(
+                    [
+                        "def handler(request):",
+                        "    payload = request.args['cmd']",
+                        "    return sink(payload)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_unmaterialized_then_focus_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-atlas-focus-rescan",
+                rule_id="python-command-injection",
+                message="handler data reaches sink",
+                level="error",
+                locations=[SourceLocation("app.py", 3, 12)],
+            )
+
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["python"]),
+                AnalyzerSettings(enabled=True),
+            )
+            summaries = "\n".join(item.summary for item in evidence)
+            flow = next(
+                item
+                for item in evidence
+                if item.kind == EvidenceKind.DATA_FLOW
+                and item.source == "atlas-agent-mcp"
+                and item.data.get("focus_scan_retry")
+            )
+
+            self.assertIn("Focus scoped search 已触发项目事实", summaries)
+            self.assertIn("Focus scoped search 触发项目事实后重试", flow.summary)
+            self.assertTrue(flow.data["focus_path_facts"])
+            self.assertFalse(any(item.data.get("mcp_tool") == "index" for item in evidence))
 
     def test_atlas_mcp_timeout_becomes_diagnostic_and_keeps_source_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -788,7 +891,7 @@ for raw in sys.stdin.buffer:
             )
             summaries = "\n".join(item.summary for item in evidence)
             indexed = next(item for item in evidence if item.data.get("mcp_tool") == "project/files")
-            self.assertIn("AI 自主 Atlas MCP project/files 找到报告路径候选", summaries)
+            self.assertIn("Atlas MCP 预分析 project/files 找到报告路径候选", summaries)
             self.assertEqual(indexed.data["matched_files"], ["faiss/impl/index_read.cpp"])
             self.assertTrue(any(item.data.get("trace_file") == "faiss/impl/index_read.cpp" for item in evidence))
             self.assertFalse(any("faiss/faiss/impl/index_read.cpp" in location.file for item in evidence for location in item.locations))
@@ -825,7 +928,7 @@ for raw in sys.stdin.buffer:
                 AnalyzerSettings(enabled=True),
             )
             summaries = "\n".join(item.summary for item in evidence)
-            self.assertIn("AI 自主 Atlas MCP 补证启动", summaries)
+            self.assertIn("Atlas MCP 预分析补证启动", summaries)
             self.assertTrue(any(item.source == "atlas-agent-mcp" for item in evidence))
             self.assertTrue(any(item.kind == EvidenceKind.CALL_CHAIN and item.source == "atlas-agent-mcp" for item in evidence))
 
@@ -884,7 +987,7 @@ for raw in sys.stdin.buffer:
                 AnalyzerSettings(enabled=True),
             )
             summaries = "\n".join(item.summary for item in evidence)
-            self.assertIn("AI 自主 Atlas MCP search 未找到报告相关符号或路径候选", summaries)
+            self.assertIn("Atlas MCP 预分析 search 未找到报告相关符号或路径候选", summaries)
             self.assertTrue(any(item.source == "agentic-source-reader" for item in evidence))
             self.assertTrue(any(location.file == "app.py" for item in evidence for location in item.locations))
 
@@ -1689,6 +1792,47 @@ for raw in sys.stdin.buffer:
         self.assertFalse(result["ok"])
         self.assertIn("IncompleteRead", result["error"])
 
+    def test_openai_compatible_llm_retries_empty_content_with_reasoning_content(self):
+        from vuln_judger.llm import OpenAICompatibleLLM
+
+        class JsonResponse:
+            status = 200
+
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(self.payload).encode("utf-8")
+
+        reasoning_only = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "是否继续下一轮：是\n分析：仍需补证。",
+                    }
+                }
+            ]
+        }
+        final_answer = {"choices": [{"message": {"role": "assistant", "content": "最终正文"}}]}
+        client = OpenAICompatibleLLM(api_key="secret", model="fake-model", endpoint="http://127.0.0.1/llm")
+
+        with patch("urllib.request.urlopen", side_effect=[JsonResponse(reasoning_only), JsonResponse(final_answer)]) as mocked:
+            response = client.complete("system", "user")
+
+        self.assertEqual(response, "最终正文")
+        self.assertEqual(mocked.call_count, 2)
+        retry_request = mocked.call_args_list[1].args[0]
+        retry_payload = json.loads(retry_request.data.decode("utf-8"))
+        self.assertIn("message.content 为空", retry_payload["messages"][1]["content"])
+
     def test_to_jsonable_decodes_nested_bytes(self):
         evidence = CodeEvidence(
             evidence_id="ev-bytes",
@@ -2319,6 +2463,324 @@ for raw in sys.stdin.buffer:
             self.assertTrue(affirmative.calls)
             self.assertTrue(negative.calls)
             self.assertTrue(moderator.calls)
+
+    def test_llm_agent_can_autonomously_call_atlas_mcp_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_focus_graph_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            mcp_file = root / "mcp.json"
+            mcp_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaults": {"atlas": "atlas-test"},
+                        "servers": [
+                            {
+                                "id": "atlas-test",
+                                "name": "Atlas Test",
+                                "kind": "atlas",
+                                "transport": "stdio",
+                                "command": str(atlas),
+                                "args": ["mcp"],
+                                "cwd": "{project}",
+                                "enabled": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            finding = load_sarif(sarif)[0]
+            bundle = EvidenceBundle(
+                finding=finding,
+                evidence=[
+                    CodeEvidence(
+                        evidence_id="ev-report",
+                        kind=EvidenceKind.REPORT,
+                        strength=EvidenceStrength.STRONG,
+                        summary="输入报告",
+                        source="test",
+                        locations=list(finding.locations),
+                    )
+                ],
+                diagnostics=[],
+            )
+            affirmative = SequenceLLM(
+                [
+                    json.dumps(
+                        {
+                            "atlas_tool_calls": [
+                                {
+                                    "tool": "project",
+                                    "arguments": {
+                                        "action": "open",
+                                        "project_path": str(root),
+                                        "storage": "auto",
+                                    },
+                                },
+                                {"tool": "search", "arguments": {"query": "handler", "limit": 5}},
+                                {
+                                    "tool": "trace",
+                                    "arguments": {"kind": "point", "file_path": "app.py", "line": 4, "column": 5},
+                                },
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "AFFIRMATIVE_AFTER_ATLAS",
+                    "AFFIRMATIVE_FINAL",
+                ]
+            )
+            report = DebateOrchestrator(
+                max_rounds=1,
+                affirmative_client=affirmative,
+                negative_client=FakeLLM("NEGATIVE"),
+                moderator_client=FakeLLM("MODERATOR"),
+                source_path=root,
+                mcp_servers_file=mcp_file,
+                enable_atlas_tools=True,
+            ).adjudicate(bundle)
+
+            self.assertGreaterEqual(len(affirmative.calls), 2)
+            self.assertIn("atlas_tool_calls", affirmative.calls[0][1])
+            self.assertIn("Atlas MCP 工具观察", affirmative.calls[1][1])
+            self.assertTrue(any(item.source == "agent-atlas-mcp:affirmative" for item in report.evidence_chain))
+            self.assertTrue(any(item.kind == EvidenceKind.DATA_FLOW and item.source == "agent-atlas-mcp:affirmative" for item in report.evidence_chain))
+
+    def test_llm_agent_atlas_mcp_timeout_uses_environment_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_timeout_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            mcp_file = root / "mcp.json"
+            mcp_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaults": {"atlas": "atlas-test"},
+                        "servers": [
+                            {
+                                "id": "atlas-test",
+                                "name": "Atlas Test",
+                                "kind": "atlas",
+                                "transport": "stdio",
+                                "command": str(atlas),
+                                "args": ["mcp"],
+                                "cwd": "{project}",
+                                "enabled": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            finding = load_sarif(sarif)[0]
+            bundle = EvidenceBundle(
+                finding=finding,
+                evidence=[
+                    CodeEvidence(
+                        evidence_id="ev-report",
+                        kind=EvidenceKind.REPORT,
+                        strength=EvidenceStrength.STRONG,
+                        summary="输入报告",
+                        source="test",
+                        locations=list(finding.locations),
+                    )
+                ],
+                diagnostics=[],
+            )
+            affirmative = SequenceLLM(
+                [
+                    json.dumps(
+                        {
+                            "atlas_tool_calls": [
+                                {
+                                    "tool": "project",
+                                    "arguments": {
+                                        "action": "open",
+                                        "project_path": str(root),
+                                        "storage": "auto",
+                                    },
+                                },
+                                {
+                                    "tool": "trace",
+                                    "arguments": {"kind": "point", "file_path": "app.py", "line": 4, "column": 5},
+                                },
+                            ]
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "AFFIRMATIVE_AFTER_TIMEOUT",
+                    "AFFIRMATIVE_FINAL",
+                ]
+            )
+
+            with patch.dict(
+                "os.environ",
+                {"VULN_JUDGER_ATLAS_MCP_TIMEOUT": "1", "VULN_JUDGER_MCP_TIMEOUT": "1"},
+            ):
+                report = DebateOrchestrator(
+                    max_rounds=1,
+                    affirmative_client=affirmative,
+                    negative_client=FakeLLM("NEGATIVE"),
+                    moderator_client=FakeLLM("MODERATOR"),
+                    source_path=root,
+                    mcp_servers_file=mcp_file,
+                    enable_atlas_tools=True,
+                ).adjudicate(bundle)
+
+            summaries = "\n".join(item.summary for item in report.evidence_chain)
+            self.assertIn("MCP request timed out after 1s: tools/call:trace", summaries)
+            self.assertIn("AFFIRMATIVE_AFTER_TIMEOUT", report.debate[0].claim)
+
+    def test_llm_agent_tool_json_after_round_limit_does_not_become_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_focus_graph_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            mcp_file = root / "mcp.json"
+            mcp_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaults": {"atlas": "atlas-test"},
+                        "servers": [
+                            {
+                                "id": "atlas-test",
+                                "name": "Atlas Test",
+                                "kind": "atlas",
+                                "transport": "stdio",
+                                "command": str(atlas),
+                                "args": ["mcp"],
+                                "cwd": "{project}",
+                                "enabled": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            finding = load_sarif(sarif)[0]
+            bundle = EvidenceBundle(
+                finding=finding,
+                evidence=[
+                    CodeEvidence(
+                        evidence_id="ev-report",
+                        kind=EvidenceKind.REPORT,
+                        strength=EvidenceStrength.STRONG,
+                        summary="输入报告",
+                        source="test",
+                        locations=list(finding.locations),
+                    )
+                ],
+                diagnostics=[],
+            )
+            tool_json = json.dumps(
+                {"atlas_tool_calls": [{"tool": "search", "arguments": {"query": "handler"}}]},
+                ensure_ascii=False,
+            )
+            affirmative = SequenceLLM([tool_json, tool_json, tool_json, "SHOULD_NOT_BE_USED"])
+
+            with patch.dict("os.environ", {"VULN_JUDGER_AGENT_ATLAS_TOOL_ROUNDS": "2"}):
+                report = DebateOrchestrator(
+                    max_rounds=1,
+                    affirmative_client=affirmative,
+                    negative_client=FakeLLM("NEGATIVE"),
+                    moderator_client=FakeLLM("MODERATOR"),
+                    source_path=root,
+                    mcp_servers_file=mcp_file,
+                    enable_atlas_tools=True,
+                ).adjudicate(bundle)
+
+            first_claim = report.debate[0].raw_claim or report.debate[0].claim
+            summaries = "\n".join(item.summary for item in report.evidence_chain)
+            self.assertNotIn("atlas_tool_calls", first_claim)
+            self.assertIn("正方证据报告", first_claim)
+            self.assertIn("工具轮次耗尽", summaries)
+
+    def test_llm_agent_scopes_wide_search_to_report_file(self):
+        from vuln_judger.debate import _normalize_agent_atlas_tool_arguments
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "faiss" / "impl").mkdir(parents=True)
+            (root / "faiss" / "impl" / "index_read.cpp").write_text("void read_index_up() {}\n", encoding="utf-8")
+            bundle = EvidenceBundle(
+                finding=Finding(
+                    finding_id="f-scope",
+                    rule_id="rule",
+                    message="demo",
+                    level="error",
+                    locations=[SourceLocation("faiss/faiss/impl/index_read.cpp", 1493)],
+                ),
+                evidence=[],
+                diagnostics=[],
+            )
+
+            normalized = _normalize_agent_atlas_tool_arguments(
+                "search",
+                {"query": "read_index_up"},
+                root,
+                bundle,
+            )
+
+            self.assertEqual(normalized["scope"], "faiss/impl/index_read.cpp")
+            self.assertEqual(normalized["limit"], 20)
+
+            directory_scope = _normalize_agent_atlas_tool_arguments(
+                "search",
+                {"query": "IndexFlatPanorama", "scope": "faiss/impl", "limit": 20},
+                root,
+                bundle,
+            )
+            self.assertEqual(directory_scope["scope"], "faiss/impl/index_read.cpp")
+
+    def test_llm_agent_normalizes_common_atlas_argument_aliases(self):
+        from vuln_judger.debate import _normalize_agent_atlas_tool_arguments
+
+        calls_args = _normalize_agent_atlas_tool_arguments(
+            "calls",
+            {"function": "read_index", "scope": "faiss/impl/index_read.cpp", "direction": "upstream"},
+            None,
+            None,
+        )
+        symbol_args = _normalize_agent_atlas_tool_arguments(
+            "symbol",
+            {"query": "search", "kind": "member", "scope": "faiss/IndexFlat.cpp", "limit": 10, "include_details": True},
+            None,
+            None,
+        )
+        trace_args = _normalize_agent_atlas_tool_arguments(
+            "trace",
+            {
+                "start": "faiss/impl/index_read.cpp:1493",
+                "end": "faiss/impl/Panorama.cpp:193",
+                "variables": ["batch_size", "n_levels", "cum_sums"],
+            },
+            None,
+            None,
+        )
+
+        self.assertEqual(calls_args, {"symbol": "read_index", "direction": "incoming"})
+        self.assertEqual(
+            symbol_args,
+            {"symbol": "search", "file_path": "faiss/IndexFlat.cpp", "limit": 10, "includeCode": True},
+        )
+        self.assertEqual(
+            trace_args,
+            {
+                "from": "faiss/impl/index_read.cpp:1493",
+                "to": "faiss/impl/Panorama.cpp:193",
+                "kind": "forward",
+            },
+        )
 
     def test_agent_config_is_used_by_llm_prompts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3046,6 +3508,246 @@ for raw in sys.stdin:
             tool_response(request_id, {"results": []})
         elif name == "trace":
             tool_response(request_id, {"ok": False, "partial_result": False, "diagnostics": ["empty"]})
+        elif name == "calls":
+            tool_response(request_id, {"hops": []})
+        else:
+            tool_response(request_id, {"error": "unknown tool"}, True)
+'''
+
+
+def fake_atlas_mcp_focus_graph_script():
+    return r'''#!/usr/bin/env python3
+import json
+import sys
+
+if "--help" in sys.argv:
+    print("Commands:")
+    print("  mcp     Start MCP server")
+    sys.exit(0)
+
+if len(sys.argv) < 2 or sys.argv[1] != "mcp":
+    sys.exit(2)
+
+TOOLS = [{"name": name} for name in ("project", "search", "trace", "calls")]
+
+def send(message):
+    print(json.dumps(message, separators=(",", ":")), flush=True)
+
+def tool_response(request_id, payload, is_error=False):
+    send({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(payload, separators=(",", ":"))}],
+            "isError": is_error,
+        },
+    })
+
+for raw in sys.stdin:
+    if not raw.strip():
+        continue
+    message = json.loads(raw)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "atlas-mcp", "version": "fake-focus-graph"},
+            },
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}})
+    elif method == "tools/call":
+        params = message.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if name == "project" and args.get("action") == "open":
+            tool_response(request_id, {
+                "project": {"path": args.get("project_path"), "storage": args.get("storage", "auto")},
+                "analysis": {"state": "focus-ready", "scope": "project"},
+                "precision": {"coverage_tier": "focus", "semantic_confidence": "medium"},
+                "work": {"items": [{"phase": "focus", "status": "done"}]},
+            })
+        elif name == "project" and args.get("action") == "status":
+            tool_response(request_id, {
+                "summary": {"files": 1, "symbols": 4, "edges": 3},
+                "project": {"db_path": None},
+                "server": {"atlas_version": "fake-focus-graph", "tool_contract_version": 2},
+                "analysis": {"state": "focus-ready"},
+                "precision": {"coverage_tier": "focus", "semantic_confidence": "medium"},
+            })
+        elif name == "project" and args.get("action") == "files":
+            tool_response(request_id, {"files": [{"path": "app.py", "language": "python", "status": "focus-ready"}]})
+        elif name == "search":
+            tool_response(request_id, {
+                "results": [{
+                    "name": "handler",
+                    "qualified_name": "handler",
+                    "kind": "function",
+                    "file": "app.py",
+                    "line": 3,
+                }]
+            })
+        elif name == "trace" and args.get("kind") == "point":
+            tool_response(request_id, {
+                "ok": True,
+                "partial_result": False,
+                "diagnostics": [],
+                "query_id": "q_focus_point",
+                "kind": "trace_point",
+                "capability": {"language": "python", "capability_level": "dataflow_full"},
+                "analysis": {"state": "focus-query"},
+                "precision": {"coverage_tier": "focus", "semantic_confidence": "medium"},
+                "work": {"items": [{"phase": "focus", "status": "done"}]},
+                "result": {
+                    "path": [
+                        {"kind": "source", "file": "app.py", "line": 4, "name": "payload"},
+                        {"kind": "sink", "file": "app.py", "line": 5, "name": "sink"},
+                    ]
+                },
+            })
+        elif name == "trace" and args.get("kind") == "callers":
+            tool_response(request_id, {
+                "ok": True,
+                "partial_result": False,
+                "diagnostics": [],
+                "query_id": "q_focus_callers",
+                "kind": "trace_callers",
+                "analysis": {"state": "focus-query"},
+                "precision": {"coverage_tier": "focus", "semantic_confidence": "medium"},
+                "result": {
+                    "path": [
+                        {"kind": "function", "qualified_name": "route", "file": "app.py", "line": 1},
+                        {"kind": "function", "qualified_name": "handler", "file": "app.py", "line": 3},
+                    ]
+                },
+            })
+        elif name == "trace":
+            tool_response(request_id, {"ok": False, "partial_result": False, "diagnostics": ["variable trace unavailable in fixture"]})
+        elif name == "calls":
+            tool_response(request_id, {
+                "nodes": [
+                    {"id": "route", "qualified_name": "route", "name": "route", "file": "app.py", "line": 1},
+                    {"id": "handler", "qualified_name": "handler", "name": "handler", "file": "app.py", "line": 3},
+                    {"id": "sink", "qualified_name": "sink", "name": "sink", "file": "app.py", "line": 6},
+                ],
+                "edges": [
+                    {"from": "route", "to": "handler", "kind": "calls"},
+                    {"from": "handler", "to": "sink", "kind": "calls"},
+                ],
+                "analysis": {"state": "focus-query"},
+                "precision": {"coverage_tier": "focus", "semantic_confidence": "medium"},
+            })
+        else:
+            tool_response(request_id, {"error": "unknown tool"}, True)
+'''
+
+
+def fake_atlas_mcp_unmaterialized_then_focus_script():
+    return r'''#!/usr/bin/env python3
+import json
+import sys
+
+if "--help" in sys.argv:
+    print("Commands:")
+    print("  mcp     Start MCP server")
+    sys.exit(0)
+
+if len(sys.argv) < 2 or sys.argv[1] != "mcp":
+    sys.exit(2)
+
+TOOLS = [{"name": name} for name in ("project", "search", "trace", "calls")]
+search_count = 0
+focus_ready = False
+
+def send(message):
+    print(json.dumps(message, separators=(",", ":")), flush=True)
+
+def tool_response(request_id, payload, is_error=False):
+    send({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": json.dumps(payload, separators=(",", ":"))}],
+            "isError": is_error,
+        },
+    })
+
+for raw in sys.stdin:
+    if not raw.strip():
+        continue
+    message = json.loads(raw)
+    method = message.get("method")
+    request_id = message.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "atlas-mcp", "version": "fake-unmaterialized"},
+            },
+        })
+    elif method == "notifications/initialized":
+        continue
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}})
+    elif method == "tools/call":
+        params = message.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if name == "project" and args.get("action") == "open":
+            tool_response(request_id, {
+                "project": {"path": args.get("project_path"), "storage": args.get("storage", "auto")},
+                "analysis": {"state": "focus-ready" if focus_ready else "project-opened"},
+                "precision": {"coverage_tier": "focus", "semantic_confidence": "medium"},
+            })
+        elif name == "project" and args.get("action") == "status":
+            tool_response(request_id, {
+                "summary": {"files": 1, "symbols": 2 if focus_ready else 0, "edges": 1 if focus_ready else 0},
+                "analysis": {"state": "focus-ready" if focus_ready else "project-opened"},
+                "precision": {"coverage_tier": "focus", "semantic_confidence": "medium"},
+            })
+        elif name == "project" and args.get("action") == "files":
+            tool_response(request_id, {"files": [{"path": "app.py", "language": "python", "status": "focus-ready" if focus_ready else "pending"}]})
+        elif name == "search":
+            search_count += 1
+            if args.get("scope") and search_count > 1:
+                focus_ready = True
+            tool_response(request_id, {
+                "results": [{
+                    "name": "handler",
+                    "qualified_name": "handler",
+                    "kind": "function",
+                    "file": "app.py",
+                    "line": 1,
+                }]
+            })
+        elif name == "trace" and not focus_ready:
+            tool_response(request_id, {"error": "No project facts have been materialized yet"}, True)
+        elif name == "trace":
+            tool_response(request_id, {
+                "ok": True,
+                "partial_result": False,
+                "diagnostics": [],
+                "query_id": "q_focus_after_rescan",
+                "kind": "trace_" + args.get("kind", "unknown"),
+                "analysis": {"state": "focus-query"},
+                "precision": {"coverage_tier": "focus", "semantic_confidence": "medium"},
+                "result": {
+                    "path": [
+                        {"kind": "source", "file": "app.py", "line": 2, "name": "payload"},
+                        {"kind": "sink", "file": "app.py", "line": 3, "name": "sink"},
+                    ]
+                },
+            })
         elif name == "calls":
             tool_response(request_id, {"hops": []})
         else:
