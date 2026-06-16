@@ -209,7 +209,7 @@ class EvidenceCollector:
                 )
             else:
                 actions.append(
-                    "Atlas 索引不足：检查 .atlas/atlas.db；可启用 auto_index_tools 自动 Atlas 构建索引，或在源码目录执行 atlas index --analysis full 后重跑。"
+                    "Atlas 语义证据不足：Atlas v1.5+ 可无需预建 .atlas/atlas.db 直接通过 MCP Focus 查询；优先确认 Atlas MCP 可用并调用 project/open、project/status、search、trace/calls，必要时启用 auto_index_tools 预热持久缓存。"
                 )
         if _has_protection_evidence(evidence):
             missing.append("protection_bypass")

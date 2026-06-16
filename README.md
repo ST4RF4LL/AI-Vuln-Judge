@@ -51,10 +51,11 @@ uv run vuln-judger run \
    `存在分歧`，并将整体结论降级为 `INCONCLUSIVE`。
    `可达性存疑` 表示局部源码或源汇路径看起来成立，但尚未证明外部或内部 REST/API/接口入口能调用到漏洞相关函数。
 
-Atlas 证据优先检查 `.atlas/atlas.db`。缺少数据库时，报告会提示执行
-`atlas index --analysis full`；启用 `--auto-index-tools` 时会自动 Atlas 构建索引。
-检测到新版 Atlas 的 `mcp` 子命令后，平台只走 AI 自主 Atlas 补证路径：系统会从
-finding 文本、路径片段和符号中生成查询计划，调用 Atlas MCP 的 `project/status`、
+Atlas 证据基于 [Atlas](https://github.com/LordCasser/atlas) MCP。当前适配 Atlas
+v1.5.0+ 的 Focus Runtime：即使源码目录尚未存在 `.atlas/atlas.db`，也会通过 MCP
+按查询范围进行增量分析，不要求用户预先执行 `atlas index`。平台只走 AI 自主 Atlas
+补证路径：系统会从 finding 文本、路径片段和符号中生成查询计划，先调用
+`project(action="open", storage="auto")` 激活项目，再调用 `project/status`、
 `project/files`、`search`、`trace` 和 `calls`，并输出
 `atlas-agent-mcp` 来源的 `SOURCE_LOCATION`、`DATA_FLOW`、`CALL_CHAIN`、
 `TOOL_DIAGNOSTIC` 证据。平台不再提供基于报告行号的固定函数调用 Atlas 分支；
@@ -63,7 +64,7 @@ AI 自主源码阅读会同时运行，输出 `agentic-source-reader` 来源的�
 
 相关运行参数：
 
-- `--auto-index-tools`：缺少 `.atlas/atlas.db` 时自动 Atlas 构建索引。
+- `--auto-index-tools`：可选预热 Atlas 持久缓存；不再是使用 Atlas MCP 的前置条件。
 
 Web 端启动任务弹窗不再提供 Atlas 执行分支开关。MCP Server 的 `judge_report`、
 `one_round_judge` 和 `collect_evidence` 工具同样固定使用 AI 自主 Atlas MCP 和
@@ -80,11 +81,15 @@ MCP Server 配置默认存储在 `.vuln-judger/mcp.json`，示例文件为
   "kind": "atlas",
   "transport": "stdio",
   "command": "atlas",
-  "args": ["mcp", "--project", "{project}", "--log-format", "json"],
+  "args": ["mcp", "--log-format", "json"],
   "cwd": "{project}",
   "enabled": true
 }
 ```
+
+这是 Atlas v1.5.0+ 推荐的 no-project MCP 启动方式：MCP Server 以源码目录为 `cwd`
+启动，vuln-judger 会在查询前调用 `project/open` 激活项目。需要持久化缓存或预热全量
+项目时，再使用 `--auto-index-tools` 或单独运行 `atlas index --analysis full`。
 
 Skill Source 配置默认存储在 `.vuln-judger/skills.json`，示例文件为
 `.vuln-judger/skills.json.example`。Skill Source 用于管理项目知识库目录；启动任务时可在
@@ -298,16 +303,24 @@ uv run vuln-judger run \
 
 ## API 和 Web 界面
 
+快速启动默认 Web/API 服务：
+
+```bash
+uv run vuln-judger api
+```
+
+等效完整参数：
+
 ```bash
 uv run vuln-judger api \
   --host 127.0.0.1 \
   --port 8765 \
-  --records-dir /path/to/vuln_judger/.vuln-judger/runs \
-  --providers-file /path/to/vuln_judger/.vuln-judger/providers.json \
-  --agents-dir /path/to/vuln_judger/agents \
-  --mcp-servers-file /path/to/vuln_judger/.vuln-judger/mcp.json \
-  --skills-file /path/to/vuln_judger/.vuln-judger/skills.json \
-  --log-file /path/to/vuln_judger/.vuln-judger/logs/vuln-judger.log
+  --records-dir .vuln-judger/runs \
+  --providers-file .vuln-judger/providers.json \
+  --agents-dir agents \
+  --mcp-servers-file .vuln-judger/mcp.json \
+  --skills-file .vuln-judger/skills.json \
+  --log-file .vuln-judger/logs/vuln-judger.log
 ```
 
 打开 http://127.0.0.1:8765 查看保存的研判记录。页面提供运行历史、结论统计、发现摘要、

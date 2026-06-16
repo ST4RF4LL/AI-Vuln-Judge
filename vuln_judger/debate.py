@@ -258,11 +258,11 @@ class DebateOrchestrator:
             extra=_stage_context(
                 "正方第一回合",
                 (
-                    "优先使用 Atlas MCP 证据向上游追溯到外部输入源头。若证据显示 Atlas 数据库缺失，才可说明需要执行 "
-                    "`atlas index --analysis full`；若证据显示 Atlas MCP 已返回 project/status、project/files、trace 或 calls，"
+                    "优先使用 Atlas MCP 证据向上游追溯到外部输入源头。Atlas v1.5+ 支持无需预建 .atlas/atlas.db 的 Focus 查询；"
+                    "若证据显示 Atlas MCP 已返回 project/open、project/status、project/files、trace 或 calls，"
                     "必须引用这些证据判断源码真实性、调用图和数据流。Atlas 缺边、未命中或 trace 不完整时，先合理怀疑工具未正确处理调用链，"
                     "转用源码阅读和 grep/ripgrep 定位调用链或数据流；找到新上游节点后再回到 Atlas 继续追溯。只有这些路径均失败时，"
-                    "才可怀疑误报、不可利用漏洞或证据不足。不得说 .atlas 缺失或未构建，除非证据明确显示数据库缺失。"
+                    "才可怀疑误报、不可利用漏洞或证据不足。不得把 .atlas 缺失当作 Atlas 不可用；只有 MCP 启动或工具调用失败时，才可说明 Atlas MCP 不可用。"
                 ),
                 challenges,
                 _affirmative_evidence_hunting_context(bundle),
@@ -1637,7 +1637,7 @@ def _flow_report(evidence: Sequence[CodeEvidence]) -> str:
         if _has_atlas_trace_unavailable(evidence):
             lines.append("- Atlas 数据库/索引存在，但当前 CLI 未提供 trace 子命令，因此只能作为索引覆盖证据，不能作为数据流 trace。")
     else:
-        lines.append("- 未获得 Atlas 证据；需要确认是否已安装 Atlas 并完成 `atlas index --analysis full`。")
+        lines.append("- 未获得 Atlas 证据；需要确认 Atlas MCP 是否可启动，并优先尝试 v1.5+ Focus 查询；预热持久缓存只是可选优化。")
     if not flow_items:
         lines.append("- 当前未建立源到汇数据流或函数调用链证据。")
         return "\n".join(lines)

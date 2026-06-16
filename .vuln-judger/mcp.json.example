@@ -12,15 +12,13 @@
       "command": "atlas",
       "args": [
         "mcp",
-        "--project",
-        "{project}",
         "--log-format",
         "json"
       ],
       "cwd": "{project}",
       "env": {},
       "enabled": true,
-      "description": "使用本地 atlas mcp 启动项目代码图 MCP Server。"
+      "description": "使用 Atlas v1.5+ MCP Focus 模式启动本地代码图 MCP Server；项目通过 cwd 或 project/open 激活。"
     }
   ]
 }

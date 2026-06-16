@@ -19,7 +19,7 @@ from .mcp_config import DEFAULT_MCP_SERVERS_FILE
 from .models import RunConfig, SourceLocation, to_jsonable
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
-from .records import RunRecordStore
+from .records import RunRecordStore, normalize_run_origin
 from .sarif import load_report
 from .skills import DEFAULT_SKILLS_FILE, load_project_context
 from .source import SourceIndexer
@@ -151,6 +151,7 @@ class JudgerMCPServer:
         report = run_judgement(config)
         saved = bool(arguments.get("save", True))
         payload = to_jsonable(report)
+        payload["run_origin"] = "mcp"
         if saved:
             self.records.save_payload(payload)
         result = _run_summary(payload)
@@ -175,6 +176,7 @@ class JudgerMCPServer:
         run_payload = {
             "run_id": run_id,
             "status": "completed",
+            "run_origin": "mcp",
             "created_at": created_at,
             "source_path": str(_required_path(arguments, "source_path")),
             "sarif_path": str(_required_path(arguments, "report_path")),
@@ -207,6 +209,7 @@ class JudgerMCPServer:
             "mode": "one_round_judge",
             "response_mode": response_mode,
             "run_id": run_id,
+            "run_origin": "mcp",
             "saved": saved,
             "record_path": record_path,
             "configuration": {
@@ -370,7 +373,7 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "auto_index_tools": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Automatically build an Atlas index when .atlas/atlas.db is missing.",
+                    "description": "Optionally prewarm a persistent Atlas cache; Atlas MCP v1.5+ can run scoped Focus queries without a prebuilt index.",
                 },
                 "enable_llm": {"type": "boolean", "default": False},
                 "providers_file": {"type": "string"},
@@ -400,7 +403,7 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "auto_index_tools": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Automatically build an Atlas index when .atlas/atlas.db is missing.",
+                    "description": "Optionally prewarm a persistent Atlas cache; Atlas MCP v1.5+ can run scoped Focus queries without a prebuilt index.",
                 },
                 "mcp_servers_file": {"type": "string"},
                 "affirmative_agent_profile": {"type": "string"},
@@ -470,7 +473,7 @@ def _analysis_properties() -> Dict[str, Any]:
         "auto_index_tools": {
             "type": "boolean",
             "default": False,
-            "description": "Automatically build an Atlas index when .atlas/atlas.db is missing.",
+            "description": "Optionally prewarm a persistent Atlas cache; Atlas MCP v1.5+ can run scoped Focus queries without a prebuilt index.",
         },
         "mcp_servers_file": {"type": "string"},
     }
@@ -834,7 +837,7 @@ def _missing_evidence(
             {
                 "type": "flow_or_call_chain",
                 "summary": "缺少中等以上强度的数据流或调用链闭环证据。",
-                "suggestion": "优先补充 SARIF codeFlows；或构建 Atlas 索引后通过 collect_evidence 获取 trace/calls。",
+                "suggestion": "优先补充 SARIF codeFlows；或确认 Atlas MCP 可用后通过 collect_evidence 获取 Focus trace/calls，必要时预热持久缓存。",
             }
         )
     if external_tools_enabled and not _has_atlas_success(evidence):
@@ -842,7 +845,7 @@ def _missing_evidence(
             {
                 "type": "atlas_evidence",
                 "summary": "未获得成功的 Atlas MCP 语义证据。",
-                "suggestion": "确认 Atlas MCP 配置可用；必要时开启 auto_index_tools 自动 Atlas 构建索引。",
+                "suggestion": "确认 Atlas MCP 配置可用；必要时开启 auto_index_tools 预热 Atlas 持久缓存。",
             }
         )
     if _has_evidence_kind(evidence, "PROTECTION"):
@@ -929,6 +932,7 @@ def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "run_id": run.get("run_id"),
         "status": run.get("status", "completed"),
+        "run_origin": normalize_run_origin(run),
         "created_at": run.get("created_at"),
         "source_path": run.get("source_path"),
         "sarif_path": run.get("sarif_path"),

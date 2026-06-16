@@ -1,3 +1,4 @@
+import http.client
 import json
 import subprocess
 import sys
@@ -11,6 +12,7 @@ from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
+from unittest.mock import patch
 
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
 from vuln_judger.api import app_html, make_handler
@@ -63,6 +65,28 @@ class PipelineTests(unittest.TestCase):
             source_root = next(item for item in report.reports[0].evidence_chain if item.kind == EvidenceKind.SOURCE_ROOT)
             self.assertEqual(source_root.data["languages"], ["python"])
             self.assertEqual(source_root.data["language_file_counts"], {"python": 1})
+
+    def test_api_command_uses_default_quick_start_paths(self):
+        import vuln_judger.cli as cli
+
+        with patch("vuln_judger.cli.serve") as serve:
+            exit_code = cli.main(["api"])
+
+        self.assertEqual(exit_code, 0)
+        serve.assert_called_once()
+        self.assertEqual(
+            serve.call_args.args,
+            (
+                "127.0.0.1",
+                8765,
+                Path(".vuln-judger") / "runs",
+                Path(".vuln-judger") / "providers.json",
+                Path("agents"),
+                Path(".vuln-judger") / "logs" / "vuln-judger.log",
+                Path(".vuln-judger") / "mcp.json",
+                Path(".vuln-judger") / "skills.json",
+            ),
+        )
 
     def test_python_code_flow_becomes_true_positive(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -566,13 +590,45 @@ class PipelineTests(unittest.TestCase):
                 AnalyzerSettings(enabled=True),
             )
             summaries = "\n".join(item.summary for item in evidence)
-            self.assertIn("检测到 Atlas 数据库", summaries)
-            self.assertIn("AI 自主 Atlas MCP project/status 确认索引状态", summaries)
+            self.assertIn("检测到 Atlas 持久缓存", summaries)
+            self.assertIn("AI 自主 Atlas MCP project/open 已激活项目", summaries)
+            self.assertIn("AI 自主 Atlas MCP project/status 确认项目状态", summaries)
             self.assertIn("AI 自主 Atlas MCP project/files 找到报告路径候选", summaries)
             self.assertNotIn("缺少 .atlas/atlas.db", summaries)
             self.assertTrue(any(item.data.get("mcp_success") for item in evidence))
+            self.assertTrue(any(item.data.get("focus_runtime") for item in evidence))
             self.assertTrue(any(item.source == "agentic-source-reader" for item in evidence))
             self.assertFalse(any(item.source == "atlas-mcp" for item in evidence))
+
+    def test_atlas_mcp_runs_without_prebuilt_database_with_focus_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "app.py"
+            source.write_text("def handler(request):\n    return request.args.get('cmd')\n", encoding="utf-8")
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            finding = Finding(
+                finding_id="f-atlas-focus",
+                rule_id="python-demo",
+                message="handler receives cmd",
+                level="warning",
+                locations=[SourceLocation("app.py", 2)],
+            )
+
+            evidence = AtlasAnalyzer(binary=str(atlas)).analyze(
+                finding,
+                SourceIndexer(root, ["python"]),
+                AnalyzerSettings(enabled=True),
+            )
+            summaries = "\n".join(item.summary for item in evidence)
+
+            self.assertIn("未检测到 Atlas 持久缓存", summaries)
+            self.assertIn("无需预先执行 atlas index", summaries)
+            self.assertIn("AI 自主 Atlas MCP project/open 已激活项目", summaries)
+            self.assertIn("AI 自主 Atlas MCP project/status 确认项目状态", summaries)
+            self.assertTrue(any(item.data.get("mcp_tool") == "trace" and item.data.get("precision") for item in evidence))
+            self.assertFalse(any("缺少 .atlas/atlas.db" in item.summary for item in evidence))
 
     def test_mcp_stdio_client_reads_utf8_tool_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,7 +707,7 @@ for raw in sys.stdin.buffer:
                 AnalyzerSettings(enabled=True),
             )
             summaries = "\n".join(item.summary for item in evidence)
-            self.assertIn("AI 自主 Atlas MCP project/status 确认索引状态", summaries)
+            self.assertIn("AI 自主 Atlas MCP project/status 确认项目状态", summaries)
             self.assertIn("AI 自主 Atlas MCP project/files 找到报告路径候选", summaries)
             self.assertIn("AI 自主 Atlas MCP trace variable 返回 ok=True", summaries)
             self.assertIn("AI 自主 Atlas MCP calls 提取 `handler` 调用图", summaries)
@@ -1336,6 +1392,42 @@ for raw in sys.stdin.buffer:
             self.assertEqual(len(saved["reports"]), 1)
             self.assertIn("服务重启时发现任务未完成", saved["diagnostics"][-1])
 
+    def test_mcp_store_migrates_default_atlas_to_focus_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mcp.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaults": {"atlas": None},
+                        "servers": [
+                            {
+                                "id": "atlas-default",
+                                "name": "Atlas 默认 MCP",
+                                "transport": "stdio",
+                                "kind": "atlas",
+                                "command": "atlas",
+                                "args": ["mcp", "--project", "{project}", "--log-format", "json"],
+                                "cwd": "{project}",
+                                "env": {},
+                                "enabled": True,
+                                "description": "使用本地 atlas mcp 启动项目代码图 MCP Server。",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            store = MCPServerStore(path)
+            store.ensure_default_atlas()
+            migrated = next(item for item in store.list() if item["id"] == "atlas-default")
+
+            self.assertEqual(migrated["args"], ["mcp", "--log-format", "json"])
+            self.assertNotIn("--project", migrated["args"])
+            self.assertEqual(store.defaults()["atlas"], "atlas-default")
+
     def test_api_serves_records_and_html(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1382,9 +1474,13 @@ for raw in sys.stdin.buffer:
                 with urllib.request.urlopen(f"{base}/", timeout=5) as response:
                     html = response.read().decode("utf-8")
                 self.assertEqual(len(runs), 1)
+                self.assertEqual(run["run_origin"], "web")
+                self.assertEqual(runs[0]["run_origin"], "web")
                 self.assertEqual(json_report["run_id"], run["run_id"])
+                self.assertEqual(json_report["run_origin"], "web")
                 self.assertIn("# 漏洞研判报告", markdown_report)
                 self.assertIn(f"- 任务 ID：{created['run_id']}", markdown_report)
+                self.assertIn("- 任务来源：Web 端", markdown_report)
                 self.assertIn("## 发现 1:", markdown_report)
                 self.assertIn("### 调用链 / 数据流概览", markdown_report)
                 self.assertNotIn("```mermaid", markdown_report)
@@ -1449,11 +1545,14 @@ for raw in sys.stdin.buffer:
         self.assertIn('id="default-skill-source"', html)
         self.assertIn('id="run-skill-source"', html)
         self.assertNotIn('id="run-languages"', html)
-        self.assertIn('自动 Atlas 构建索引', html)
+        self.assertIn('预热 Atlas 持久缓存', html)
         self.assertNotIn('自动索引工具', html)
         self.assertNotIn('id="run-agentic-atlas"', html)
         self.assertNotIn('id="run-agentic-atlas-direct"', html)
         self.assertNotIn('直接 AI 自主运行 Atlas MCP', html)
+        self.assertIn('function runOriginLabel(run)', html)
+        self.assertIn('任务来源', html)
+        self.assertIn('chip origin', html)
         self.assertIn('class="run-agent-grid"', html)
         self.assertLess(html.index('id="run-affirmative-provider"'), html.index('id="run-affirmative-agent-profile"'))
         self.assertLess(html.index('id="run-negative-provider"'), html.index('id="run-negative-agent-profile"'))
@@ -1566,6 +1665,29 @@ for raw in sys.stdin.buffer:
 
         client = OpenAICompatibleLLM(api_key="secret", model="fake-model")
         self.assertEqual(client.timeout_seconds, 300)
+
+    def test_openai_compatible_llm_handles_incomplete_read(self):
+        from vuln_judger.llm import OpenAICompatibleLLM
+
+        class BrokenChunkedResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                raise http.client.IncompleteRead(b"")
+
+        client = OpenAICompatibleLLM(api_key="secret", model="fake-model", endpoint="http://127.0.0.1/llm")
+
+        with patch("urllib.request.urlopen", return_value=BrokenChunkedResponse()):
+            result = client.request("system", "user")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("IncompleteRead", result["error"])
 
     def test_to_jsonable_decodes_nested_bytes(self):
         evidence = CodeEvidence(
@@ -1780,6 +1902,12 @@ for raw in sys.stdin.buffer:
             api_thread.start()
             base = f"http://127.0.0.1:{api_server.server_port}"
             try:
+                with urllib.request.urlopen(f"{base}/mcp-servers", timeout=5) as response:
+                    default_mcp_servers = json.loads(response.read().decode("utf-8"))
+                default_atlas = next(item for item in default_mcp_servers if item["id"] == "atlas-default")
+                self.assertEqual(default_atlas["args"], ["mcp", "--log-format", "json"])
+                self.assertNotIn("--project", default_atlas["args"])
+
                 mcp = post_json(
                     f"{base}/mcp-servers",
                     {
@@ -1787,7 +1915,7 @@ for raw in sys.stdin.buffer:
                         "name": "Atlas Test",
                         "kind": "atlas",
                         "command": str(atlas),
-                        "args": ["mcp", "--project", "{project}"],
+                        "args": ["mcp"],
                         "cwd": "{project}",
                         "enabled": True,
                     },
@@ -2032,6 +2160,7 @@ for raw in sys.stdin.buffer:
                     )
                 )
                 self.assertEqual(quick["mode"], "one_round_judge")
+                self.assertEqual(quick["run_origin"], "mcp")
                 self.assertEqual(quick["response_mode"], "compact")
                 self.assertEqual(quick["configuration"]["max_rounds"], 1)
                 self.assertFalse(quick["configuration"]["enable_llm"])
@@ -2058,7 +2187,8 @@ for raw in sys.stdin.buffer:
                 self.assertNotIn("evidence", quick)
                 self.assertNotIn("debate", quick)
                 quick_runs = mcp_tool_json(client.call_tool("list_runs", {"limit": 5}))
-                self.assertTrue(any(item["run_id"] == quick["run_id"] for item in quick_runs["runs"]))
+                quick_run = next(item for item in quick_runs["runs"] if item["run_id"] == quick["run_id"])
+                self.assertEqual(quick_run["run_origin"], "mcp")
                 quick_finding_args = quick["full_report_access"]["mcp_get_finding"]["arguments"]
                 quick_finding = mcp_tool_json(client.call_tool("get_finding", quick_finding_args))
                 self.assertEqual(quick_finding["finding_id"], quick["selected_finding"]["finding_id"])
@@ -2077,12 +2207,15 @@ for raw in sys.stdin.buffer:
                     )
                 )
                 self.assertEqual(judged["finding_count"], 1)
+                self.assertEqual(judged["run_origin"], "mcp")
                 self.assertTrue(judged["saved"])
                 run_id = judged["run_id"]
 
                 runs = mcp_tool_json(client.call_tool("list_runs", {"limit": 5}))
-                self.assertTrue(any(item["run_id"] == run_id for item in runs["runs"]))
+                judged_run = next(item for item in runs["runs"] if item["run_id"] == run_id)
+                self.assertEqual(judged_run["run_origin"], "mcp")
                 run_summary = mcp_tool_json(client.call_tool("get_run", {"run_id": run_id}))
+                self.assertEqual(run_summary["run_origin"], "mcp")
                 finding_id = run_summary["findings"][0]["finding_id"]
                 finding = mcp_tool_json(client.call_tool("get_finding", {"run_id": run_id, "finding_id": finding_id}))
                 self.assertEqual(finding["finding_id"], finding_id)
@@ -2772,12 +2905,22 @@ for raw in sys.stdin:
         params = message.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
-        if name == "project" and args.get("action") == "status":
+        if name == "project" and args.get("action") == "open":
+            tool_response(request_id, {
+                "project": {"path": args.get("project_path"), "storage": args.get("storage", "auto")},
+                "analysis": {"state": "focus-ready", "scope": "project"},
+                "precision": {"coverage_tier": "scoped", "semantic_confidence": "medium"},
+                "work": {"items": []},
+            })
+        elif name == "project" and args.get("action") == "status":
             tool_response(request_id, {
                 "summary": {"files": 1, "symbols": 1, "edges": 2},
                 "project": {"db_path": ".atlas/atlas.db"},
                 "server": {"atlas_version": "fake", "tool_contract_version": 1},
                 "language_capabilities": [{"language": "python", "capability_level": "dataflow_full"}],
+                "analysis": {"state": "focus-ready"},
+                "precision": {"coverage_tier": "scoped", "semantic_confidence": "medium"},
+                "work": {"items": []},
             })
         elif name == "project" and args.get("action") == "files":
             path = args.get("path_prefix", "app.py")
@@ -2790,6 +2933,9 @@ for raw in sys.stdin:
                 "query_id": "q_fake",
                 "kind": "trace_" + args.get("kind", "unknown"),
                 "capability": {"language": "python", "capability_level": "dataflow_full"},
+                "analysis": {"state": "focus-query"},
+                "precision": {"coverage_tier": "scoped", "semantic_confidence": "medium"},
+                "work": {"items": [{"phase": "focus", "status": "done"}]},
                 "result": {"path": [{"file": "app.py", "line": 3}, {"file": "app.py", "line": 4}]},
             })
         elif name == "search":
@@ -2881,7 +3027,14 @@ for raw in sys.stdin:
         params = message.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
-        if name == "project" and args.get("action") == "status":
+        if name == "project" and args.get("action") == "open":
+            tool_response(request_id, {
+                "project": {"path": args.get("project_path"), "storage": args.get("storage", "auto")},
+                "analysis": {"state": "focus-ready"},
+                "precision": {"coverage_tier": "scoped", "semantic_confidence": "low"},
+                "work": {"items": []},
+            })
+        elif name == "project" and args.get("action") == "status":
             tool_response(request_id, {
                 "summary": {"files": 1, "symbols": 0, "edges": 0},
                 "project": {"db_path": ".atlas/atlas.db"},
@@ -2953,7 +3106,14 @@ for raw in sys.stdin:
         params = message.get("params") or {}
         name = params.get("name")
         args = params.get("arguments") or {}
-        if name == "project" and args.get("action") == "status":
+        if name == "project" and args.get("action") == "open":
+            tool_response(request_id, {
+                "project": {"path": args.get("project_path"), "storage": args.get("storage", "auto")},
+                "analysis": {"state": "focus-ready"},
+                "precision": {"coverage_tier": "scoped", "semantic_confidence": "medium"},
+                "work": {"items": []},
+            })
+        elif name == "project" and args.get("action") == "status":
             tool_response(request_id, {
                 "summary": {"files": 1, "symbols": 1, "edges": 2},
                 "project": {"db_path": ".atlas/atlas.db"},

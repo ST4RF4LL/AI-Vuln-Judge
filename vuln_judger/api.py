@@ -19,11 +19,12 @@ from .mcp_config import DEFAULT_MCP_SERVERS_FILE, MCPServerStore
 from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import RunStopped, run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderStore
-from .records import RunRecordStore
+from .records import RunRecordStore, normalize_run_origin
 from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore
 
 
 DEFAULT_RECORDS_DIR = Path(".vuln-judger") / "runs"
+RUN_ORIGIN_WEB = "web"
 LOG = logger("api")
 PROMPT_ECHO_MARKERS = (
     "AGENT.md",
@@ -521,6 +522,7 @@ def _run_detail(run):
     return {
         "run_id": run.get("run_id"),
         "status": run.get("status", "completed"),
+        "run_origin": normalize_run_origin(run),
         "created_at": run.get("created_at"),
         "source_path": run.get("source_path"),
         "sarif_path": run.get("sarif_path"),
@@ -578,6 +580,7 @@ def _task_from_config(config: RunConfig, run_id: str, status: str, error: Option
     return {
         "run_id": run_id,
         "status": status,
+        "run_origin": RUN_ORIGIN_WEB,
         "created_at": _now(),
         "source_path": str(config.source_path),
         "sarif_path": str(config.sarif_path),
@@ -616,6 +619,7 @@ def _run_task(
         def on_progress(progress_report):
             nonlocal last_payload
             payload = to_jsonable(progress_report)
+            payload["run_origin"] = RUN_ORIGIN_WEB
             payload["config"] = _config_task_snapshot(config)
             last_payload = payload
             status = "stopping" if stop_event.is_set() else "pausing" if pause_event.is_set() else "running"
@@ -636,6 +640,7 @@ def _run_task(
             should_stop=lambda: stop_event.is_set() or pause_event.is_set(),
         )
         payload = to_jsonable(report)
+        payload["run_origin"] = RUN_ORIGIN_WEB
         payload["config"] = _config_task_snapshot(config)
         store.save_payload(payload)
         with tasks_lock:
@@ -681,6 +686,7 @@ def _task_from_report_payload(payload: dict, status: str) -> dict:
     return {
         "run_id": payload.get("run_id"),
         "status": status,
+        "run_origin": normalize_run_origin(payload),
         "created_at": payload.get("created_at"),
         "source_path": payload.get("source_path"),
         "sarif_path": payload.get("sarif_path"),
@@ -972,6 +978,7 @@ def _export_run_markdown(run: dict) -> str:
         "",
         f"- 任务 ID：{run.get('run_id') or ''}",
         f"- 状态：{run.get('status', 'completed')}",
+        f"- 任务来源：{_run_origin_label(normalize_run_origin(run))}",
         f"- 创建时间：{run.get('created_at') or ''}",
         f"- 输入报告：{run.get('sarif_path') or ''}",
         f"- 源码目录：{run.get('source_path') or ''}",
@@ -1173,6 +1180,15 @@ def _status_text(status) -> str:
     return labels.get(str(status or ""), str(status or "未知"))
 
 
+def _run_origin_label(origin: str) -> str:
+    labels = {
+        "web": "Web 端",
+        "mcp": "MCP",
+        "unknown": "未知来源",
+    }
+    return labels.get(str(origin or "unknown"), str(origin or "未知来源"))
+
+
 def _report_evidence_graph(report: dict) -> dict:
     graph = report.get("evidence_graph")
     if isinstance(graph, dict) and graph.get("nodes"):
@@ -1360,6 +1376,7 @@ def app_html() -> str:
     .chip.tp {{ color: var(--tp); border-color: #8fd4aa; background: #effaf3; }}
     .chip.fp {{ color: var(--fp); border-color: #edc391; background: #fff7ed; }}
     .chip.inc {{ color: var(--inc); border-color: #c9c1ef; background: #f6f3ff; }}
+    .chip.origin {{ color: #31565d; border-color: #a8c8cd; background: #f0f8f9; }}
     .chip.run-delete {{ cursor: pointer; color: var(--bad); }}
     .chip.run-delete:hover {{ border-color: var(--bad); background: #fff1f0; }}
     .chip.run-stop, .chip.run-pause, .chip.run-resume {{ cursor: pointer; color: var(--accent); }}
@@ -1914,7 +1931,7 @@ def app_html() -> str:
               <label>类型<input id="mcp-kind" value="atlas"></label>
               <label>命令<input id="mcp-command" placeholder="atlas"></label>
               <label class="wide checkbox-row"><input id="mcp-enabled" type="checkbox" checked> 启用 MCP Server</label>
-              <label class="wide">参数 JSON<textarea id="mcp-args" placeholder='["mcp","--project","{{project}}","--log-format","json"]'></textarea></label>
+              <label class="wide">参数 JSON<textarea id="mcp-args" placeholder='["mcp","--log-format","json"]'></textarea></label>
               <label class="wide">工作目录<input id="mcp-cwd" placeholder="{{project}}"></label>
               <label class="wide">环境变量 JSON<textarea id="mcp-env" placeholder='{{"HTTP_PROXY":"http://127.0.0.1:7890"}}'></textarea></label>
               <label class="wide">说明<textarea id="mcp-description" placeholder="本地 Atlas MCP Server"></textarea></label>
@@ -1988,7 +2005,7 @@ def app_html() -> str:
             </div>
             <div class="chips">
               <label><input id="run-external-tools" type="checkbox" checked> 启用外部工具</label>
-              <label><input id="run-auto-index" type="checkbox"> 自动 Atlas 构建索引</label>
+              <label><input id="run-auto-index" type="checkbox"> 预热 Atlas 持久缓存</label>
               <label><input id="run-llm" type="checkbox"> 使用 LLM 博弈</label>
             </div>
             <div class="toolbar">
@@ -2407,6 +2424,14 @@ def app_html() -> str:
         queued: '排队中'
       }};
       return labels[status] || status || '未知状态';
+    }}
+    function runOriginLabel(run) {{
+      const origin = String((run && (run.run_origin || run.origin || run.task_origin)) || '').toLowerCase();
+      if (origin === 'web') return 'Web 端';
+      if (origin === 'mcp') return 'MCP';
+      if (run && run.config && typeof run.config === 'object' && Object.keys(run.config).length) return 'Web 端';
+      if (run && Object.prototype.hasOwnProperty.call(run, 'source_finding_count')) return 'MCP';
+      return '未知来源';
     }}
     function verdictLabel(verdict) {{
       const labels = {{
@@ -3156,6 +3181,7 @@ def app_html() -> str:
       el.list.innerHTML = state.runs.map(run => {{
         const counts = run.verdict_counts || {{}};
         const status = run.status || 'completed';
+        const origin = runOriginLabel(run);
         const pauseButton = status === 'running' || status === 'pausing'
           ? `<span class="chip run-pause" data-run-pause="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="暂停该任务">暂停</span>`
           : '';
@@ -3178,6 +3204,7 @@ def app_html() -> str:
             <div class="path">${{esc(run.source_path || '')}}</div>
           </div>
           <div class="chips">
+            <span class="chip origin">${{esc(origin)}}</span>
             <span class="chip">${{esc(statusLabel(status))}}</span>
             <span class="chip">${{esc(run.finding_count)}} 个发现</span>
           </div>
@@ -3376,10 +3403,12 @@ def app_html() -> str:
       const counts = run.verdict_counts || {{}};
       const providers = run.llm_providers || {{}};
       const agents = run.agent_configs || {{}};
+      const origin = runOriginLabel(run);
       return `<div class="detail metadata-section">
         <h3>运行元数据</h3>
         <div class="detail-body">
           <div class="chips">
+            <span class="chip origin">${{esc(origin)}}</span>
             <span class="chip">${{esc(statusLabel(status))}}</span>
             <span class="chip">${{esc(findings.length)}} 个发现</span>
           </div>
@@ -3394,6 +3423,7 @@ def app_html() -> str:
             <button type="button" data-run-export="markdown" data-run-id="${{esc(run.run_id)}}">导出 Markdown</button>
             <button type="button" data-run-export="json" data-run-id="${{esc(run.run_id)}}">导出 JSON</button>
           </div>
+          <div><strong>任务来源：</strong> ${{esc(origin)}}</div>
           <div><strong>创建时间：</strong> ${{esc(fmtDate(run.created_at))}}</div>
           <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
           <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>

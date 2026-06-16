@@ -79,6 +79,7 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "run_id": payload.get("run_id"),
         "status": payload.get("status", "completed"),
+        "run_origin": normalize_run_origin(payload),
         "created_at": payload.get("created_at"),
         "source_path": payload.get("source_path"),
         "sarif_path": payload.get("sarif_path"),
@@ -93,6 +94,18 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
         "resume_from_finding_id": payload.get("resume_from_finding_id"),
         "resume_from_finding_index": payload.get("resume_from_finding_index"),
     }
+
+
+def normalize_run_origin(payload: Dict[str, Any]) -> str:
+    origin = str(payload.get("run_origin") or payload.get("origin") or payload.get("task_origin") or "").strip().lower()
+    if origin in {"web", "mcp"}:
+        return origin
+    config = payload.get("config")
+    if isinstance(config, dict) and config:
+        return "web"
+    if "source_finding_count" in payload:
+        return "mcp"
+    return "unknown"
 
 
 def _paused_after_restart(payload: Dict[str, Any]) -> Dict[str, Any]:

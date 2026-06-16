@@ -20,7 +20,7 @@ class MCPServerConfig:
     name: str
     transport: str = MCP_TRANSPORT_STDIO
     command: str = "atlas"
-    args: List[str] = field(default_factory=lambda: ["mcp", "--project", "{project}", "--log-format", "json"])
+    args: List[str] = field(default_factory=lambda: ["mcp", "--log-format", "json"])
     cwd: Optional[str] = "{project}"
     env: Dict[str, str] = field(default_factory=dict)
     enabled: bool = True
@@ -163,13 +163,32 @@ class MCPServerStore:
     def ensure_default_atlas(self) -> None:
         data = self._load()
         servers = data.setdefault("servers", [])
-        if any(item.get("id") == "atlas-default" for item in servers):
+        for item in servers:
+            if item.get("id") != "atlas-default":
+                continue
+            changed = False
+            if item.get("args") == ["mcp", "--project", "{project}", "--log-format", "json"]:
+                item["args"] = ["mcp", "--log-format", "json"]
+                changed = True
+            if str(item.get("description") or "").strip() in {
+                "",
+                "使用 atlas mcp --project {project} 启动本地 Atlas MCP Server。",
+                "使用本地 atlas mcp 启动项目代码图 MCP Server。",
+            }:
+                item["description"] = "使用 Atlas v1.5+ MCP Focus 模式启动本地代码图 MCP Server；项目通过 cwd 或 project/open 激活。"
+                changed = True
+            defaults = data.setdefault("defaults", {})
+            if defaults.get("atlas") is None:
+                defaults["atlas"] = "atlas-default"
+                changed = True
+            if changed:
+                self._save(data)
             return
         servers.append(
             MCPServerConfig(
                 id="atlas-default",
                 name="Atlas 默认 MCP",
-                description="使用 atlas mcp --project {project} 启动本地 Atlas MCP Server。",
+                description="使用 Atlas v1.5+ MCP Focus 模式启动本地代码图 MCP Server；项目通过 cwd 或 project/open 激活。",
             ).private_dict()
         )
         data.setdefault("defaults", {})["atlas"] = "atlas-default"

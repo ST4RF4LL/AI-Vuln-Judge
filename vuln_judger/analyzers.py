@@ -78,43 +78,57 @@ class AtlasAnalyzer(Analyzer):
         resolved_locations = self._resolved_locations(finding, indexer)
         atlas_db = indexer.source_root / ".atlas" / "atlas.db"
         diagnostics: List[CodeEvidence] = []
-        if not atlas_db.exists():
-            if not settings.auto_index:
-                diagnostics = [
-                    CodeEvidence(
-                        evidence_id=evidence_id(finding.finding_id, self.name, "not-indexed"),
-                        kind=EvidenceKind.TOOL_DIAGNOSTIC,
-                        strength=EvidenceStrength.PARTIAL,
-                        summary="Atlas 已安装，但缺少 .atlas/atlas.db；请先在源码目录执行 atlas index --analysis full，或使用 --auto-index-tools 自动 Atlas 构建索引",
-                        source=self.name,
-                    )
-                ]
-                return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
-            diagnostics.extend(self._index_project(finding, indexer, settings))
-        if not atlas_db.exists():
-            return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
-        diagnostics.append(
-            CodeEvidence(
-                evidence_id=evidence_id(finding.finding_id, self.name, "database-present"),
-                kind=EvidenceKind.TOOL_DIAGNOSTIC,
-                strength=EvidenceStrength.MEDIUM,
-                summary="检测到 Atlas 数据库 .atlas/atlas.db，将通过 AI 自主 Atlas MCP 输出数据流、调用图和源码上下文",
-                source=self.name,
-                data={"database": str(atlas_db), "mcp_preferred": True},
-            )
-        )
-        if not self._supports_mcp(settings):
+        mcp_supported = self._supports_mcp(settings)
+        if not mcp_supported:
+            if settings.auto_index and self.binary:
+                diagnostics.extend(self._index_project(finding, indexer, settings))
             diagnostics.append(
                 CodeEvidence(
                     evidence_id=evidence_id(finding.finding_id, self.name, "mcp-unavailable"),
                     kind=EvidenceKind.TOOL_DIAGNOSTIC,
                     strength=EvidenceStrength.WEAK,
-                    summary="Atlas 数据库已存在，但当前 Atlas 未提供 MCP 子命令；无法提取数据流 trace 和调用图。请确认 Atlas 版本支持 mcp 子命令",
+                    summary="当前 Atlas 未提供 MCP 子命令；无法使用 Atlas Focus 查询提取数据流 trace 和调用图。请确认 Atlas 版本支持 mcp 子命令",
                     source=self.name,
-                    data={"database": str(atlas_db), "mcp_supported": False},
+                    data={"database": str(atlas_db) if atlas_db.exists() else None, "mcp_supported": False},
                 )
             )
             return diagnostics + self._agentic_source_reading_evidence(finding, indexer)
+        if atlas_db.exists():
+            diagnostics.append(
+                CodeEvidence(
+                    evidence_id=evidence_id(finding.finding_id, self.name, "database-present"),
+                    kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                    strength=EvidenceStrength.MEDIUM,
+                    summary="检测到 Atlas 持久缓存 .atlas/atlas.db，将通过 AI 自主 Atlas MCP 输出数据流、调用图和源码上下文",
+                    source=self.name,
+                    data={"database": str(atlas_db), "mcp_preferred": True, "focus_runtime": True},
+                )
+            )
+        else:
+            if settings.auto_index:
+                if self.binary:
+                    diagnostics.extend(self._index_project(finding, indexer, settings))
+                else:
+                    diagnostics.append(
+                        CodeEvidence(
+                            evidence_id=evidence_id(finding.finding_id, self.name, "prewarm-unavailable"),
+                            kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                            strength=EvidenceStrength.WEAK,
+                            summary="已请求预热 Atlas 持久缓存，但本机未找到 atlas CLI；继续使用已配置的 Atlas MCP Focus 查询",
+                            source=self.name,
+                            data={"database": None, "mcp_preferred": True, "focus_runtime": True, "auto_index_tools": settings.auto_index},
+                        )
+                    )
+            diagnostics.append(
+                CodeEvidence(
+                    evidence_id=evidence_id(finding.finding_id, self.name, "focus-runtime"),
+                    kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                    strength=EvidenceStrength.MEDIUM,
+                    summary="未检测到 Atlas 持久缓存 .atlas/atlas.db；将直接使用 Atlas v1.5+ MCP Focus 查询按需分析，无需预先执行 atlas index",
+                    source=self.name,
+                    data={"database": None, "mcp_preferred": True, "focus_runtime": True, "auto_index_tools": settings.auto_index},
+                )
+            )
         agentic_evidence = self._agentic_mcp_evidence(finding, indexer, settings, resolved_locations)
         return diagnostics + agentic_evidence + self._agentic_source_reading_evidence(finding, indexer)
 
@@ -276,6 +290,7 @@ class AtlasAnalyzer(Analyzer):
                     )
                 ]
                 if "project" in tools:
+                    evidence.append(self._agentic_project_open_evidence(client, finding, indexer, settings))
                     status_payload, status_text, status_error = _safe_mcp_tool_payload(client, "project", {"action": "status", "verbose": True})
                     evidence.append(self._agentic_status_evidence(finding, status_payload, status_text, status_error))
                     evidence.extend(self._agentic_file_evidence(client, finding, indexer, path_prefixes))
@@ -314,6 +329,52 @@ class AtlasAnalyzer(Analyzer):
                 )
             ]
 
+    def _agentic_project_open_evidence(
+        self, client: MCPStdioClient, finding: Finding, indexer: SourceIndexer, settings: AnalyzerSettings
+    ) -> CodeEvidence:
+        storage = "persistent" if settings.auto_index else "auto"
+        arguments = {"action": "open", "project_path": str(indexer.source_root), "storage": storage}
+        payload, raw_text, is_error = _safe_mcp_tool_payload(client, "project", arguments)
+        if is_error or not isinstance(payload, dict):
+            return CodeEvidence(
+                evidence_id=evidence_id(finding.finding_id, self.name, "agentic-open"),
+                kind=EvidenceKind.TOOL_DIAGNOSTIC,
+                strength=EvidenceStrength.WEAK,
+                summary="AI 自主 Atlas MCP project/open 未确认项目激活；将继续使用 MCP 启动目录尝试查询"
+                + (f"：{raw_text[:240]}" if raw_text else ""),
+                source="atlas-agent-mcp",
+                data={
+                    "transport": "mcp",
+                    "mcp_tool": "project/open",
+                    "mcp_success": False,
+                    "agentic_atlas": True,
+                    "focus_runtime": True,
+                    "storage": storage,
+                    "project_path": str(indexer.source_root),
+                    "raw": raw_text[:1000],
+                },
+            )
+        return CodeEvidence(
+            evidence_id=evidence_id(finding.finding_id, self.name, "agentic-open"),
+            kind=EvidenceKind.TOOL_DIAGNOSTIC,
+            strength=EvidenceStrength.MEDIUM,
+            summary=f"AI 自主 Atlas MCP project/open 已激活项目：storage={storage}",
+            source="atlas-agent-mcp",
+            data={
+                "transport": "mcp",
+                "mcp_tool": "project/open",
+                "mcp_success": True,
+                "agentic_atlas": True,
+                "focus_runtime": True,
+                "storage": storage,
+                "project_path": str(indexer.source_root),
+                "project": payload.get("project") or payload.get("result") or {},
+                "analysis": payload.get("analysis") or {},
+                "precision": payload.get("precision") or {},
+                "work": payload.get("work") or {},
+            },
+        )
+
     def _agentic_status_evidence(self, finding: Finding, payload: Any, raw_text: str, is_error: bool) -> CodeEvidence:
         if is_error or not isinstance(payload, dict):
             return CodeEvidence(
@@ -324,25 +385,32 @@ class AtlasAnalyzer(Analyzer):
                 source="atlas-agent-mcp",
                 data={"transport": "mcp", "mcp_tool": "project/status", "mcp_success": False, "raw": raw_text[:1000]},
             )
-        summary = payload.get("summary") or {}
+        summary = _mcp_result_dict(payload).get("summary") or payload.get("summary") or {}
         bits = []
         for key, label in (("files", "文件"), ("symbols", "符号"), ("edges", "边")):
             if summary.get(key) is not None:
                 bits.append(f"{label} {summary.get(key)}")
+        precision_text = _mcp_precision_text(payload)
+        if precision_text:
+            bits.append(precision_text)
         return CodeEvidence(
             evidence_id=evidence_id(finding.finding_id, self.name, "agentic-status"),
             kind=EvidenceKind.TOOL_DIAGNOSTIC,
             strength=EvidenceStrength.MEDIUM,
-            summary="AI 自主 Atlas MCP project/status 确认索引状态" + ("：" + "，".join(bits) if bits else ""),
+            summary="AI 自主 Atlas MCP project/status 确认项目状态" + ("：" + "，".join(bits) if bits else ""),
             source="atlas-agent-mcp",
             data={
                 "transport": "mcp",
                 "mcp_tool": "project/status",
                 "mcp_success": True,
                 "agentic_atlas": True,
+                "focus_runtime": True,
                 "summary": summary,
-                "project": payload.get("project") or {},
-                "server": payload.get("server") or {},
+                "project": payload.get("project") or _mcp_result_dict(payload).get("project") or {},
+                "server": payload.get("server") or _mcp_result_dict(payload).get("server") or {},
+                "analysis": payload.get("analysis") or {},
+                "precision": payload.get("precision") or {},
+                "work": payload.get("work") or {},
             },
         )
 
@@ -354,7 +422,7 @@ class AtlasAnalyzer(Analyzer):
             payload, _, is_error = _safe_mcp_tool_payload(client, "project", {"action": "files", "path_prefix": prefix, "limit": 50})
             if is_error or not isinstance(payload, dict):
                 continue
-            for item in payload.get("files") or []:
+            for item in _mcp_files(payload):
                 path = str(item.get("path") or "")
                 if not path:
                     continue
@@ -392,7 +460,7 @@ class AtlasAnalyzer(Analyzer):
             payload, _, is_error = _safe_mcp_tool_payload(client, "search", {"query": term, "limit": 10})
             if is_error or not isinstance(payload, dict):
                 continue
-            for item in payload.get("results") or []:
+            for item in _mcp_results(payload):
                 if not isinstance(item, dict):
                     continue
                 marker = (str(item.get("qualified_name") or item.get("name") or ""), str(item.get("file") or ""), _optional_int(item.get("line")) or 0)
@@ -558,7 +626,7 @@ class AtlasAnalyzer(Analyzer):
             return server.command_for_project(indexer.source_root)
         if self.binary is None:
             raise ValueError("Atlas binary 未配置")
-        command = [self.binary, "mcp", "--project", str(indexer.source_root), "--log-format", "json"]
+        command = [self.binary, "mcp", "--log-format", "json"]
         return command, indexer.source_root, {}
 
     def _configured_mcp_server(self, settings: AnalyzerSettings):
@@ -581,9 +649,10 @@ class AtlasAnalyzer(Analyzer):
                 source="atlas-mcp",
                 data={"transport": "mcp", "mcp_success": False, "raw": raw_text[:1000]},
             )
-        summary_data = payload.get("summary") or {}
-        project_data = payload.get("project") or {}
-        server_data = payload.get("server") or {}
+        result_data = _mcp_result_dict(payload)
+        summary_data = result_data.get("summary") or payload.get("summary") or {}
+        project_data = payload.get("project") or result_data.get("project") or {}
+        server_data = payload.get("server") or result_data.get("server") or {}
         language = detect_language(finding.primary_location.file) if finding.primary_location else None
         language_capability = _mcp_language_capability(payload, language)
         files_indexed = summary_data.get("files")
@@ -598,7 +667,10 @@ class AtlasAnalyzer(Analyzer):
             bits.append(f"边 {edges}")
         if language and language_capability:
             bits.append(f"{language} 能力 {language_capability.get('capability_level')}")
-        summary = "Atlas MCP project/status 确认索引可用"
+        precision_text = _mcp_precision_text(payload)
+        if precision_text:
+            bits.append(precision_text)
+        summary = "Atlas MCP project/status 确认项目状态可用"
         if bits:
             summary += "：" + "，".join(bits)
         return CodeEvidence(
@@ -620,6 +692,9 @@ class AtlasAnalyzer(Analyzer):
                 "language": language,
                 "language_level": language_capability.get("capability_level") if language_capability else None,
                 "trace_supported": trace_available,
+                "analysis": payload.get("analysis") or {},
+                "precision": payload.get("precision") or {},
+                "work": payload.get("work") or {},
             },
         )
 
@@ -636,7 +711,7 @@ class AtlasAnalyzer(Analyzer):
             payload, _, is_error = _safe_mcp_tool_payload(client, "project", {"action": "files", "path_prefix": resolved.relative_path, "limit": 20})
             if is_error or not isinstance(payload, dict):
                 continue
-            for item in payload.get("files") or []:
+            for item in _mcp_files(payload):
                 if item.get("path") != resolved.relative_path:
                     continue
                 matched_files.append(resolved.relative_path)
@@ -735,7 +810,7 @@ class AtlasAnalyzer(Analyzer):
             payload, _, is_error = _safe_mcp_tool_payload(client, "search", {"query": term, "limit": 10})
             if is_error or not isinstance(payload, dict):
                 continue
-            candidates = payload.get("results") or []
+            candidates = _mcp_results(payload)
             location = term_locations.get(term) or (SourceLocation(file=resolved_locations[0].relative_path) if resolved_locations else None)
             chosen = _choose_mcp_symbol(candidates, location.file if location else "", term)
             if not chosen:
@@ -969,7 +1044,8 @@ def _trace_column(indexer: SourceIndexer, resolved: ResolvedLocation, line: int)
 def _mcp_language_capability(payload: Dict[str, Any], language: Optional[str]) -> Optional[Dict[str, Any]]:
     if not language:
         return None
-    for item in payload.get("language_capabilities") or []:
+    result = _mcp_result_dict(payload)
+    for item in payload.get("language_capabilities") or result.get("language_capabilities") or []:
         if item.get("language") == language:
             return item
     return None
@@ -992,6 +1068,37 @@ def _mcp_partial_json(text: str) -> Optional[Dict[str, Any]]:
     if language or capability_level:
         result["capability"] = {"language": language, "capability_level": capability_level}
     return result if len(result) > 1 else None
+
+
+def _mcp_result_dict(payload: Dict[str, Any]) -> Dict[str, Any]:
+    result = payload.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+def _mcp_files(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    result = _mcp_result_dict(payload)
+    files = payload.get("files") or result.get("files") or []
+    return [item for item in files if isinstance(item, dict)]
+
+
+def _mcp_results(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    result = _mcp_result_dict(payload)
+    results = payload.get("results") or result.get("results") or []
+    return [item for item in results if isinstance(item, dict)]
+
+
+def _mcp_precision_text(payload: Dict[str, Any]) -> str:
+    precision = payload.get("precision")
+    if not isinstance(precision, dict):
+        return ""
+    coverage = precision.get("coverage_tier") or precision.get("coverage")
+    confidence = precision.get("semantic_confidence") or precision.get("confidence")
+    parts = []
+    if coverage:
+        parts.append(f"覆盖 {coverage}")
+    if confidence:
+        parts.append(f"语义置信 {confidence}")
+    return "Precision " + "/".join(parts) if parts else ""
 
 
 def _mcp_trace_item(
@@ -1054,6 +1161,12 @@ def _mcp_trace_item(
     capability = payload.get("capability") or {}
     if isinstance(capability, dict) and capability.get("capability_level"):
         summary += f"，能力 {capability.get('language')}:{capability.get('capability_level')}"
+    precision_text = _mcp_precision_text(payload)
+    if precision_text:
+        summary += f"，{precision_text}"
+    work = payload.get("work")
+    if isinstance(work, dict) and work:
+        summary += "，包含 Focus 后台工作信息"
     return CodeEvidence(
         evidence_id=evidence_id(
             finding.finding_id,
@@ -1080,6 +1193,11 @@ def _mcp_trace_item(
             "query_id": payload.get("query_id"),
             "truncated_json": bool(payload.get("truncated_json")),
             "language_level": capability.get("capability_level") if isinstance(capability, dict) else None,
+            "analysis": payload.get("analysis") or {},
+            "precision": payload.get("precision") or {},
+            "work": payload.get("work") or {},
+            "lazy_diagnostics": payload.get("lazy_diagnostics") or [],
+            "analysis_contract": payload.get("analysis_contract") or {},
             "trace_file": location.file,
             "trace_line": location.line,
             "trace_column": location.column,
@@ -1119,7 +1237,8 @@ def _choose_mcp_symbol(candidates: Sequence[Dict[str, Any]], relative_path: str,
 def _mcp_call_entries(payload: Dict[str, Any], key: str) -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
     seen = set()
-    for hop in payload.get("hops") or []:
+    result = _mcp_result_dict(payload)
+    for hop in payload.get("hops") or result.get("hops") or []:
         for item in hop.get(key) or []:
             if not isinstance(item, dict):
                 continue

@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import time
+import http.client
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -81,14 +82,14 @@ class OpenAICompatibleLLM(LLMClient):
                 exc,
             )
             return _failure(None, started, str(exc))
-        except (socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
+        except (http.client.IncompleteRead, http.client.HTTPException, socket.timeout, TimeoutError, ConnectionError, OSError) as exc:
             LOG.warning(
                 "LLM 连接错误 provider=%s latency_ms=%s error=%s",
                 self.provider_id or self.provider_name or "unknown",
                 _latency_ms(started),
                 exc,
             )
-            return _failure(None, started, str(exc))
+            return _failure(None, started, f"{exc.__class__.__name__}: {exc}")
         try:
             body = json.loads(body_text)
         except json.JSONDecodeError as exc:

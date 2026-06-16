@@ -29,7 +29,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--source", required=True, type=Path, help="报告对应的源码目录")
     run_parser.add_argument("--skills", type=Path, help="项目知识库 skill 目录")
     run_parser.add_argument("--max-rounds", type=int, default=4, help="最大博弈回合数")
-    run_parser.add_argument("--auto-index-tools", action="store_true", help="自动 Atlas 构建索引")
+    run_parser.add_argument("--auto-index-tools", action="store_true", help="预热 Atlas 持久缓存")
     run_parser.add_argument("--no-external-tools", action="store_true", help="禁用 Atlas/CodeQL 探测")
     run_parser.add_argument("--llm", action="store_true", help="使用 OpenAI-compatible LLM 生成正反方和主持人回合")
     run_parser.add_argument("--llm-model", help="--llm 使用的模型名；也可使用 VULN_JUDGER_LLM_MODEL")
@@ -56,7 +56,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="运行记录保存目录")
     run_parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE, help="日志文件路径")
 
-    api_parser = subparsers.add_parser("api", help="启动本地 HTTP API 和 Web 界面")
+    api_parser = subparsers.add_parser(
+        "api",
+        help="启动本地 HTTP API 和 Web 界面",
+        description=(
+            "不传参数时使用默认快速启动配置：127.0.0.1:8765，"
+            ".vuln-judger/runs，.vuln-judger/providers.json，agents，"
+            ".vuln-judger/mcp.json，.vuln-judger/skills.json，"
+            ".vuln-judger/logs/vuln-judger.log"
+        ),
+    )
     api_parser.add_argument("--host", default="127.0.0.1")
     api_parser.add_argument("--port", default=8765, type=int)
     api_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="运行记录保存目录")
