@@ -2010,8 +2010,6 @@ def app_html() -> str:
             </div>
             <div class="toolbar">
               <button id="start-run" type="button">启动任务</button>
-              <button id="fill-demo-run" type="button">填入 SARIF 示例</button>
-              <button id="fill-markdown-demo-run" type="button">填入 Markdown 示例</button>
             </div>
             <pre id="run-result">尚未启动任务。</pre>
           </div>
@@ -2169,8 +2167,6 @@ def app_html() -> str:
     document.getElementById('delete-skill').addEventListener('click', deleteSkillSource);
     document.getElementById('save-skill-defaults').addEventListener('click', saveSkillDefaults);
     document.getElementById('start-run').addEventListener('click', startRun);
-    document.getElementById('fill-demo-run').addEventListener('click', fillDemoRun);
-    document.getElementById('fill-markdown-demo-run').addEventListener('click', fillMarkdownDemoRun);
     el.runAffirmativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
     el.runNegativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
     el.runModeratorProvider.addEventListener('change', enableRunLlmForSelectedProviders);
@@ -2675,6 +2671,61 @@ def app_html() -> str:
       if (source) el.runSkills.value = source.path || '';
     }}
 
+    function setSelectValue(select, value, label) {{
+      const normalized = value || '';
+      if (normalized && !Array.from(select.options).some(option => option.value === normalized)) {{
+        const option = document.createElement('option');
+        option.value = normalized;
+        option.textContent = label || `${{normalized}} / 历史配置`;
+        select.appendChild(option);
+      }}
+      select.value = normalized;
+    }}
+
+    async function copyRunToConfig(runId) {{
+      if (!runId) return;
+      try {{
+        el.runResult.textContent = '正在读取历史任务配置...';
+        const run = await fetchJson(`/runs/${{encodeURIComponent(runId)}}`);
+        await Promise.all([loadProviders(), loadAgentPrompts(), loadIntegrations()]);
+        fillRunConfigFromHistory(run);
+        el.runConfigModal.classList.add('open');
+      }} catch (error) {{
+        el.runConfigModal.classList.add('open');
+        el.runResult.textContent = error.message;
+      }}
+    }}
+
+    function fillRunConfigFromHistory(run) {{
+      const config = (run && run.config && typeof run.config === 'object') ? run.config : {{}};
+      const agents = (run && run.agent_configs && typeof run.agent_configs === 'object') ? run.agent_configs : {{}};
+      const agentConfig = role => config[`${{role}}_agent`] || agents[role] || {{}};
+      const agentProfile = role => {{
+        const value = agentConfig(role);
+        return value.profile_id || value.profile || value.id || '';
+      }};
+      el.runSarif.value = config.report_path || config.sarif_path || run.sarif_path || '';
+      el.runSource.value = config.source_path || run.source_path || '';
+      el.runSkills.value = config.skills_path || '';
+      setSelectValue(el.runSkillSource, config.skill_source_id || '');
+      setSelectValue(el.runAffirmativeProvider, config.affirmative_provider_id || '');
+      setSelectValue(el.runNegativeProvider, config.negative_provider_id || '');
+      setSelectValue(el.runModeratorProvider, config.moderator_provider_id || '');
+      setSelectValue(el.runAffirmativeAgentProfile, agentProfile('affirmative'));
+      setSelectValue(el.runNegativeAgentProfile, agentProfile('negative'));
+      setSelectValue(el.runModeratorAgentProfile, agentProfile('moderator'));
+      el.runMaxRounds.value = String(config.max_rounds || 4);
+      el.runExternalTools.checked = config.enable_external_tools !== false;
+      el.runAutoIndex.checked = Boolean(config.auto_index_tools);
+      el.runLlm.checked = Boolean(
+        config.enable_llm ||
+        config.affirmative_provider_id ||
+        config.negative_provider_id ||
+        config.moderator_provider_id
+      );
+      el.runResult.textContent = `已从 ${{run.run_id || '历史任务'}} 填入配置。可调整参数后再启动。`;
+    }}
+
     async function saveSkillSource() {{
       try {{
         const payload = {{
@@ -3032,30 +3083,6 @@ def app_html() -> str:
       }} catch (error) {{
         el.providerResult.textContent = error.message;
       }}
-    }}
-
-    function fillDemoRun() {{
-      el.runSarif.value = 'fixtures/demo_sarif/report.sarif';
-      el.runSource.value = 'fixtures/demo_sarif/source';
-      el.runSkills.value = 'fixtures/demo_sarif/skills';
-      el.runSkillSource.value = '';
-      el.runMaxRounds.value = '4';
-      el.runExternalTools.checked = false;
-      el.runAutoIndex.checked = false;
-      enableRunLlmForSelectedProviders();
-      el.runResult.textContent = '已填入 SARIF 示例路径。';
-    }}
-
-    function fillMarkdownDemoRun() {{
-      el.runSarif.value = 'fixtures/demo_markdown/report.md';
-      el.runSource.value = 'fixtures/demo_sarif/source';
-      el.runSkills.value = 'fixtures/demo_sarif/skills';
-      el.runSkillSource.value = '';
-      el.runMaxRounds.value = '4';
-      el.runExternalTools.checked = false;
-      el.runAutoIndex.checked = false;
-      enableRunLlmForSelectedProviders();
-      el.runResult.textContent = '已填入 Markdown 示例路径。';
     }}
 
     async function startRun() {{
@@ -3420,6 +3447,7 @@ def app_html() -> str:
           </div>
           <div class="toolbar">
             ${{detailControls}}
+            <button type="button" data-run-copy-config="true" data-run-id="${{esc(run.run_id)}}">填入新任务</button>
             <button type="button" data-run-export="markdown" data-run-id="${{esc(run.run_id)}}">导出 Markdown</button>
             <button type="button" data-run-export="json" data-run-id="${{esc(run.run_id)}}">导出 JSON</button>
           </div>
@@ -3503,6 +3531,12 @@ def app_html() -> str:
     }}
 
     function bindRunControlButtons(root) {{
+      for (const button of root.querySelectorAll('[data-run-copy-config]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          copyRunToConfig(button.dataset.runId);
+        }});
+      }}
       for (const button of root.querySelectorAll('[data-run-pause]')) {{
         button.addEventListener('click', event => {{
           event.stopPropagation();
