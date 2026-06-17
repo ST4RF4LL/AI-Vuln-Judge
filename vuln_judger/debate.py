@@ -48,13 +48,6 @@ class DebateDecision:
 
 
 @dataclass
-class SideConclusion:
-    label: str
-    verdict: Verdict
-    statement: str
-
-
-@dataclass
 class ModeratorRoundDecision:
     continue_debate: bool
     unresolved: List[str]
@@ -267,7 +260,7 @@ class DebateOrchestrator:
         impact_ids = _ids(evidence, EvidenceKind.IMPACT, EvidenceKind.PROJECT_CONTEXT)
         tool_diag_ids = _ids(evidence, EvidenceKind.TOOL_DIAGNOSTIC)
         configured_rounds = max(1, int(self.max_rounds or 1))
-        max_regular_round = 1 if configured_rounds == 1 else configured_rounds - 1
+        max_regular_round = configured_rounds
         affirmative_report = self._llm_claim(
             "AFFIRMATIVE",
             (
@@ -372,8 +365,7 @@ class DebateOrchestrator:
         self._emit_progress(bundle, base_decision, turns)
         unresolved = moderator_decision.unresolved
         if not moderator_decision.continue_debate:
-            final_round = 1 if configured_rounds == 1 else min(configured_rounds, 2)
-            return self._finalize_debate(bundle, base_decision, challenges, turns, last_negative, final_round)
+            return self._finalize_debate(bundle, base_decision, challenges, turns, 1)
 
         for round_index in range(2, max_regular_round + 1):
             clarification = self._llm_claim(
@@ -463,10 +455,9 @@ class DebateOrchestrator:
             self._emit_progress(bundle, base_decision, turns)
             unresolved = moderator_decision.unresolved
             if not moderator_decision.continue_debate:
-                final_round = min(configured_rounds, round_index + 1)
-                return self._finalize_debate(bundle, base_decision, challenges, turns, last_negative, final_round)
+                return self._finalize_debate(bundle, base_decision, challenges, turns, round_index)
 
-        return self._finalize_debate(bundle, base_decision, challenges, turns, last_negative, configured_rounds)
+        return self._finalize_debate(bundle, base_decision, challenges, turns, configured_rounds)
 
     def _finalize_debate(
         self,
@@ -474,56 +465,22 @@ class DebateOrchestrator:
         base_decision: DebateDecision,
         challenges: Sequence[str],
         turns: List[DebateTurn],
-        last_negative: str,
         final_round: int,
     ) -> Tuple[List[DebateTurn], str, DebateDecision]:
         evidence = bundle.evidence
-        source_root_ids = _ids(evidence, EvidenceKind.SOURCE_ROOT)
-        report_ids = _ids(evidence, EvidenceKind.REPORT)
-        location_ids = _ids(evidence, EvidenceKind.SOURCE_LOCATION)
-        flow_ids = _ids(evidence, EvidenceKind.SARIF_CODE_FLOW, EvidenceKind.DATA_FLOW, EvidenceKind.CALL_CHAIN)
-        protection_ids = _ids(evidence, EvidenceKind.PROTECTION)
-        impact_ids = _ids(evidence, EvidenceKind.IMPACT, EvidenceKind.PROJECT_CONTEXT)
-        tool_diag_ids = _ids(evidence, EvidenceKind.TOOL_DIAGNOSTIC)
-        affirmative_final = self._side_conclusion("AFFIRMATIVE", bundle, base_decision, challenges, last_negative)
-        turns.append(
-            _make_debate_turn(
-                role=DebateRole.AFFIRMATIVE,
-                round_index=final_round,
-                claim=f"## 正方结案\n【{affirmative_final.label}】，{affirmative_final.statement}",
-                evidence_ids=source_root_ids + report_ids + location_ids + flow_ids + impact_ids,
-                resolved=True,
-                decision=base_decision,
-                unresolved=challenges,
-            )
-        )
-        self._emit_progress(bundle, base_decision, turns)
-        negative_final = self._side_conclusion("NEGATIVE", bundle, base_decision, challenges, last_negative)
-        turns.append(
-            _make_debate_turn(
-                role=DebateRole.NEGATIVE,
-                round_index=final_round,
-                claim=f"## 反方结案\n【{negative_final.label}】，{negative_final.statement}",
-                evidence_ids=source_root_ids + protection_ids + tool_diag_ids + location_ids + flow_ids,
-                resolved=True,
-                decision=base_decision,
-                unresolved=challenges,
-            )
-        )
-        self._emit_progress(bundle, base_decision, turns)
-        side_final_conclusion = _final_conclusion(affirmative_final, negative_final)
         moderator_summary = self._moderator_summary(
             bundle,
             base_decision,
             challenges,
-            affirmative_final,
-            negative_final,
-            side_final_conclusion,
             turns,
         )
         evidence_graph = build_evidence_graph(evidence, challenges)
-        final_conclusion = _append_evidence_graph_markdown(moderator_summary or side_final_conclusion, evidence_graph)
-        decision = _decision_from_conclusions(base_decision, affirmative_final, negative_final, final_conclusion)
+        fallback_conclusion = _fallback_moderator_final_conclusion(bundle, base_decision, challenges)
+        final_conclusion = _append_evidence_graph_markdown(
+            _ensure_moderator_final_label(moderator_summary, base_decision) if moderator_summary else fallback_conclusion,
+            evidence_graph,
+        )
+        decision = _decision_from_moderator_conclusion(base_decision, final_conclusion)
         turns.append(
             _make_debate_turn(
                 role=DebateRole.MODERATOR,
@@ -865,66 +822,40 @@ class DebateOrchestrator:
             replies.append("影响已从规则/消息和项目上下文映射，可结合调用链进一步归因到具体汇点。")
         return " ".join(replies)
 
-    def _side_conclusion(
-        self,
-        role: str,
-        bundle: EvidenceBundle,
-        decision: DebateDecision,
-        challenges: Sequence[str],
-        last_negative: str,
-    ) -> SideConclusion:
-        label, verdict, statement = _fallback_side_conclusion(role, bundle, decision, challenges)
-        llm_statement = self._llm_response(
-            role,
-            (
-                f"给出简短结案陈述。当前结案方向为【{label}】，系统会自动添加标签。"
-                "你只需要输出结案陈述正文 1 到 3 句话，不要输出 Markdown 表格，"
-                "不要复述或讨论用户要求、任务要求、标签、格式约束、角色名称或指令遵循过程。"
-            ),
-            bundle,
-            extra=_stage_context("结案", "最近一轮反方意见：\n" + last_negative, challenges, ""),
-            output_instruction="只返回结案陈述正文 1 到 3 句话；不要说明你要做什么，不要复述任务、标签、约束或格式要求。",
-        )
-        if llm_statement:
-            statement = _clean_final_statement(llm_statement, label) or statement
-        return SideConclusion(label=label, verdict=verdict, statement=statement)
-
     def _moderator_summary(
         self,
         bundle: EvidenceBundle,
         decision: DebateDecision,
         challenges: Sequence[str],
-        affirmative_final: SideConclusion,
-        negative_final: SideConclusion,
-        side_final_conclusion: str,
         turns: Sequence[DebateTurn],
     ) -> Optional[str]:
         turn_context = "\n\n".join(
-            f"{_role_label(turn.role.value)}第 {turn.round_index} 回合：\n{_turn_prompt_text(turn)}" for turn in turns[-6:]
+            f"{_role_label(turn.role.value)}第 {turn.round_index} 回合：\n{_turn_prompt_text(turn)}" for turn in turns[-8:]
         )
         llm_summary = self._llm_response(
             "MODERATOR",
             (
-                "作为中立 Moderator，总结正反方核心观点、双方一致点、主要分歧、证据闭环状态和最终研判。"
+                "作为中立 Moderator，负责最终总结和结案。总结正反方核心观点、双方一致点、主要分歧、证据闭环状态和最终研判。"
                 "必须自主串联证据链并审查双方是否达成各自目标：正方是否证明可达攻击链，反方是否客观验证断点，"
                 "Moderator 是否识别了复读、异常报告读取、证据跳跃和仍未闭环缺口。"
                 "不得新增证据链之外的新事实；不得替任一方辩护；只基于双方陈述和证据 ID 做客观归纳。"
-                "输出 2 到 5 句话，不要使用 Markdown 表格。"
+                "必须给出唯一结论标签：真实漏洞、误报、证据不足、可达性存疑。输出 2 到 5 句话，不要使用 Markdown 表格。"
             ),
             bundle,
             extra=_stage_context(
                 "主持人总结",
                 (
-                    f"正方结案：【{affirmative_final.label}】，{affirmative_final.statement}\n"
-                    f"反方结案：【{negative_final.label}】，{negative_final.statement}\n"
                     f"自动裁决摘要：{decision.reasoning_summary}\n"
-                    f"当前合成结论：{side_final_conclusion}\n"
+                    f"自动裁决标签参考：{_moderator_label_from_decision(decision)}\n"
                     f"最近回合：\n{turn_context}"
                 ),
                 challenges,
                 _moderator_autonomous_review_context(bundle, turns, challenges),
             ),
-            output_instruction="只返回主持人总结正文 2 到 5 句话；不要说明你要做什么，不要复述任务、标签或格式要求。",
+            output_instruction=(
+                "只返回主持人最终总结正文 2 到 5 句话；开头必须包含一个结论标签，如【真实漏洞】、【误报】、"
+                "【证据不足】或【可达性存疑】；不要说明你要做什么，不要复述任务、标签或格式要求。"
+            ),
         )
         if not llm_summary:
             return None
@@ -1672,7 +1603,7 @@ def _render_structured_turn(structured: Dict[str, Any]) -> str:
     position = str(structured.get("position") or "").strip()
     if position:
         lines.append(f"结论倾向：{position}")
-    lines.append("状态：" + ("已闭环或进入结案" if structured.get("resolved") else "仍需验证"))
+    lines.append("状态：" + ("已闭环或进入主持人总结" if structured.get("resolved") else "仍需验证"))
     summary = str(structured.get("summary") or "").strip()
     if summary:
         lines.extend(["核心陈述：", f"- {summary}"])
@@ -2661,7 +2592,7 @@ def _fallback_moderator_round_decision(
                 round_index,
                 False,
                 unresolved,
-                "已达到预设轮数，本轮分析后进入正方、反方和 Moderator 的最终总结。",
+                "已达到预设轮数，本轮正反方交锋后由 Moderator 进入最终总结。",
             ),
         )
     if _can_reach_consensus(base_decision, unresolved):
@@ -2780,7 +2711,7 @@ def _ensure_moderator_decision_summary(text: str, continue_debate: bool, unresol
 
 
 def _append_moderator_limit_notice(summary: str, round_index: int) -> str:
-    notice = f"已达到第 {round_index} 个可交锋回合，下一轮进入最终总结。"
+    notice = f"已达到第 {round_index} 个可交锋回合，本轮后由 Moderator 进入最终总结。"
     if notice in summary:
         return summary
     return summary.rstrip() + "\n\n" + notice
@@ -2804,44 +2735,6 @@ def _challenge_lines(challenges: Sequence[str]) -> str:
     if not items:
         return "- 无"
     return "\n".join(f"- {item}" for item in items[:8])
-
-
-def _fallback_side_conclusion(
-    role: str, bundle: EvidenceBundle, decision: DebateDecision, challenges: Sequence[str]
-) -> Tuple[str, Verdict, str]:
-    evidence = bundle.evidence
-    if _all_primary_locations_invalid(evidence):
-        return "误报", Verdict.FALSE_POSITIVE, "报告位置无法映射到当前源码版本，不能证明漏洞真实存在。"
-    if _has_reachability_doubt(evidence):
-        return (
-            "可达性存疑",
-            Verdict.INCONCLUSIVE,
-            "局部源码或源汇路径存在，但未证明外部或内部 REST/API/接口入口能够调用到漏洞相关函数，需排除废弃代码或不可达路径。",
-        )
-    if role == "AFFIRMATIVE":
-        if _has_meaningful_flow(evidence) and not _has_protection(evidence):
-            return "真实漏洞", Verdict.TRUE_POSITIVE, "报告、源码位置和数据流/调用链证据形成闭环，当前未识别到有效防护。"
-        if _has_meaningful_flow(evidence) and _has_protection(evidence):
-            return "真实漏洞", Verdict.TRUE_POSITIVE, "攻击路径存在较强证据，但防护是否足以消减风险仍需重点验证。"
-        if _has_protection(evidence) and not _has_meaningful_flow(evidence):
-            return "证据不足", Verdict.INCONCLUSIVE, "源码存在但端到端路径不足，且附近防护可能消减风险。"
-        return "证据不足", Verdict.INCONCLUSIVE, "当前只能确认部分源码或局部源汇迹象，尚未证明完整攻击链。"
-    if _has_meaningful_flow(evidence) and not _has_protection(evidence) and not _material_unresolved(challenges):
-        return "真实漏洞", Verdict.TRUE_POSITIVE, "反方未发现能推翻路径真实性、防护缺失或直接影响的证据。"
-    if _has_protection(evidence) and not _has_meaningful_flow(evidence):
-        return "误报", Verdict.FALSE_POSITIVE, "缺少可验证攻击路径，且源码附近已有可能消减风险的控制。"
-    if decision.verdict == Verdict.FALSE_POSITIVE:
-        return "误报", Verdict.FALSE_POSITIVE, decision.reasoning_summary
-    return "证据不足", Verdict.INCONCLUSIVE, "仍存在路径可达性、防护有效性或影响归因未闭环的问题。"
-
-
-def _clean_final_statement(text: str, label: str) -> str:
-    cleaned = text.strip()
-    segments = _clean_statement_segments(cleaned, max_segments=3, label=label)
-    statement = " ".join(segments).strip()
-    if not statement or _looks_like_task_echo(statement):
-        return ""
-    return statement[:500]
 
 
 def _clean_moderator_summary(text: str) -> str:
@@ -3009,10 +2902,65 @@ def _looks_like_task_echo(statement: str) -> bool:
     return bool(first_person_task and task_target)
 
 
-def _final_conclusion(affirmative: SideConclusion, negative: SideConclusion) -> str:
-    if affirmative.label == negative.label:
-        return f"【{affirmative.label}】，{affirmative.statement}；{negative.statement}"
-    return f"存在分歧。正方【{affirmative.label}】，{affirmative.statement}；反方【{negative.label}】，{negative.statement}"
+def _fallback_moderator_final_conclusion(
+    bundle: EvidenceBundle, decision: DebateDecision, challenges: Sequence[str]
+) -> str:
+    label, statement = _fallback_moderator_label_statement(bundle, decision, challenges)
+    return f"【{label}】，{statement}"
+
+
+def _fallback_moderator_label_statement(
+    bundle: EvidenceBundle, decision: DebateDecision, challenges: Sequence[str]
+) -> Tuple[str, str]:
+    evidence = bundle.evidence
+    if _all_primary_locations_invalid(evidence):
+        return "误报", "报告位置无法映射到当前源码版本，不能证明漏洞真实存在。"
+    if _has_reachability_doubt(evidence):
+        return (
+            "可达性存疑",
+            "局部源码或源汇路径存在，但未证明外部或内部 REST/API/接口入口能够调用到漏洞相关函数，需排除废弃代码或不可达路径。",
+        )
+    if decision.verdict == Verdict.TRUE_POSITIVE:
+        if _has_meaningful_flow(evidence) and not _has_protection(evidence):
+            return "真实漏洞", "报告、源码位置和数据流/调用链证据形成闭环，当前未识别到有效防护。"
+        if _has_meaningful_flow(evidence) and _has_protection(evidence):
+            return "真实漏洞", "攻击路径存在较强证据，但防护是否足以消减风险仍需重点验证。"
+    if decision.verdict == Verdict.FALSE_POSITIVE:
+        return "误报", decision.reasoning_summary
+    if _has_protection(evidence) and not _has_meaningful_flow(evidence):
+        return "误报", "缺少可验证攻击路径，且源码附近已有可能消减风险的控制。"
+    if _has_protection(evidence) and not _material_unresolved(challenges):
+        return "证据不足", "源码存在但端到端路径不足，且附近防护可能消减风险。"
+    if _has_meaningful_flow(evidence):
+        return "证据不足", "仍存在路径可达性、防护有效性或影响归因未闭环的问题。"
+    return "证据不足", "当前只能确认部分源码或局部源汇迹象，尚未证明完整攻击链。"
+
+
+def _ensure_moderator_final_label(text: Optional[str], decision: DebateDecision) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return f"【{_moderator_label_from_decision(decision)}】，{decision.reasoning_summary}"
+    if _extract_conclusion_label(cleaned):
+        return cleaned
+    return f"【{_moderator_label_from_decision(decision)}】，{cleaned}"
+
+
+def _moderator_label_from_decision(decision: DebateDecision) -> str:
+    if decision.verdict == Verdict.INCONCLUSIVE:
+        haystack = " ".join([decision.reasoning_summary, *decision.disputed_points])
+        if any(marker in haystack for marker in ("可达", "入口", "接口", "REST", "API", "废弃代码", "死代码")):
+            return "可达性存疑"
+    return _verdict_label(decision.verdict)
+
+
+def _verdict_from_final_label(label: str) -> Optional[Verdict]:
+    if label == "真实漏洞":
+        return Verdict.TRUE_POSITIVE
+    if label == "误报":
+        return Verdict.FALSE_POSITIVE
+    if label in {"证据不足", "可达性存疑"}:
+        return Verdict.INCONCLUSIVE
+    return None
 
 
 def _append_evidence_graph_markdown(conclusion: str, graph: Dict[str, Any]) -> str:
@@ -3033,26 +2981,19 @@ def _conclusion_without_evidence_graph(conclusion: str) -> str:
     return conclusion.rstrip()
 
 
-def _decision_from_conclusions(
-    base: DebateDecision, affirmative: SideConclusion, negative: SideConclusion, final_conclusion: str
-) -> DebateDecision:
+def _decision_from_moderator_conclusion(base: DebateDecision, final_conclusion: str) -> DebateDecision:
     reasoning_summary = _clean_moderator_summary(_conclusion_without_evidence_graph(final_conclusion)) or base.reasoning_summary
-    if affirmative.verdict == negative.verdict:
-        return DebateDecision(
-            verdict=affirmative.verdict,
-            confidence=base.confidence,
-            disputed_points=base.disputed_points,
-            reasoning_summary=reasoning_summary,
-            recommended_next_steps=base.recommended_next_steps,
-        )
+    label = _extract_conclusion_label(final_conclusion)
+    verdict = _verdict_from_final_label(label) or base.verdict
     disputed = list(base.disputed_points)
-    disputed.append("正方和反方最终结论标签不一致。")
+    if label == "可达性存疑" and not any("可达" in item or "入口" in item for item in disputed):
+        disputed.append("主持人最终总结认为入口可达性仍未闭环。")
     return DebateDecision(
-        verdict=Verdict.INCONCLUSIVE,
-        confidence=min(base.confidence, 0.5),
-        disputed_points=disputed,
+        verdict=verdict,
+        confidence=base.confidence if verdict == base.verdict else min(base.confidence, 0.6),
+        disputed_points=disputed if verdict == Verdict.INCONCLUSIVE else [],
         reasoning_summary=reasoning_summary,
-        recommended_next_steps=base.recommended_next_steps + ["人工复核正反方分歧点后再定性。"],
+        recommended_next_steps=base.recommended_next_steps,
     )
 
 

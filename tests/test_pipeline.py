@@ -2890,12 +2890,8 @@ for raw in sys.stdin.buffer:
                 self.assertNotIn("标签约束", field)
                 self.assertNotIn("必须遵守", field)
                 self.assertNotIn("之前的分析", field)
-            for turn in serialized["debate"]:
-                if turn["claim"].startswith("## 正方结案") or turn["claim"].startswith("## 反方结案"):
-                    self.assertNotIn("分析请求", turn["claim"])
-                    self.assertNotIn("分析用户请求", turn["claim"])
-                    self.assertNotIn("强约束", turn["claim"])
-                    self.assertNotIn("标签约束", turn["claim"])
+            self.assertFalse(any(turn["claim"].startswith("## 正方结案") for turn in serialized["debate"]))
+            self.assertFalse(any(turn["claim"].startswith("## 反方结案") for turn in serialized["debate"]))
             self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.final_conclusion)
             self.assertIn("报告、源码位置和数据流/调用链证据形成闭环", report.reasoning_summary)
 
@@ -2922,17 +2918,17 @@ for raw in sys.stdin.buffer:
             affirmative = SequenceLLM(
                 [
                     "正方证据报告：调用链和数据流已按证据闭环。",
-                    "正方第 2 回合澄清：继续补充外部输入可达性证据。",
-                    "正方第 3 回合澄清：继续补充调用链证据。",
-                    "正方结案正文。",
+                    "正方第 2 回合澄清：补充 HTTP handler 到 service 层的入口证据 ev-a。",
+                    "正方第 3 回合澄清：补充 service 调用 sink 的参数传递证据 ev-b。",
+                    "正方第 4 回合澄清：继续围绕剩余质疑提交边界条件证据 ev-c。",
                 ]
             )
             negative = SequenceLLM(
                 [
                     "## 反方质疑报告\n### 仍未闭环的问题\n- 调用链仍未闭环，报告无法证明外部输入可达。\n### 是否继续质疑：是",
-                    "## 反方第 2 回合复审报告\n### 仍未闭环的问题\n- 调用链仍未闭环，反方继续质疑。",
-                    "## 反方第 3 回合复审报告\n### 仍未闭环的问题\n- 调用链仍未闭环，反方继续质疑。",
-                    "反方结案正文。",
+                    "## 反方第 2 回合复审报告\n### 仍未闭环的问题\n- handler 证据仍未证明文件输入会到达 parser，反方继续质疑。",
+                    "## 反方第 3 回合复审报告\n### 仍未闭环的问题\n- service 到 sink 的参数别名关系仍未被 trace 支持，反方继续质疑。",
+                    "## 反方第 4 回合复审报告\n### 仍未闭环的问题\n- 边界条件证据仍未覆盖异常路径，反方继续质疑。",
                 ]
             )
             report = DebateOrchestrator(
@@ -2957,9 +2953,18 @@ for raw in sys.stdin.buffer:
             )
             self.assertNotEqual(report.debate[-1].round_index, 2)
             self.assertEqual(report.debate[-1].round_index, 4)
-            self.assertTrue(
-                any(turn.role.value == "AFFIRMATIVE" and turn.round_index == 4 and "正方结案" in turn.claim for turn in report.debate)
+            affirmative_round4 = next(
+                turn for turn in report.debate if turn.role.value == "AFFIRMATIVE" and turn.round_index == 4
             )
+            negative_round4 = next(
+                turn for turn in report.debate if turn.role.value == "NEGATIVE" and turn.round_index == 4
+            )
+            self.assertIn("继续围绕剩余质疑提交边界条件证据", affirmative_round4.raw_claim)
+            self.assertIn("继续质疑", negative_round4.raw_claim)
+            self.assertNotIn("正方结案", affirmative_round4.claim)
+            self.assertNotIn("反方结案", negative_round4.claim)
+            self.assertEqual(report.debate[-1].role.value, "MODERATOR")
+            self.assertFalse(any("正方结案" in turn.claim or "反方结案" in turn.claim for turn in report.debate))
 
     def test_moderator_can_stop_next_round_even_when_negative_disputes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2981,15 +2986,17 @@ for raw in sys.stdin.buffer:
             bundle.finding.rule_id = finding.rule_id
             bundle.finding.message = "demo"
             bundle.finding.locations = finding.source_locations
+            affirmative = SequenceLLM(["正方证据报告。", "正方最终总结正文。"])
+            negative = SequenceLLM(
+                [
+                    "## 反方质疑报告\n- 调用链仍未闭环，报告无法证明外部输入可达。",
+                    "反方最终总结正文。",
+                ]
+            )
             report = DebateOrchestrator(
                 max_rounds=4,
-                affirmative_client=SequenceLLM(["正方证据报告。", "正方最终总结正文。"]),
-                negative_client=SequenceLLM(
-                    [
-                        "## 反方质疑报告\n- 调用链仍未闭环，报告无法证明外部输入可达。",
-                        "反方最终总结正文。",
-                    ]
-                ),
+                affirmative_client=affirmative,
+                negative_client=negative,
                 moderator_client=SequenceLLM(
                     [
                         "是否继续下一轮：否\n未闭环争议：无\n分析：Moderator 裁定当前争议不需要继续下一轮。",
@@ -3002,15 +3009,16 @@ for raw in sys.stdin.buffer:
                 turn for turn in report.debate if turn.role.value == "MODERATOR" and turn.round_index == 1
             )
             self.assertIn("是否继续下一轮：否", moderator_round.claim)
-            self.assertEqual(report.debate[-1].round_index, 2)
+            self.assertEqual(report.debate[-1].round_index, 1)
             self.assertFalse(
                 any(
                     turn.role.value == "AFFIRMATIVE"
                     and turn.round_index == 2
-                    and "正方结案" not in turn.claim
                     for turn in report.debate
                 )
             )
+            self.assertEqual(len(affirmative.calls), 1)
+            self.assertEqual(len(negative.calls), 1)
             self.assertIn("Moderator 最终总结正文", report.final_conclusion)
 
     def test_moderator_ends_debate_when_agents_repeat(self):
@@ -3047,13 +3055,8 @@ for raw in sys.stdin.buffer:
             )
             self.assertIn("是否继续下一轮：否", moderator_round.claim)
             self.assertIn("高度复读", moderator_round.claim)
-            self.assertTrue(
-                any(turn.role.value == "AFFIRMATIVE" and turn.round_index == 2 and "正方结案" in turn.claim for turn in report.debate)
-            )
-            self.assertTrue(
-                any(turn.role.value == "NEGATIVE" and turn.round_index == 2 and "反方结案" in turn.claim for turn in report.debate)
-            )
-            self.assertEqual(report.debate[-1].round_index, 2)
+            self.assertFalse(any("正方结案" in turn.claim or "反方结案" in turn.claim for turn in report.debate))
+            self.assertEqual(report.debate[-1].round_index, 1)
 
     def test_run_report_records_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
