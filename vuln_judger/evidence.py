@@ -118,7 +118,12 @@ class EvidenceCollector:
             start_line = properties.get("markdown_start_line")
             end_line = properties.get("markdown_end_line")
             range_text = f"；原始行号 {start_line}-{end_line}" if start_line and end_line else ""
-            summary = f"输入 Markdown 单漏洞报告：{finding.message or finding.rule_id}{range_text}"
+            if properties.get("source_report_format") == "sarif":
+                indices = properties.get("sarif_result_indices") or []
+                index_text = f"；SARIF results {indices}" if indices else ""
+                summary = f"输入 SARIF 经 Moderator 整理后的单漏洞报告：{finding.message or finding.rule_id}{index_text}"
+            else:
+                summary = f"输入 Markdown 单漏洞报告：{finding.message or finding.rule_id}{range_text}"
         else:
             summary = f"输入报告发现：{finding.rule_id}（{finding.level}）"
             if finding.message:
@@ -137,10 +142,12 @@ class EvidenceCollector:
             snippet=markdown_report or None,
             data={
                 "source_format": properties.get("source_format") or "sarif",
+                "source_report_format": properties.get("source_report_format"),
                 "source_report": properties.get("source_report"),
                 "temporary_markdown_report": properties.get("temporary_markdown_report"),
                 "markdown_start_line": properties.get("markdown_start_line"),
                 "markdown_end_line": properties.get("markdown_end_line"),
+                "sarif_result_indices": properties.get("sarif_result_indices"),
                 "markdown_report": markdown_report,
                 "rule_id": finding.rule_id,
                 "level": finding.level,

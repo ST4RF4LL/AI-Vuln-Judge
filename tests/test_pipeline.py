@@ -379,6 +379,61 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("faiss/IndexFastScan.cpp", finding.raw["markdown"])
             self.assertIn("faiss/impl/index_read.cpp", prepared.effective_path.read_text(encoding="utf-8"))
 
+    def test_sarif_report_is_moderated_with_source_into_markdown_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            response = {
+                "reports": [
+                    {
+                        "title": "命令注入独立报告",
+                        "result_indices": [0],
+                        "markdown": "\n".join(
+                            [
+                                "# 命令注入独立报告",
+                                "",
+                                "- SARIF 位置：app.py:5:5",
+                                "- 源码上下文：request.args['cmd'] 进入 os.system。",
+                                "- 待正反方核验：入口可达性和防护措施。",
+                            ]
+                        ),
+                    }
+                ]
+            }
+            moderator = FakeLLM(json.dumps(response, ensure_ascii=False))
+
+            prepared = prepare_report_for_processing(sarif, moderator_client=moderator, source_path=root)
+
+            self.assertTrue(prepared.temporary)
+            self.assertEqual(len(prepared.findings or []), 1)
+            finding = prepared.findings[0]
+            self.assertEqual(finding.rule_id, "python-command-injection")
+            self.assertEqual(finding.message, "命令注入独立报告")
+            self.assertEqual(finding.locations[0].display(), "app.py:5:5")
+            self.assertEqual(finding.code_flows[0][0].display(), "app.py:4:11")
+            self.assertEqual(finding.properties["source_report_format"], "sarif")
+            self.assertEqual(finding.properties["sarif_result_indices"], [0])
+            self.assertIn("request.args['cmd']", finding.raw["markdown"])
+            self.assertEqual(prepared.effective_path.read_text(encoding="utf-8"), finding.raw["markdown"])
+            self.assertIn("os.system(cmd)", moderator.calls[0][1])
+            self.assertIn('"result_index": 0', moderator.calls[0][1])
+            self.assertTrue(any("结合源码整理 SARIF" in item for item in prepared.diagnostics))
+
+    def test_sarif_moderation_failure_falls_back_to_original_sarif(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            moderator = SequenceLLM(["不是 JSON", "仍然不是 JSON", "bad"])
+
+            prepared = prepare_report_for_processing(sarif, moderator_client=moderator, source_path=root)
+
+            self.assertIsNone(prepared.findings)
+            self.assertFalse(prepared.temporary)
+            self.assertEqual(len(moderator.calls), 3)
+            self.assertTrue(any("Moderator SARIF 预处理失败，回退原始 SARIF" in item for item in prepared.diagnostics))
+            fallback = load_sarif(prepared.effective_path)
+            self.assertEqual(fallback[0].rule_id, "python-command-injection")
+
     def test_moderator_repairs_suspicious_sarif_message_in_temp_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4022,6 +4077,19 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
             user_prompt = body["messages"][1]["content"] if len(body.get("messages") or []) > 1 else ""
             if "connectivity" in system_prompt:
                 content = "OK"
+            elif "预处理 SARIF" in system_prompt or "SARIF 与源码上下文 JSON" in user_prompt:
+                content = json.dumps(
+                    {
+                        "reports": [
+                            {
+                                "title": "命令注入独立报告",
+                                "result_indices": [0],
+                                "markdown": "# 命令注入独立报告\n\nSARIF 指向 app.py:5，源码上下文显示 request.args['cmd'] 进入 os.system。",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
             elif "按独立漏洞条目分割" in system_prompt or "Markdown 报告原文（带行号）开始" in user_prompt:
                 content = json.dumps(
                     {

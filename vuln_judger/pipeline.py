@@ -77,6 +77,7 @@ def run_judgement(
         sarif_path,
         moderator_client=moderator_client,
         moderator_agent=config.moderator_agent,
+        source_path=source_path,
     )
     diagnostics = list(prepared_report.diagnostics)
     findings = list(prepared_report.findings) if prepared_report.findings is not None else load_sarif(prepared_report.effective_path)

@@ -2172,10 +2172,12 @@ def _markdown_report_prompt_text(item: CodeEvidence) -> str:
 def _data_excerpt(item: CodeEvidence) -> str:
     keys = (
         "source_format",
+        "source_report_format",
         "source_report",
         "temporary_markdown_report",
         "markdown_start_line",
         "markdown_end_line",
+        "sarif_result_indices",
         "source_root",
         "source_root_exists",
         "source_root_is_dir",
