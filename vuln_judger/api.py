@@ -1377,6 +1377,18 @@ def app_html() -> str:
     .chip.fp {{ color: var(--fp); border-color: #edc391; background: #fff7ed; }}
     .chip.inc {{ color: var(--inc); border-color: #c9c1ef; background: #f6f3ff; }}
     .chip.origin {{ color: #31565d; border-color: #a8c8cd; background: #f0f8f9; }}
+    .chip.status-chip {{
+      font-weight: 700;
+      border-width: 1.5px;
+      box-shadow: inset 0 0 0 1px rgba(15, 23, 42, 0.03);
+    }}
+    .chip.status-completed {{ color: #17663a; border-color: #75c894; background: #eaf8ef; }}
+    .chip.status-running {{ color: #0d4f6f; border-color: #74bdd8; background: #e8f6fb; }}
+    .chip.status-stopped {{ color: #8a332c; border-color: #e0a29a; background: #fff1f0; }}
+    .chip.status-stopping, .chip.status-pausing {{ color: #8a4b11; border-color: #e2b36f; background: #fff8e7; }}
+    .chip.status-paused {{ color: #6c4a9f; border-color: #bfa9e8; background: #f6f0ff; }}
+    .chip.status-failed {{ color: #9a2f2f; border-color: #e19090; background: #fff1f1; }}
+    .chip.status-queued {{ color: #35516e; border-color: #9fb8d2; background: #eef6ff; }}
     .chip.run-delete {{ cursor: pointer; color: var(--bad); }}
     .chip.run-delete:hover {{ border-color: var(--bad); background: #fff1f0; }}
     .chip.run-stop, .chip.run-pause, .chip.run-resume {{ cursor: pointer; color: var(--accent); }}
@@ -2421,6 +2433,10 @@ def app_html() -> str:
       }};
       return labels[status] || status || '未知状态';
     }}
+    function statusChipClass(status) {{
+      const normalized = String(status || 'completed').toLowerCase().replace(/[^a-z0-9_-]+/g, '-');
+      return `chip status-chip status-${{normalized || 'unknown'}}`;
+    }}
     function runOriginLabel(run) {{
       const origin = String((run && (run.run_origin || run.origin || run.task_origin)) || '').toLowerCase();
       if (origin === 'web') return 'Web 端';
@@ -3232,7 +3248,7 @@ def app_html() -> str:
           </div>
           <div class="chips">
             <span class="chip origin">${{esc(origin)}}</span>
-            <span class="chip">${{esc(statusLabel(status))}}</span>
+            <span class="${{statusChipClass(status)}}">${{esc(statusLabel(status))}}</span>
             <span class="chip">${{esc(run.finding_count)}} 个发现</span>
           </div>
           <div class="chips run-verdict-chips">
@@ -3436,7 +3452,7 @@ def app_html() -> str:
         <div class="detail-body">
           <div class="chips">
             <span class="chip origin">${{esc(origin)}}</span>
-            <span class="chip">${{esc(statusLabel(status))}}</span>
+            <span class="${{statusChipClass(status)}}">${{esc(statusLabel(status))}}</span>
             <span class="chip">${{esc(findings.length)}} 个发现</span>
           </div>
           <div class="overview-summary">
