@@ -7,7 +7,7 @@ import json
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import unquote, urlparse
 
 from .agents import DEFAULT_MODERATOR_AGENT
@@ -16,7 +16,8 @@ from .models import AgentConfig
 from .models import Finding, SourceLocation
 
 
-MARKDOWN_TO_SARIF_RETRIES = 3
+MARKDOWN_SPLIT_RETRIES = 3
+MARKDOWN_SPLIT_CHUNK_MAX_CHARS = 18000
 
 
 @dataclasses.dataclass
@@ -25,16 +26,25 @@ class PreparedReport:
     effective_path: Path
     diagnostics: List[str]
     temporary: bool = False
+    findings: Optional[List[Finding]] = None
+    temporary_paths: List[Path] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass(frozen=True)
+class MarkdownFindingRange:
+    title: str
+    start_line: int
+    end_line: int
 
 
 class ReportPreparationError(RuntimeError):
-    """Raised when a report cannot be normalized into valid SARIF."""
+    """Raised when a report cannot be prepared for processing."""
 
 
 def load_report(path: Path) -> List[Finding]:
     suffix = path.suffix.lower()
     if suffix in {".md", ".markdown"}:
-        raise ReportPreparationError("Markdown 报告必须先由 Moderator LLM 转换为 SARIF")
+        raise ReportPreparationError("Markdown 报告必须先由 Moderator LLM 分割为单漏洞 Markdown 报告")
     if suffix in {".sarif", ".json"}:
         return load_sarif(path)
     with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -42,7 +52,7 @@ def load_report(path: Path) -> List[Finding]:
     try:
         return parse_sarif(json.loads(text))
     except json.JSONDecodeError:
-        raise ReportPreparationError("非 JSON 报告必须先由 Moderator LLM 转换为 SARIF") from None
+        raise ReportPreparationError("非 JSON 报告必须先由 Moderator LLM 分割为单漏洞报告") from None
 
 
 def load_sarif(path: Path) -> List[Finding]:
@@ -56,49 +66,51 @@ def prepare_report_for_processing(
     moderator_client: Optional[LLMClient] = None,
     moderator_agent: Optional[AgentConfig] = None,
 ) -> PreparedReport:
-    """Normalize report input to SARIF without modifying the original file."""
+    """Prepare a report without modifying the original file."""
     report_path = path.expanduser().resolve()
     suffix = report_path.suffix.lower()
     diagnostics: List[str] = []
     if suffix in {".md", ".markdown"}:
         text = report_path.read_text(encoding="utf-8", errors="replace")
-        sarif_data, conversion_diagnostics = moderator_markdown_to_sarif(
+        ranges, split_diagnostics = moderator_split_markdown_report(
             text,
             source_name=str(report_path),
             moderator_client=moderator_client,
             moderator_agent=moderator_agent,
         )
-        diagnostics.extend(conversion_diagnostics)
-        sarif_data, repairs = moderator_review_sarif(sarif_data)
-        diagnostics.extend(f"Moderator 修复 Markdown 转换结果：{item}" for item in repairs)
-        issues = validate_sarif_report(sarif_data)
-        if issues:
-            raise ReportPreparationError("Moderator LLM SARIF 未通过格式验证：" + "；".join(issues))
-        temp_path = _write_temp_sarif(sarif_data, report_path)
-        diagnostics.append(f"Moderator 已将 Markdown 报告转换为临时 SARIF：{temp_path}")
-        diagnostics.append(_validation_diagnostic(issues))
-        return PreparedReport(report_path, temp_path, diagnostics, temporary=True)
+        findings, temp_paths = _write_markdown_findings(text, ranges, report_path)
+        diagnostics.extend(split_diagnostics)
+        diagnostics.append(f"Moderator 已将 Markdown 报告分割为 {len(findings)} 个临时单漏洞 Markdown 报告")
+        return PreparedReport(
+            report_path,
+            temp_paths[0] if temp_paths else report_path,
+            diagnostics,
+            temporary=bool(temp_paths),
+            findings=findings,
+            temporary_paths=temp_paths,
+        )
 
     try:
         data = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
     except json.JSONDecodeError:
         text = report_path.read_text(encoding="utf-8", errors="replace")
-        sarif_data, conversion_diagnostics = moderator_markdown_to_sarif(
+        ranges, split_diagnostics = moderator_split_markdown_report(
             text,
             source_name=str(report_path),
             moderator_client=moderator_client,
             moderator_agent=moderator_agent,
         )
-        diagnostics.extend(conversion_diagnostics)
-        sarif_data, repairs = moderator_review_sarif(sarif_data)
-        diagnostics.extend(f"Moderator 修复 Markdown 转换结果：{item}" for item in repairs)
-        issues = validate_sarif_report(sarif_data)
-        if issues:
-            raise ReportPreparationError("Moderator LLM SARIF 未通过格式验证：" + "；".join(issues))
-        temp_path = _write_temp_sarif(sarif_data, report_path)
-        diagnostics.append(f"Moderator 将非 JSON 文本报告转换为临时 SARIF：{temp_path}")
-        diagnostics.append(_validation_diagnostic(issues))
-        return PreparedReport(report_path, temp_path, diagnostics, temporary=True)
+        findings, temp_paths = _write_markdown_findings(text, ranges, report_path)
+        diagnostics.extend(split_diagnostics)
+        diagnostics.append(f"Moderator 已将非 JSON 文本报告分割为 {len(findings)} 个临时单漏洞报告")
+        return PreparedReport(
+            report_path,
+            temp_paths[0] if temp_paths else report_path,
+            diagnostics,
+            temporary=bool(temp_paths),
+            findings=findings,
+            temporary_paths=temp_paths,
+        )
 
     reviewed, repairs = moderator_review_sarif(data)
     issues = validate_sarif_report(reviewed)
@@ -113,86 +125,321 @@ def prepare_report_for_processing(
     return PreparedReport(report_path, report_path, diagnostics, temporary=False)
 
 
-def moderator_markdown_to_sarif(
+def moderator_split_markdown_report(
     text: str,
     source_name: str = "markdown-report",
     moderator_client: Optional[LLMClient] = None,
     moderator_agent: Optional[AgentConfig] = None,
-) -> tuple[Dict[str, Any], List[str]]:
+) -> tuple[List[MarkdownFindingRange], List[str]]:
     diagnostics: List[str] = []
     if moderator_client is None:
-        raise ReportPreparationError("Moderator LLM 不可用，无法将 Markdown 报告转换为 SARIF")
-    system, user = _markdown_to_sarif_prompt(text, source_name, moderator_agent)
-    attempts = MARKDOWN_TO_SARIF_RETRIES + 1
+        raise ReportPreparationError("Moderator LLM 不可用，无法分割 Markdown 报告")
+    lines = text.splitlines()
+    chunks = _markdown_line_chunks(lines)
+    if len(chunks) == 1:
+        ranges = _moderator_markdown_ranges_with_retries(
+            moderator_client,
+            _markdown_split_prompt(
+                lines,
+                source_name,
+                moderator_agent,
+                chunk_index=1,
+                chunk_count=1,
+                start_line=1,
+                end_line=max(1, len(lines)),
+            ),
+            total_lines=len(lines),
+            action="Moderator LLM Markdown 分割",
+            diagnostics=diagnostics,
+        )
+        diagnostics.append(f"Moderator LLM 已读取 Markdown 并确定 {len(ranges)} 个漏洞报告范围")
+        return ranges, diagnostics
+
+    candidate_ranges: List[MarkdownFindingRange] = []
+    diagnostics.append(f"Markdown 报告过长，已按行分为 {len(chunks)} 段交给 Moderator 分段读取")
+    for chunk_index, (start_line, end_line) in enumerate(chunks, start=1):
+        chunk_ranges = _moderator_markdown_ranges_with_retries(
+            moderator_client,
+            _markdown_split_prompt(
+                lines,
+                source_name,
+                moderator_agent,
+                chunk_index=chunk_index,
+                chunk_count=len(chunks),
+                start_line=start_line,
+                end_line=end_line,
+            ),
+            total_lines=len(lines),
+            action=f"Moderator LLM Markdown 分段 {chunk_index}/{len(chunks)} 分割",
+            diagnostics=diagnostics,
+        )
+        diagnostics.append(f"Moderator LLM Markdown 分段 {chunk_index}/{len(chunks)} 识别候选范围 {len(chunk_ranges)} 个")
+        candidate_ranges.extend(chunk_ranges)
+    if not candidate_ranges:
+        raise ReportPreparationError("Moderator LLM 未从 Markdown 分段中识别出漏洞报告范围")
+    final_ranges = _moderator_consolidate_markdown_ranges(
+        moderator_client,
+        source_name,
+        candidate_ranges,
+        total_lines=len(lines),
+        moderator_agent=moderator_agent,
+        diagnostics=diagnostics,
+    )
+    diagnostics.append(f"Moderator LLM 已合并分段结果并确定 {len(final_ranges)} 个漏洞报告范围")
+    return final_ranges, diagnostics
+
+
+def _moderator_markdown_ranges_with_retries(
+    moderator_client: LLMClient,
+    prompts: tuple[str, str],
+    total_lines: int,
+    action: str,
+    diagnostics: List[str],
+) -> List[MarkdownFindingRange]:
+    system, user = prompts
+    attempts = MARKDOWN_SPLIT_RETRIES + 1
     last_error = "unknown error"
     for attempt in range(1, attempts + 1):
-        attempt_diagnostics: List[str] = []
         try:
-            sarif_data = _moderator_markdown_to_sarif_once(
-                text=text,
-                source_name=source_name,
-                moderator_client=moderator_client,
-                moderator_agent=moderator_agent,
-                system=system,
-                user=user,
-                diagnostics=attempt_diagnostics,
-            )
+            response = _complete_moderator_llm(moderator_client, system, user, action)
+            if not response:
+                raise ReportPreparationError("Moderator LLM 未返回 Markdown 分割结果")
+            data = _extract_json_object(response)
+            if data is None:
+                raise ReportPreparationError("Moderator LLM Markdown 分割结果不是合法 JSON object")
+            ranges = _markdown_ranges_from_response(data, total_lines)
+            if not ranges:
+                raise ReportPreparationError("Moderator LLM Markdown 分割结果未包含有效 findings 行号范围")
         except ReportPreparationError as exc:
             last_error = str(exc)
-            diagnostics.extend(attempt_diagnostics)
             if attempt < attempts:
-                diagnostics.append(
-                    f"Moderator LLM Markdown 转 SARIF 第 {attempt}/{attempts} 次失败，准备重试：{last_error}"
-                )
+                diagnostics.append(f"{action} 第 {attempt}/{attempts} 次失败，准备重试：{last_error}")
                 continue
-            diagnostics.append(f"Moderator LLM Markdown 转 SARIF 第 {attempt}/{attempts} 次失败：{last_error}")
+            diagnostics.append(f"{action} 第 {attempt}/{attempts} 次失败：{last_error}")
             break
-        diagnostics.extend(attempt_diagnostics)
         if attempt > 1:
-            diagnostics.append(f"Moderator LLM Markdown 转 SARIF 第 {attempt}/{attempts} 次尝试成功")
-        diagnostics.append("Moderator LLM 已解读 Markdown 并生成 SARIF")
-        return sarif_data, diagnostics
-    raise ReportPreparationError(f"Moderator LLM Markdown 转 SARIF 在 {attempts} 次尝试后仍失败：{last_error}")
+            diagnostics.append(f"{action} 第 {attempt}/{attempts} 次尝试成功")
+        return ranges
+    raise ReportPreparationError(f"{action} 在 {attempts} 次尝试后仍失败：{last_error}")
 
 
-def _moderator_markdown_to_sarif_once(
-    text: str,
-    source_name: str,
+def _moderator_consolidate_markdown_ranges(
     moderator_client: LLMClient,
+    source_name: str,
+    candidate_ranges: Sequence[MarkdownFindingRange],
+    total_lines: int,
     moderator_agent: Optional[AgentConfig],
-    system: str,
-    user: str,
     diagnostics: List[str],
-) -> Dict[str, Any]:
-    response = _complete_moderator_llm(moderator_client, system, user, "Moderator LLM Markdown 转换")
-    if not response:
-        raise ReportPreparationError("Moderator LLM 未返回 Markdown 转换结果")
-    sarif_data = _extract_json_object(response)
-    if sarif_data is None:
-        raise ReportPreparationError("Moderator LLM Markdown 转换结果不是合法 JSON")
-    sarif_data, repairs = moderator_review_sarif(sarif_data)
-    diagnostics.extend(f"Moderator 修复 LLM SARIF：{item}" for item in repairs)
-    issues = validate_sarif_report(sarif_data)
-    if issues:
-        repaired = _repair_llm_sarif_with_moderator(
-            moderator_client,
-            text=text,
-            source_name=source_name,
-            previous_sarif=sarif_data,
-            issues=issues,
-            moderator_agent=moderator_agent,
+) -> List[MarkdownFindingRange]:
+    agent = moderator_agent or DEFAULT_MODERATOR_AGENT
+    system = (
+        f"你是 {agent.name or '中立 Moderator'}，负责合并 Markdown 漏洞报告的分段读取结果。"
+        "只输出 JSON object，不要输出 Markdown、代码块、SARIF、漏洞事实摘要或额外解释。"
+    )
+    if agent.instructions.strip():
+        system += f"\nModerator 配置：\n{agent.instructions.strip()}"
+    candidates = [
+        {"title": item.title, "start_line": item.start_line, "end_line": item.end_line}
+        for item in candidate_ranges
+    ]
+    user = (
+        "下面是 Moderator 分段读取同一份 Markdown 报告后得到的候选漏洞范围。"
+        "请只合并重叠/重复范围，并输出最终漏洞报告范围；不要改写成 SARIF，不要提取漏洞字段。"
+        "行号是原始 Markdown 的 1-based inclusive 行号。\n\n"
+        f"source_report: {source_name}\n"
+        f"total_lines: {total_lines}\n"
+        "输出 JSON 格式：{\"findings\":[{\"title\":\"...\",\"start_line\":1,\"end_line\":20}]}\n\n"
+        "候选范围 JSON：\n"
+        + json.dumps({"findings": candidates}, ensure_ascii=False, indent=2)
+    )
+    return _moderator_markdown_ranges_with_retries(
+        moderator_client,
+        (system, user),
+        total_lines=total_lines,
+        action="Moderator LLM Markdown 分段范围合并",
+        diagnostics=diagnostics,
+    )
+
+
+def _markdown_line_chunks(lines: Sequence[str]) -> List[tuple[int, int]]:
+    if not lines:
+        return [(1, 1)]
+    chunks: List[tuple[int, int]] = []
+    start_index = 0
+    current_size = 0
+    for index, line in enumerate(lines):
+        line_size = len(line) + 16
+        if index > start_index and current_size + line_size > MARKDOWN_SPLIT_CHUNK_MAX_CHARS:
+            chunks.append((start_index + 1, index))
+            start_index = index
+            current_size = 0
+        current_size += line_size
+    chunks.append((start_index + 1, len(lines)))
+    return chunks
+
+
+def _markdown_split_prompt(
+    lines: Sequence[str],
+    source_name: str,
+    moderator_agent: Optional[AgentConfig],
+    chunk_index: int,
+    chunk_count: int,
+    start_line: int,
+    end_line: int,
+) -> tuple[str, str]:
+    agent = moderator_agent or DEFAULT_MODERATOR_AGENT
+    agent_instructions = (agent.instructions or "").strip()
+    system = (
+        f"你是 {agent.name or '中立 Moderator'}，负责将 Markdown 静态漏洞报告按独立漏洞条目分割。"
+        "你必须先阅读报告内容，判断这一段中有多少个漏洞条目，再提取每个条目的原始 Markdown 行号范围。"
+        "禁止把 Markdown 转换为 SARIF；禁止输出漏洞字段抽取结果；禁止基于文件名、危险函数、CWE、表格列名等关键词规则猜测边界。"
+        "只输出一个 JSON object，不要输出 Markdown、代码块或解释。"
+    )
+    if agent_instructions:
+        system += f"\nModerator 配置：\n{agent_instructions}"
+    user = (
+        "请读取下面带原始行号的 Markdown 报告"
+        + (f"分段 {chunk_index}/{chunk_count}" if chunk_count > 1 else "")
+        + "，输出这一段中应拆出的独立漏洞报告范围。\n"
+        "要求：\n"
+        "1. 行号必须是原始 Markdown 的 1-based inclusive 行号。\n"
+        "2. 每个范围必须包含该漏洞所需的标题、描述、表格行、代码块、影响、复现、调用链等上下文；不确定时扩大范围，不要缩小。\n"
+        "3. 如果同一漏洞跨越本段边界，只输出本段可见且应归属该漏洞的最大行号范围。\n"
+        "4. 不要输出 ruleId、message、locations、codeFlows 或 SARIF 字段。\n"
+        "5. 输出 JSON 格式：{\"findings\":[{\"title\":\"可选标题\",\"start_line\":1,\"end_line\":20}]}\n\n"
+        f"source_report: {source_name}\n"
+        f"segment: {chunk_index}/{chunk_count}\n"
+        f"segment_lines: {start_line}-{end_line}\n\n"
+        "Markdown 报告原文（带行号）开始：\n"
+        + _line_numbered_markdown(lines, start_line, end_line)
+        + "\nMarkdown 报告原文（带行号）结束。"
+    )
+    return system, user
+
+
+def _line_numbered_markdown(lines: Sequence[str], start_line: int, end_line: int) -> str:
+    if not lines:
+        return "1 | "
+    selected = lines[start_line - 1 : end_line]
+    width = max(4, len(str(end_line)))
+    return "\n".join(f"{line_number:0{width}d} | {line}" for line_number, line in enumerate(selected, start=start_line))
+
+
+def _markdown_ranges_from_response(data: Dict[str, Any], total_lines: int) -> List[MarkdownFindingRange]:
+    raw_findings = data.get("findings")
+    if raw_findings is None:
+        raw_findings = data.get("vulnerabilities") or data.get("reports") or data.get("ranges")
+    if not isinstance(raw_findings, list):
+        raise ReportPreparationError("Moderator LLM Markdown 分割 JSON 缺少 findings 数组")
+    ranges: List[MarkdownFindingRange] = []
+    for index, item in enumerate(raw_findings, start=1):
+        if not isinstance(item, dict):
+            continue
+        start_line = _optional_int(
+            item.get("start_line")
+            or item.get("startLine")
+            or item.get("line_start")
+            or item.get("from_line")
+            or item.get("start")
         )
-        if repaired is not None:
-            repaired, repair_items = moderator_review_sarif(repaired)
-            repaired_issues = validate_sarif_report(repaired)
-            if not repaired_issues:
-                diagnostics.append("Moderator LLM 已根据 SARIF 验证问题修正 Markdown 转换结果")
-                diagnostics.extend(f"Moderator 修复 LLM SARIF：{item}" for item in repair_items)
-                return repaired
-            diagnostics.append("Moderator LLM 修正后的 SARIF 仍未通过验证：" + "；".join(repaired_issues))
-        diagnostics.append("Moderator LLM SARIF 未通过格式验证：" + "；".join(issues))
-        raise ReportPreparationError("Moderator LLM SARIF 未通过格式验证：" + "；".join(issues))
-    return sarif_data
+        end_line = _optional_int(
+            item.get("end_line")
+            or item.get("endLine")
+            or item.get("line_end")
+            or item.get("to_line")
+            or item.get("end")
+        )
+        if start_line is None or end_line is None:
+            continue
+        start_line = max(1, min(start_line, max(1, total_lines)))
+        end_line = max(1, min(end_line, max(1, total_lines)))
+        if end_line < start_line:
+            start_line, end_line = end_line, start_line
+        title = str(item.get("title") or item.get("name") or item.get("heading") or f"Markdown finding {index}").strip()
+        ranges.append(MarkdownFindingRange(title=title or f"Markdown finding {index}", start_line=start_line, end_line=end_line))
+    ranges.sort(key=lambda item: (item.start_line, item.end_line, item.title))
+    deduped: List[MarkdownFindingRange] = []
+    seen = set()
+    for item in ranges:
+        marker = (item.start_line, item.end_line)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped.append(item)
+    return deduped
+
+
+def _write_markdown_findings(
+    text: str,
+    ranges: Sequence[MarkdownFindingRange],
+    original_path: Path,
+) -> tuple[List[Finding], List[Path]]:
+    lines = text.splitlines()
+    if not lines:
+        lines = [""]
+    findings: List[Finding] = []
+    temp_paths: List[Path] = []
+    for index, item in enumerate(ranges, start=1):
+        body = "\n".join(lines[item.start_line - 1 : item.end_line]).rstrip() + "\n"
+        temp_path = _write_temp_markdown(body, original_path, index)
+        temp_paths.append(temp_path)
+        finding_id = _markdown_finding_id(original_path, index, item, body)
+        title = item.title or f"Markdown finding {index}"
+        findings.append(
+            Finding(
+                finding_id=finding_id,
+                rule_id=f"markdown-finding-{index}",
+                message=title,
+                level="warning",
+                locations=[],
+                code_flows=[],
+                properties={
+                    "source_format": "markdown",
+                    "source_report": str(original_path),
+                    "temporary_markdown_report": str(temp_path),
+                    "markdown_start_line": item.start_line,
+                    "markdown_end_line": item.end_line,
+                    "moderator_split": True,
+                },
+                raw={
+                    "format": "markdown",
+                    "source_report": str(original_path),
+                    "temporary_report": str(temp_path),
+                    "finding_index": index,
+                    "title": title,
+                    "line_range": {"start_line": item.start_line, "end_line": item.end_line},
+                    "markdown": body,
+                },
+            )
+        )
+    if not findings:
+        raise ReportPreparationError("Moderator LLM 未生成任何可处理的 Markdown finding")
+    return findings, temp_paths
+
+
+def _markdown_finding_id(original_path: Path, index: int, item: MarkdownFindingRange, body: str) -> str:
+    seed = {
+        "path": str(original_path),
+        "index": index,
+        "start_line": item.start_line,
+        "end_line": item.end_line,
+        "body": body,
+    }
+    digest = hashlib.sha256(json.dumps(seed, sort_keys=True).encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
+def _write_temp_markdown(text: str, original_path: Path, index: int) -> Path:
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", original_path.stem)[:40] or "report"
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        suffix=".md",
+        prefix=f"vuln-judger-{safe_stem}-finding-{index}-",
+        delete=False,
+    ) as handle:
+        handle.write(text)
+        return Path(handle.name)
 
 
 def validate_sarif_report(data: Dict[str, Any]) -> List[str]:
@@ -268,69 +515,6 @@ def moderator_review_sarif(data: Dict[str, Any]) -> tuple[Dict[str, Any], List[s
             if repairs:
                 props["moderator_repairs"] = list(repairs)
     return reviewed, repairs
-
-
-def _markdown_to_sarif_prompt(
-    text: str,
-    source_name: str,
-    moderator_agent: Optional[AgentConfig],
-) -> tuple[str, str]:
-    agent = moderator_agent or DEFAULT_MODERATOR_AGENT
-    agent_instructions = (agent.instructions or "").strip()
-    system = (
-        f"你是 {agent.name or '中立 Moderator'}，负责把静态漏洞 Markdown 报告转换为 SARIF 2.1.0。"
-        "你必须阅读整份 Markdown，提取漏洞类型、漏洞描述、危险函数/危险 API、文件路径、行列号、严重性、调用链/数据流。"
-        "不要把 Markdown 表格分隔线、表头或格式说明当作漏洞消息。"
-        "只输出一个合法 JSON object，不要输出 Markdown、代码块、解释或额外文本。"
-    )
-    if agent_instructions:
-        system += f"\nModerator 配置：\n{agent_instructions}"
-    user = (
-        "请将下面 Markdown 报告转换为 SARIF 2.1.0 JSON。\n"
-        "必须满足：\n"
-        "1. 顶层包含 version='2.1.0' 和 runs 数组。\n"
-        "2. 每个漏洞放入 runs[0].results[]，必须包含 ruleId、message.text、level、locations。\n"
-        "3. ruleId 优先使用漏洞类型、规则 ID、CWE/CVE 或报告标题，不要使用表格分隔线。\n"
-        "4. message.text 必须是具体漏洞描述，优先包含漏洞类型、危险函数和影响，不要使用 '|------|-----|'、表头或空文本。\n"
-        "5. 文件路径放入 locations[].physicalLocation.artifactLocation.uri；行列号放入 region.startLine/startColumn。\n"
-        "6. 调用链、数据流或代码流放入 codeFlows[].threadFlows[].locations[].location。\n"
-        "7. 在 properties 中保留 source_format='markdown'、source_report、moderator_converted=true，"
-        "并尽量保留 markdown_vulnerabilitytype、markdown_dangerousfunction、markdown_description 等字段。\n\n"
-        f"source_report: {source_name}\n\n"
-        "Markdown 报告开始：\n"
-        f"{text}\n"
-        "Markdown 报告结束。"
-    )
-    return system, user
-
-
-def _repair_llm_sarif_with_moderator(
-    moderator_client: LLMClient,
-    text: str,
-    source_name: str,
-    previous_sarif: Dict[str, Any],
-    issues: List[str],
-    moderator_agent: Optional[AgentConfig],
-) -> Optional[Dict[str, Any]]:
-    agent = moderator_agent or DEFAULT_MODERATOR_AGENT
-    system = (
-        f"你是 {agent.name or '中立 Moderator'}，负责修复 Markdown 转换出的 SARIF。"
-        "只输出修复后的合法 SARIF JSON object，不要输出 Markdown、代码块、解释或额外文本。"
-    )
-    user = (
-        "上一次 SARIF 转换未通过格式验证，请基于原始 Markdown 修复。\n"
-        "验证问题：\n- "
-        + "\n- ".join(issues)
-        + "\n\n原始 Markdown：\n"
-        + text
-        + "\n\n上一次 SARIF JSON：\n"
-        + json.dumps(previous_sarif, ensure_ascii=False, indent=2, sort_keys=True)
-        + f"\n\nsource_report: {source_name}"
-    )
-    response = _complete_moderator_llm(moderator_client, system, user, "Moderator LLM SARIF 修复")
-    if not response:
-        return None
-    return _extract_json_object(response)
 
 
 def _complete_moderator_llm(moderator_client: LLMClient, system: str, user: str, action: str) -> Optional[str]:

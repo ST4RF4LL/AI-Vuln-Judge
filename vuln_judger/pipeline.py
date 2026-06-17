@@ -79,7 +79,7 @@ def run_judgement(
         moderator_agent=config.moderator_agent,
     )
     diagnostics = list(prepared_report.diagnostics)
-    findings = load_sarif(prepared_report.effective_path)
+    findings = list(prepared_report.findings) if prepared_report.findings is not None else load_sarif(prepared_report.effective_path)
     LOG.info(
         "报告解析完成 findings=%s report=%s effective_report=%s temporary=%s",
         len(findings),

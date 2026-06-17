@@ -140,7 +140,7 @@ class PipelineTests(unittest.TestCase):
                     )
                 )
 
-    def test_markdown_table_report_is_moderated_into_temp_sarif(self):
+    def test_markdown_table_report_is_moderated_into_temp_markdown_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
@@ -156,43 +156,26 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            llm_sarif = {
-                "version": "2.1.0",
-                "runs": [
-                    {
-                        "tool": {"driver": {"name": "moderator-llm"}},
-                        "results": [
-                            {
-                                "ruleId": "python-command-injection",
-                                "level": "error",
-                                "message": {"text": "用户输入可到达命令执行点"},
-                                "locations": [
-                                    {
-                                        "physicalLocation": {
-                                            "artifactLocation": {"uri": "app.py"},
-                                            "region": {"startLine": 5},
-                                        }
-                                    }
-                                ],
-                                "properties": {"markdown_dangerousfunction": "os.system"},
-                            }
-                        ],
-                    }
-                ],
-            }
-            moderator = FakeLLM(json.dumps(llm_sarif, ensure_ascii=False))
+            split_result = {"findings": [{"title": "python-command-injection", "start_line": 1, "end_line": 5}]}
+            moderator = FakeLLM(json.dumps(split_result, ensure_ascii=False))
 
             prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
             self.assertNotEqual(prepared.effective_path, markdown.resolve())
             self.assertTrue(prepared.temporary)
             self.assertTrue(moderator.calls)
-            findings = load_sarif(prepared.effective_path)
-            self.assertEqual(findings[0].message, "用户输入可到达命令执行点")
-            self.assertEqual(findings[0].rule_id, "python-command-injection")
-            self.assertEqual(findings[0].locations[0].display(), "app.py:5")
-            self.assertTrue(any("SARIF 格式验证通过" in item for item in prepared.diagnostics))
+            self.assertTrue(prepared.effective_path.name.endswith(".md"))
+            self.assertEqual(len(prepared.findings or []), 1)
+            finding = prepared.findings[0]
+            self.assertEqual(finding.rule_id, "markdown-finding-1")
+            self.assertEqual(finding.message, "python-command-injection")
+            self.assertEqual(finding.locations, [])
+            self.assertIn("| python-command-injection | os.system |", finding.raw["markdown"])
+            self.assertEqual(prepared.effective_path.read_text(encoding="utf-8"), finding.raw["markdown"])
+            self.assertIn("0001 | # Markdown 表格报告", moderator.calls[0][1])
+            self.assertNotIn("转换为 SARIF 2.1.0", moderator.calls[0][1])
+            self.assertTrue(any("分割为 1 个临时单漏洞 Markdown 报告" in item for item in prepared.diagnostics))
 
-    def test_moderator_llm_interprets_markdown_before_sarif_validation(self):
+    def test_moderator_llm_splits_markdown_before_sarif_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
@@ -206,81 +189,83 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            llm_sarif = {
-                "version": "2.1.0",
-                "runs": [
-                    {
-                        "tool": {"driver": {"name": "moderator-llm"}},
-                        "results": [
-                            {
-                                "ruleId": "LLM-MARKDOWN-COMMAND-INJECTION",
-                                "level": "error",
-                                "message": {"text": "LLM 解读：用户输入可到达 os.system。"},
-                                "locations": [
-                                    {
-                                        "physicalLocation": {
-                                            "artifactLocation": {"uri": "app.py"},
-                                            "region": {"startLine": 5},
-                                        }
-                                    }
-                                ],
-                                "properties": {"markdown_dangerousfunction": "os.system"},
-                            }
-                        ],
-                    }
-                ],
-            }
-            moderator = FakeLLM(json.dumps(llm_sarif, ensure_ascii=False))
+            split_result = {"findings": [{"title": "自然语言漏洞报告", "start_line": 1, "end_line": 3}]}
+            moderator = FakeLLM(json.dumps(split_result, ensure_ascii=False))
 
             prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
-            findings = load_sarif(prepared.effective_path)
+            findings = prepared.findings or []
 
             self.assertTrue(moderator.calls)
-            self.assertIn("Markdown 报告开始", moderator.calls[0][1])
-            self.assertEqual(findings[0].rule_id, "LLM-MARKDOWN-COMMAND-INJECTION")
-            self.assertEqual(findings[0].message, "LLM 解读：用户输入可到达 os.system。")
-            self.assertTrue(any("Moderator LLM 已解读 Markdown 并生成 SARIF" in item for item in prepared.diagnostics))
+            self.assertIn("Markdown 报告原文（带行号）开始", moderator.calls[0][1])
+            self.assertEqual(findings[0].rule_id, "markdown-finding-1")
+            self.assertEqual(findings[0].message, "自然语言漏洞报告")
+            self.assertEqual(findings[0].properties["markdown_start_line"], 1)
+            self.assertEqual(findings[0].properties["markdown_end_line"], 3)
+            self.assertIn("危险函数是 os.system", findings[0].raw["markdown"])
+            self.assertTrue(any("Moderator LLM 已读取 Markdown 并确定 1 个漏洞报告范围" in item for item in prepared.diagnostics))
 
-    def test_markdown_conversion_retries_until_valid_sarif(self):
+    def test_markdown_split_retries_until_valid_ranges(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
             markdown.write_text("# 报告\n\napp.py 第 5 行存在命令注入，危险函数 os.system。", encoding="utf-8")
-            llm_sarif = {
-                "version": "2.1.0",
-                "runs": [
-                    {
-                        "tool": {"driver": {"name": "moderator-llm"}},
-                        "results": [
-                            {
-                                "ruleId": "LLM-MARKDOWN-COMMAND-INJECTION",
-                                "level": "error",
-                                "message": {"text": "第三次重试后解析成功。"},
-                                "locations": [
-                                    {
-                                        "physicalLocation": {
-                                            "artifactLocation": {"uri": "app.py"},
-                                            "region": {"startLine": 5},
-                                        }
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ],
-            }
-            moderator = SequenceLLM(["不是 JSON", "", json.dumps(llm_sarif, ensure_ascii=False)])
+            split_result = {"findings": [{"title": "第三次重试后解析成功", "start_line": 1, "end_line": 3}]}
+            moderator = SequenceLLM(["不是 JSON", "", json.dumps(split_result, ensure_ascii=False)])
 
             prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
-            findings = load_sarif(prepared.effective_path)
+            findings = prepared.findings or []
 
             self.assertEqual(len(moderator.calls), 3)
-            self.assertEqual(findings[0].rule_id, "LLM-MARKDOWN-COMMAND-INJECTION")
+            self.assertEqual(findings[0].rule_id, "markdown-finding-1")
+            self.assertIn("os.system", findings[0].raw["markdown"])
             self.assertTrue(any("第 1/4 次失败" in item for item in prepared.diagnostics))
             self.assertTrue(any("第 2/4 次失败" in item for item in prepared.diagnostics))
             self.assertTrue(any("第 3/4 次尝试成功" in item for item in prepared.diagnostics))
 
-    def test_markdown_conversion_fails_after_three_retries(self):
+    def test_long_markdown_report_is_split_in_segments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markdown = root / "report.md"
+            markdown.write_text(
+                "\n".join(
+                    [
+                        "# 长 Markdown 报告",
+                        "## 漏洞 A",
+                        "A" * 600,
+                        "",
+                        "## 漏洞 B",
+                        "B" * 600,
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            first_segment = {"findings": [{"title": "漏洞 A", "start_line": 1, "end_line": 4}]}
+            second_segment = {"findings": [{"title": "漏洞 B", "start_line": 5, "end_line": 6}]}
+            consolidated = {
+                "findings": [
+                    {"title": "漏洞 A", "start_line": 1, "end_line": 4},
+                    {"title": "漏洞 B", "start_line": 5, "end_line": 6},
+                ]
+            }
+            moderator = SequenceLLM(
+                [
+                    json.dumps(first_segment, ensure_ascii=False),
+                    json.dumps(second_segment, ensure_ascii=False),
+                    json.dumps(consolidated, ensure_ascii=False),
+                ]
+            )
+
+            with patch("vuln_judger.sarif.MARKDOWN_SPLIT_CHUNK_MAX_CHARS", 700):
+                prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
+
+            self.assertGreaterEqual(len(moderator.calls), 3)
+            self.assertEqual(len(prepared.findings or []), 2)
+            self.assertIn("A" * 60, prepared.findings[0].raw["markdown"])
+            self.assertIn("B" * 60, prepared.findings[1].raw["markdown"])
+            self.assertTrue(any("Markdown 报告过长，已按行分为" in item for item in prepared.diagnostics))
+            self.assertTrue(any("已合并分段结果并确定 2 个漏洞报告范围" in item for item in prepared.diagnostics))
+
+    def test_markdown_split_fails_after_three_retries(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
@@ -292,7 +277,7 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(len(moderator.calls), 4)
 
-    def test_pipeline_uses_moderator_llm_for_markdown_conversion(self):
+    def test_pipeline_uses_moderator_llm_for_markdown_split(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _sarif, skills = write_python_fixture(root)
@@ -339,10 +324,32 @@ class PipelineTests(unittest.TestCase):
                 llm_server.shutdown()
                 llm_server.server_close()
 
-            self.assertTrue(any("Moderator LLM 已解读 Markdown 并生成 SARIF" in item for item in report.diagnostics))
-            self.assertEqual(report.reports[0].rule_id, "LLM-MARKDOWN-COMMAND-INJECTION")
-            summaries = "\n".join(item.summary for item in report.reports[0].evidence_chain)
-            self.assertIn("LLM 解读：用户输入可到达 os.system。", summaries)
+            self.assertTrue(any("Moderator LLM 已读取 Markdown 并确定 1 个漏洞报告范围" in item for item in report.diagnostics))
+            self.assertEqual(report.reports[0].rule_id, "markdown-finding-1")
+            report_evidence = next(item for item in report.reports[0].evidence_chain if item.kind == EvidenceKind.REPORT)
+            self.assertIn("请由 Moderator 解读", report_evidence.snippet)
+            self.assertIn("os.system", report_evidence.data["markdown_report"])
+
+    def test_markdown_report_body_is_expanded_in_agent_evidence_prompt(self):
+        from vuln_judger.debate import _evidence_prompt
+
+        markdown_body = "# 单漏洞报告\n\n完整上下文包含危险函数 os.system 和调用前提。\n"
+        evidence = CodeEvidence(
+            evidence_id="report-1",
+            kind=EvidenceKind.REPORT,
+            strength=EvidenceStrength.STRONG,
+            summary="输入 Markdown 单漏洞报告",
+            source="input-report",
+            snippet=markdown_body,
+            data={"source_format": "markdown", "markdown_report": markdown_body},
+        )
+
+        prompt = _evidence_prompt([evidence])
+
+        self.assertIn("报告正文：", prompt)
+        self.assertIn("```markdown", prompt)
+        self.assertIn("完整上下文包含危险函数 os.system", prompt)
+        self.assertNotIn("代码片段：", prompt)
 
     def test_markdown_cpp_paths_keep_full_extension(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -364,27 +371,13 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            llm_sarif = {
-                "version": "2.1.0",
-                "runs": [
-                    {
-                        "tool": {"driver": {"name": "moderator-llm"}},
-                        "results": [
-                            {
-                                "ruleId": "faiss-report",
-                                "message": {"text": "FAISS affected code"},
-                                "locations": [
-                                    {"physicalLocation": {"artifactLocation": {"uri": "faiss/impl/index_read.cpp"}}},
-                                    {"physicalLocation": {"artifactLocation": {"uri": "faiss/IndexFastScan.cpp"}}},
-                                ],
-                            }
-                        ],
-                    }
-                ],
-            }
-            prepared = prepare_report_for_processing(markdown, moderator_client=FakeLLM(json.dumps(llm_sarif)))
-            locations = [location.file for finding in load_sarif(prepared.effective_path) for location in finding.locations]
-            self.assertEqual(locations, ["faiss/impl/index_read.cpp", "faiss/IndexFastScan.cpp"])
+            split_result = {"findings": [{"title": "FAISS report", "start_line": 1, "end_line": 6}]}
+            prepared = prepare_report_for_processing(markdown, moderator_client=FakeLLM(json.dumps(split_result)))
+            finding = (prepared.findings or [])[0]
+            self.assertEqual(finding.locations, [])
+            self.assertIn("faiss/impl/index_read.cpp", finding.raw["markdown"])
+            self.assertIn("faiss/IndexFastScan.cpp", finding.raw["markdown"])
+            self.assertIn("faiss/impl/index_read.cpp", prepared.effective_path.read_text(encoding="utf-8"))
 
     def test_moderator_repairs_suspicious_sarif_message_in_temp_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4029,31 +4022,12 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
             user_prompt = body["messages"][1]["content"] if len(body.get("messages") or []) > 1 else ""
             if "connectivity" in system_prompt:
                 content = "OK"
-            elif "转换为 SARIF 2.1.0" in system_prompt or "Markdown 报告开始" in user_prompt:
+            elif "按独立漏洞条目分割" in system_prompt or "Markdown 报告原文（带行号）开始" in user_prompt:
                 content = json.dumps(
                     {
-                        "version": "2.1.0",
-                        "runs": [
-                            {
-                                "tool": {"driver": {"name": "moderator-llm"}},
-                                "results": [
-                                    {
-                                        "ruleId": "LLM-MARKDOWN-COMMAND-INJECTION",
-                                        "level": "error",
-                                        "message": {"text": "LLM 解读：用户输入可到达 os.system。"},
-                                        "locations": [
-                                            {
-                                                "physicalLocation": {
-                                                    "artifactLocation": {"uri": "app.py"},
-                                                    "region": {"startLine": 5},
-                                                }
-                                            }
-                                        ],
-                                        "properties": {"markdown_dangerousfunction": "os.system"},
-                                    }
-                                ],
-                            }
-                        ],
+                        "findings": [
+                            {"title": "自然语言漏洞报告", "start_line": 1, "end_line": 3},
+                        ]
                     },
                     ensure_ascii=False,
                 )

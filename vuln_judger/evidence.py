@@ -110,14 +110,23 @@ class EvidenceCollector:
         )
 
     def _report_evidence(self, finding: Finding) -> CodeEvidence:
+        raw_result = dict(finding.raw)
+        properties = dict(finding.properties)
+        markdown_report = str(raw_result.get("markdown") or "") if properties.get("source_format") == "markdown" else ""
         locations = [location.display() for location in finding.locations]
-        summary = f"输入报告发现：{finding.rule_id}（{finding.level}）"
-        if finding.message:
-            summary += f"，消息：{finding.message}"
-        if locations:
-            summary += f"，位置：{'; '.join(locations[:5])}"
-        if finding.code_flows:
-            summary += f"，报告内代码流 {len(finding.code_flows)} 条"
+        if markdown_report:
+            start_line = properties.get("markdown_start_line")
+            end_line = properties.get("markdown_end_line")
+            range_text = f"；原始行号 {start_line}-{end_line}" if start_line and end_line else ""
+            summary = f"输入 Markdown 单漏洞报告：{finding.message or finding.rule_id}{range_text}"
+        else:
+            summary = f"输入报告发现：{finding.rule_id}（{finding.level}）"
+            if finding.message:
+                summary += f"，消息：{finding.message}"
+            if locations:
+                summary += f"，位置：{'; '.join(locations[:5])}"
+            if finding.code_flows:
+                summary += f"，报告内代码流 {len(finding.code_flows)} 条"
         return CodeEvidence(
             evidence_id=evidence_id(finding.finding_id, "input-report"),
             kind=EvidenceKind.REPORT,
@@ -125,7 +134,14 @@ class EvidenceCollector:
             summary=summary,
             source="input-report",
             locations=list(finding.locations),
+            snippet=markdown_report or None,
             data={
+                "source_format": properties.get("source_format") or "sarif",
+                "source_report": properties.get("source_report"),
+                "temporary_markdown_report": properties.get("temporary_markdown_report"),
+                "markdown_start_line": properties.get("markdown_start_line"),
+                "markdown_end_line": properties.get("markdown_end_line"),
+                "markdown_report": markdown_report,
                 "rule_id": finding.rule_id,
                 "level": finding.level,
                 "message": finding.message,
@@ -133,8 +149,8 @@ class EvidenceCollector:
                 "code_flows": [[location.display() for location in flow] for flow in finding.code_flows],
                 "location_count": len(finding.locations),
                 "code_flow_count": len(finding.code_flows),
-                "properties": dict(finding.properties),
-                "raw_result": dict(finding.raw),
+                "properties": properties,
+                "raw_result": raw_result,
             },
         )
 

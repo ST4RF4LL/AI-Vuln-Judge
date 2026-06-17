@@ -39,6 +39,7 @@ AGENT_ATLAS_MAX_LLM_REQUESTS = 5
 DEFAULT_AGENT_ATLAS_TOOL_ROUNDS = AGENT_ATLAS_MAX_LLM_REQUESTS - 1
 AGENT_ATLAS_TOOL_BATCH_LIMIT = 5
 AGENT_ATLAS_MAX_MCP_CALLS = 20
+MARKDOWN_REPORT_PROMPT_CHARS = 20000
 
 
 @dataclass
@@ -2141,7 +2142,10 @@ def _evidence_prompt(evidence: Sequence[CodeEvidence]) -> str:
         )
         if item.locations:
             lines.append("  位置：" + " -> ".join(location.display() for location in item.locations[:8]))
-        if item.snippet and snippet_count < 8:
+        markdown_report = _markdown_report_prompt_text(item)
+        if markdown_report:
+            lines.append("  报告正文：\n```markdown\n" + markdown_report + "\n```")
+        elif item.snippet and snippet_count < 8:
             lines.append("  代码片段：\n```text\n" + item.snippet[:1200] + "\n```")
             snippet_count += 1
         data_excerpt = _data_excerpt(item)
@@ -2152,8 +2156,26 @@ def _evidence_prompt(evidence: Sequence[CodeEvidence]) -> str:
     return "\n".join(lines) if lines else "无证据。"
 
 
+def _markdown_report_prompt_text(item: CodeEvidence) -> str:
+    if item.kind != EvidenceKind.REPORT:
+        return ""
+    if item.data.get("source_format") != "markdown":
+        return ""
+    text = str(item.data.get("markdown_report") or item.snippet or "").strip()
+    if not text:
+        return ""
+    if len(text) <= MARKDOWN_REPORT_PROMPT_CHARS:
+        return text
+    return text[:MARKDOWN_REPORT_PROMPT_CHARS] + "\n\n[报告正文过长，以上为前 20000 字；完整正文保存在 REPORT 证据数据和临时 Markdown 文件中。]"
+
+
 def _data_excerpt(item: CodeEvidence) -> str:
     keys = (
+        "source_format",
+        "source_report",
+        "temporary_markdown_report",
+        "markdown_start_line",
+        "markdown_end_line",
         "source_root",
         "source_root_exists",
         "source_root_is_dir",
