@@ -2705,6 +2705,80 @@ for raw in sys.stdin.buffer:
             self.assertIn("正方证据报告", first_claim)
             self.assertIn("工具轮次耗尽", summaries)
 
+    def test_llm_agent_default_budget_allows_five_llm_and_twenty_mcp_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            atlas = root / "atlas"
+            atlas.write_text(fake_atlas_mcp_focus_graph_script(), encoding="utf-8")
+            atlas.chmod(0o755)
+            mcp_file = root / "mcp.json"
+            mcp_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "defaults": {"atlas": "atlas-test"},
+                        "servers": [
+                            {
+                                "id": "atlas-test",
+                                "name": "Atlas Test",
+                                "kind": "atlas",
+                                "transport": "stdio",
+                                "command": str(atlas),
+                                "args": ["mcp"],
+                                "cwd": "{project}",
+                                "enabled": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            finding = load_sarif(sarif)[0]
+            bundle = EvidenceBundle(
+                finding=finding,
+                evidence=[
+                    CodeEvidence(
+                        evidence_id="ev-report",
+                        kind=EvidenceKind.REPORT,
+                        strength=EvidenceStrength.STRONG,
+                        summary="输入报告",
+                        source="test",
+                        locations=list(finding.locations),
+                    )
+                ],
+                diagnostics=[],
+            )
+            tool_json = json.dumps(
+                {
+                    "atlas_tool_calls": [
+                        {"tool": "search", "arguments": {"query": f"handler_{index}"}}
+                        for index in range(5)
+                    ]
+                },
+                ensure_ascii=False,
+            )
+            affirmative = SequenceLLM([tool_json, tool_json, tool_json, tool_json, "AFFIRMATIVE_FINAL"])
+
+            report = DebateOrchestrator(
+                max_rounds=1,
+                affirmative_client=affirmative,
+                negative_client=FakeLLM("NEGATIVE"),
+                moderator_client=FakeLLM("MODERATOR"),
+                source_path=root,
+                mcp_servers_file=mcp_file,
+                enable_atlas_tools=True,
+            ).adjudicate(bundle)
+
+            agent_evidence = [
+                item
+                for item in report.evidence_chain
+                if item.source == "agent-atlas-mcp:affirmative" and item.data.get("mcp_tool") == "search"
+            ]
+            self.assertEqual(len(affirmative.calls), 5)
+            self.assertEqual(len(agent_evidence), 20)
+            self.assertIn("AFFIRMATIVE_FINAL", report.debate[0].raw_claim or report.debate[0].claim)
+
     def test_llm_agent_scopes_wide_search_to_report_file(self):
         from vuln_judger.debate import _normalize_agent_atlas_tool_arguments
 

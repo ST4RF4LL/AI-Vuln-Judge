@@ -35,7 +35,10 @@ from .source import evidence_id
 
 
 LOG = logger("debate")
-DEFAULT_AGENT_ATLAS_TOOL_ROUNDS = 2
+AGENT_ATLAS_MAX_LLM_REQUESTS = 5
+DEFAULT_AGENT_ATLAS_TOOL_ROUNDS = AGENT_ATLAS_MAX_LLM_REQUESTS - 1
+AGENT_ATLAS_TOOL_BATCH_LIMIT = 5
+AGENT_ATLAS_MAX_MCP_CALLS = 20
 
 
 @dataclass
@@ -649,6 +652,7 @@ class DebateOrchestrator:
             return client.complete(system, user)
         tool_user = user + "\n\n" + _agent_atlas_tool_instruction(self.source_path)
         mcp_client: Optional[MCPStdioClient] = None
+        remaining_mcp_calls = AGENT_ATLAS_MAX_MCP_CALLS
         try:
             for round_index in range(_agent_atlas_tool_round_limit()):
                 response = client.complete(system, tool_user)
@@ -661,21 +665,33 @@ class DebateOrchestrator:
                     "%s Agent 请求 Atlas MCP 工具 round=%s tools=%s",
                     _role_label(role),
                     round_index + 1,
-                    [str(call.get("tool") or call.get("name") or "").strip() for call in calls[:6]],
+                    [
+                        str(call.get("tool") or call.get("name") or "").strip()
+                        for call in calls[: min(AGENT_ATLAS_TOOL_BATCH_LIMIT, remaining_mcp_calls)]
+                    ],
                 )
                 if mcp_client is None:
                     mcp_client = self._start_atlas_mcp_client()
-                observations = self._execute_agent_atlas_tool_calls(mcp_client, role, bundle, calls)
+                observations, used_mcp_calls = self._execute_agent_atlas_tool_calls(
+                    mcp_client, role, bundle, calls, remaining_mcp_calls
+                )
+                remaining_mcp_calls = max(0, remaining_mcp_calls - used_mcp_calls)
                 tool_user += (
                     "\n\nAtlas MCP 工具观察（这些观察已作为新证据加入 evidence_chain，后续论断必须引用对应 evidence_id）：\n"
                     + "\n".join(observations)
-                    + "\n\n请基于当前证据继续。若仍需 Atlas，请再次只输出 atlas_tool_calls JSON；"
-                    "若证据已足够，请输出本回合正文，不要再输出工具 JSON。"
+                    + (
+                        "\n\n本回合 Atlas MCP 工具调用预算已经用完。请基于当前证据输出本回合正文，不要再输出工具 JSON。"
+                        if remaining_mcp_calls <= 0
+                        else "\n\n请基于当前证据继续。若仍需 Atlas，请再次只输出 atlas_tool_calls JSON；"
+                        "若证据已足够，请输出本回合正文，不要再输出工具 JSON。"
+                    )
                 )
+                if remaining_mcp_calls <= 0:
+                    break
             response = client.complete(
                 system,
                 tool_user
-                + "\n\nAtlas MCP 工具调用轮次已经用完。现在必须只输出本回合中文 Markdown 正文，"
+                + "\n\nAtlas MCP 工具调用轮次或工具调用预算已经用完。现在必须只输出本回合中文 Markdown 正文，"
                 "禁止再输出 atlas_tool_calls、tool_calls 或任何 JSON。若证据仍不足，请在正文中说明已尝试的工具路径和剩余缺口。",
             )
             if not response:
@@ -738,10 +754,21 @@ class DebateOrchestrator:
         return client
 
     def _execute_agent_atlas_tool_calls(
-        self, client: MCPStdioClient, role: str, bundle: EvidenceBundle, calls: Sequence[Dict[str, Any]]
-    ) -> List[str]:
+        self,
+        client: MCPStdioClient,
+        role: str,
+        bundle: EvidenceBundle,
+        calls: Sequence[Dict[str, Any]],
+        remaining_mcp_calls: int,
+    ) -> Tuple[List[str], int]:
         observations: List[str] = []
-        for index, call in enumerate(calls[:6], start=1):
+        used_mcp_calls = 0
+        batch_limit = min(AGENT_ATLAS_TOOL_BATCH_LIMIT, max(0, remaining_mcp_calls))
+        if batch_limit <= 0:
+            return ["- 本回合 Atlas MCP 工具调用预算已用完，本批工具调用未执行"], 0
+        if len(calls) > batch_limit:
+            observations.append(f"- 本批请求了 {len(calls)} 个工具调用，仅执行前 {batch_limit} 个以遵守本回合预算")
+        for index, call in enumerate(calls[:batch_limit], start=1):
             tool = str(call.get("tool") or call.get("name") or "").strip()
             arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
             arguments = _normalize_agent_atlas_tool_arguments(tool, arguments, self.source_path, bundle)
@@ -759,6 +786,7 @@ class DebateOrchestrator:
                 continue
             LOG.info("%s Agent 调用 Atlas MCP tool=%s arguments=%s", _role_label(role), tool, _compact_agent_log_json(arguments))
             try:
+                used_mcp_calls += 1
                 payload, raw_text, is_error = _agent_mcp_tool_payload(client.call_tool(tool, arguments))
             except (MCPError, OSError, ValueError) as exc:
                 evidence = _agent_atlas_tool_failure_evidence(
@@ -791,7 +819,7 @@ class DebateOrchestrator:
                 + _compact_text(raw_text or json.dumps(payload, ensure_ascii=False), 1200)
             )
             LOG.info("%s Agent Atlas MCP tool=%s success=%s evidence=%s", _role_label(role), tool, not is_error, evidence.evidence_id)
-        return observations
+        return observations, used_mcp_calls
 
     def _client_for_role(self, role: str) -> Optional[LLMClient]:
         if role == "AFFIRMATIVE":
@@ -1051,7 +1079,8 @@ def _agent_atlas_tool_instruction(source_path: Optional[Path]) -> str:
         "- 如果 project/status 提示 No project facts have been materialized yet，这不是 Atlas 不可用；应先执行 scoped search，"
         "再继续 calls、trace、symbol、path 等追溯。\n"
         "- 大型项目禁止一上来做全项目宽泛 search；先用报告位置的项目相对文件路径作为 scope。\n"
-        "- 每次最多 6 个 tool call。工具观察返回后，你可以继续请求工具，也可以输出本回合正文。\n"
+        "- 每个 Agent 回合最多 5 次 LLM 调度（含最终正文）和 20 次 Atlas MCP 工具调用。\n"
+        "- 每次最多 5 个 tool call。工具观察返回后，你可以继续请求工具，也可以输出本回合正文。\n"
     )
 
 
@@ -1059,7 +1088,7 @@ def _agent_atlas_tool_round_limit() -> int:
     raw = os.environ.get("VULN_JUDGER_AGENT_ATLAS_TOOL_ROUNDS")
     if raw:
         try:
-            return max(0, min(6, int(raw)))
+            return max(0, min(DEFAULT_AGENT_ATLAS_TOOL_ROUNDS, int(raw)))
         except ValueError:
             pass
     return DEFAULT_AGENT_ATLAS_TOOL_ROUNDS

@@ -63,6 +63,8 @@ Agent 继续分析。默认不开放 `index` 工具；`project(action="open", st
 触发，然后继续 `trace` / `calls` / `symbol` 等追溯。未启用 LLM
 时，Atlas 预分析器仍可作为非 LLM 模式的兼容补证路径。AI 自主源码阅读会同时运行，输出
 `agentic-source-reader` 来源的源码分析证据。MCP 不可用时也会保留该源码阅读路径。
+每个正方/反方 Agent 回合默认最多执行 5 次 LLM 调度（含最终正文）和 20 次 Atlas MCP
+工具调用，以便完成一次较完整的证据收集，同时避免无限循环。
 
 相关运行参数：
 
