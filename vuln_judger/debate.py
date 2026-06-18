@@ -481,14 +481,25 @@ class DebateOrchestrator:
         evidence_graph = build_evidence_graph(evidence, challenges)
         fallback_conclusion = _fallback_moderator_final_conclusion(bundle, base_decision, challenges)
         final_conclusion = _append_evidence_graph_markdown(
-            _ensure_moderator_final_label(moderator_summary, base_decision) if moderator_summary else fallback_conclusion,
+            _append_agent_atlas_budget_notice(
+                _ensure_moderator_final_label(moderator_summary, base_decision) if moderator_summary else fallback_conclusion,
+                evidence,
+            ),
             evidence_graph,
         )
         decision = _decision_from_moderator_conclusion(base_decision, final_conclusion)
+        if decision.verdict == Verdict.INCONCLUSIVE and not _has_meaningful_flow(evidence) and _agent_atlas_budget_exhaustion_summary(evidence):
+            decision = DebateDecision(
+                verdict=decision.verdict,
+                confidence=decision.confidence,
+                disputed_points=decision.disputed_points,
+                reasoning_summary=decision.reasoning_summary,
+                recommended_next_steps=_flow_gap_next_steps(evidence),
+            )
         turns.append(
             _make_debate_turn(
                 role=DebateRole.MODERATOR,
-                round_index=final_round,
+                round_index=final_round + 1,
                 claim=final_conclusion,
                 evidence_ids=[item.evidence_id for item in evidence],
                 resolved=decision.verdict != Verdict.INCONCLUSIVE,
@@ -654,14 +665,18 @@ class DebateOrchestrator:
         tool_user = user + "\n\n" + _agent_atlas_tool_instruction(self.source_path)
         mcp_client: Optional[MCPStdioClient] = None
         remaining_mcp_calls = AGENT_ATLAS_MAX_MCP_CALLS
+        used_tool_rounds = 0
+        exhausted_reason = ""
         try:
-            for round_index in range(_agent_atlas_tool_round_limit()):
+            tool_round_limit = _agent_atlas_tool_round_limit()
+            for round_index in range(tool_round_limit):
                 response = client.complete(system, tool_user)
                 if not response:
                     return None
                 calls = _parse_agent_atlas_tool_calls(response)
                 if not calls:
                     return _parse_agent_final_text(response) or response
+                used_tool_rounds = round_index + 1
                 LOG.info(
                     "%s Agent 请求 Atlas MCP 工具 round=%s tools=%s",
                     _role_label(role),
@@ -688,7 +703,23 @@ class DebateOrchestrator:
                     )
                 )
                 if remaining_mcp_calls <= 0:
+                    exhausted_reason = "mcp_calls"
                     break
+            if not exhausted_reason and used_tool_rounds >= tool_round_limit:
+                exhausted_reason = "tool_rounds"
+            if exhausted_reason:
+                bundle.evidence.append(
+                    _agent_atlas_budget_exhausted_evidence(
+                        bundle.finding.finding_id,
+                        role,
+                        len(bundle.evidence) + 1,
+                        used_tool_rounds,
+                        tool_round_limit,
+                        AGENT_ATLAS_MAX_MCP_CALLS - remaining_mcp_calls,
+                        AGENT_ATLAS_MAX_MCP_CALLS,
+                        exhausted_reason,
+                    )
+                )
             response = client.complete(
                 system,
                 tool_user
@@ -947,7 +978,7 @@ class DebateOrchestrator:
                 confidence=0.52,
                 disputed_points=challenges,
                 reasoning_summary="代码位置存在且包含类似源点/汇点的词项，但源到汇可达性尚未被证明。",
-                recommended_next_steps=["启用索引运行 Atlas/CodeQL，或让扫描器在 SARIF 中补充 code-flow 路径。"],
+                recommended_next_steps=_flow_gap_next_steps(evidence),
             )
         if _has_protection(evidence):
             return DebateDecision(
@@ -962,7 +993,7 @@ class DebateOrchestrator:
             confidence=0.4,
             disputed_points=challenges,
             reasoning_summary="源码位置存在，但当前证据不足以证明可达性、数据流或缓解状态。",
-            recommended_next_steps=["收集更强的分析器证据，或在 SARIF 报告中补充 code-flow。"],
+            recommended_next_steps=_flow_gap_next_steps(evidence),
         )
 
 
@@ -1422,6 +1453,42 @@ def _agent_atlas_tool_failure_evidence(
             "mcp_success": False,
             "arguments": arguments,
             "error": str(exc),
+        },
+    )
+
+
+def _agent_atlas_budget_exhausted_evidence(
+    finding_id: str,
+    role: str,
+    sequence: int,
+    used_tool_rounds: int,
+    tool_round_limit: int,
+    used_mcp_calls: int,
+    mcp_call_limit: int,
+    reason: str,
+) -> CodeEvidence:
+    role_label = _role_label(role)
+    if reason == "mcp_calls":
+        reason_text = f"已执行 {used_mcp_calls}/{mcp_call_limit} 次 MCP 调用"
+    else:
+        reason_text = f"已执行 {used_tool_rounds}/{tool_round_limit} 轮工具请求"
+    return CodeEvidence(
+        evidence_id=evidence_id(finding_id, "agent-atlas", role.lower(), str(sequence), "budget-exhausted"),
+        kind=EvidenceKind.TOOL_DIAGNOSTIC,
+        strength=EvidenceStrength.MEDIUM,
+        summary=(
+            f"{role_label} Agent Atlas MCP 工具预算耗尽：{reason_text}；"
+            "若调用链或数据流仍未闭环，只能说明当前工具预算/解析能力内未证明路径，不能等同于已证明路径不可达"
+        ),
+        source=f"agent-atlas-mcp:{role.lower()}",
+        data={
+            "agent_atlas_tool": True,
+            "budget_exhausted": True,
+            "exhausted_reason": reason,
+            "used_tool_rounds": used_tool_rounds,
+            "tool_round_limit": tool_round_limit,
+            "used_mcp_calls": used_mcp_calls,
+            "mcp_call_limit": mcp_call_limit,
         },
     )
 
@@ -2186,6 +2253,12 @@ def _data_excerpt(item: CodeEvidence) -> str:
         "atlas_database_exists",
         "transport",
         "mcp_tool",
+        "budget_exhausted",
+        "exhausted_reason",
+        "used_mcp_calls",
+        "mcp_call_limit",
+        "used_tool_rounds",
+        "tool_round_limit",
         "trace_kind",
         "trace_file",
         "trace_line",
@@ -2398,6 +2471,12 @@ def _moderator_autonomous_review_context(
         lines.append("当前报告主位置未能解析到源码，Moderator 应重点审查是否为报告路径/源码根配置问题或报告读取异常。")
     if not _has_meaningful_flow(evidence):
         lines.append("当前缺少强调用链/数据流证据，Moderator 应把端到端路径作为优先未闭环争议。")
+        budget_summary = _agent_atlas_budget_exhaustion_summary(evidence)
+        if budget_summary:
+            lines.append(
+                "Atlas 工具预算状态：" + budget_summary + "。Moderator 必须区分：这是工具预算/解析能力内未证明路径，"
+                "不得直接写成已经证明路径不可达；如要判定不可达，必须指出支持不可达的独立源码或调用图证据。"
+            )
     if _sensitive_info_candidates(evidence):
         lines.append("当前存在敏感信息候选词，Moderator 应检查反方是否审查真实敏感性，正方是否证明泄露或可读路径。")
     repeated_roles = _roles_with_repeated_turns(turns)
@@ -2962,6 +3041,50 @@ def _fallback_moderator_final_conclusion(
     return f"【{label}】，{statement}"
 
 
+def _append_agent_atlas_budget_notice(conclusion: str, evidence: Sequence[CodeEvidence]) -> str:
+    if _has_meaningful_flow(evidence):
+        return conclusion
+    budget_summary = _agent_atlas_budget_exhaustion_summary(evidence)
+    if not budget_summary or "工具预算" in conclusion or "预算/解析能力" in conclusion:
+        return conclusion
+    notice = (
+        "工具预算说明：" + budget_summary + "；当前未闭环只能说明在本轮 Atlas MCP 工具预算/解析能力内未证明路径，"
+        "不能等同于已证明路径不可达。"
+    )
+    return conclusion.rstrip() + "\n\n" + notice
+
+
+def _agent_atlas_budget_exhaustion_summary(evidence: Sequence[CodeEvidence]) -> str:
+    items = [item for item in evidence if item.data.get("agent_atlas_tool") and item.data.get("budget_exhausted")]
+    if not items:
+        return ""
+    parts: List[str] = []
+    for item in items[:3]:
+        role = _role_label(str(item.source).split(":")[-1].upper()) if ":" in item.source else "Agent"
+        used_calls = item.data.get("used_mcp_calls")
+        call_limit = item.data.get("mcp_call_limit")
+        used_rounds = item.data.get("used_tool_rounds")
+        round_limit = item.data.get("tool_round_limit")
+        if used_calls is not None and call_limit is not None and int(used_calls or 0) >= int(call_limit or 0):
+            parts.append(f"{role}已耗尽 MCP 调用预算 {used_calls}/{call_limit}")
+        elif used_rounds is not None and round_limit is not None:
+            parts.append(f"{role}已耗尽工具请求轮次 {used_rounds}/{round_limit}")
+        else:
+            parts.append(f"{role}Atlas MCP 工具预算已耗尽")
+    if len(items) > 3:
+        parts.append(f"另有 {len(items) - 3} 条预算耗尽诊断")
+    return "；".join(parts)
+
+
+def _flow_gap_next_steps(evidence: Sequence[CodeEvidence]) -> List[str]:
+    if _agent_atlas_budget_exhaustion_summary(evidence):
+        return [
+            "当前 Atlas MCP 预算已耗尽仍未闭环路径；增大工具预算或缩小 scope 后复跑，并优先补齐入口到汇点的 calls/trace。",
+            "用源码阅读或 grep/ripgrep 对 Atlas 未解析的关键跳点做人工路径重构，再把新符号交回 Atlas 追溯。",
+        ]
+    return ["收集更强的分析器证据，或在 SARIF 报告中补充 code-flow。"]
+
+
 def _fallback_moderator_label_statement(
     bundle: EvidenceBundle, decision: DebateDecision, challenges: Sequence[str]
 ) -> Tuple[str, str]:
@@ -2986,6 +3109,13 @@ def _fallback_moderator_label_statement(
         return "证据不足", "源码存在但端到端路径不足，且附近防护可能消减风险。"
     if _has_meaningful_flow(evidence):
         return "证据不足", "仍存在路径可达性、防护有效性或影响归因未闭环的问题。"
+    budget_summary = _agent_atlas_budget_exhaustion_summary(evidence)
+    if budget_summary:
+        return (
+            "证据不足",
+            f"当前只能确认部分源码或局部源汇迹象，尚未证明完整攻击链；同时 {budget_summary}，"
+            "因此不能区分是工具预算/解析能力不足还是路径真实不可达。",
+        )
     return "证据不足", "当前只能确认部分源码或局部源汇迹象，尚未证明完整攻击链。"
 
 

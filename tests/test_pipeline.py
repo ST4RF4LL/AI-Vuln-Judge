@@ -2836,8 +2836,17 @@ for raw in sys.stdin.buffer:
                 for item in report.evidence_chain
                 if item.source == "agent-atlas-mcp:affirmative" and item.data.get("mcp_tool") == "search"
             ]
+            budget_evidence = [
+                item
+                for item in report.evidence_chain
+                if item.source == "agent-atlas-mcp:affirmative" and item.data.get("budget_exhausted")
+            ]
             self.assertEqual(len(affirmative.calls), 5)
             self.assertEqual(len(agent_evidence), 20)
+            self.assertEqual(len(budget_evidence), 1)
+            self.assertEqual(budget_evidence[0].data["used_mcp_calls"], 20)
+            self.assertIn("不能等同于已证明路径不可达", report.final_conclusion)
+            self.assertTrue(any("增大工具预算" in step for step in report.recommended_next_steps))
             self.assertIn("AFFIRMATIVE_FINAL", report.debate[0].raw_claim or report.debate[0].claim)
 
     def test_llm_agent_scopes_wide_search_to_report_file(self):
@@ -3087,7 +3096,7 @@ for raw in sys.stdin.buffer:
                 any(turn.role.value == "NEGATIVE" and turn.round_index == 2 for turn in report.debate)
             )
             self.assertNotEqual(report.debate[-1].round_index, 2)
-            self.assertEqual(report.debate[-1].round_index, 4)
+            self.assertEqual(report.debate[-1].round_index, 5)
             affirmative_round4 = next(
                 turn for turn in report.debate if turn.role.value == "AFFIRMATIVE" and turn.round_index == 4
             )
@@ -3144,7 +3153,7 @@ for raw in sys.stdin.buffer:
                 turn for turn in report.debate if turn.role.value == "MODERATOR" and turn.round_index == 1
             )
             self.assertIn("是否继续下一轮：否", moderator_round.claim)
-            self.assertEqual(report.debate[-1].round_index, 1)
+            self.assertEqual(report.debate[-1].round_index, 2)
             self.assertFalse(
                 any(
                     turn.role.value == "AFFIRMATIVE"
@@ -3191,7 +3200,7 @@ for raw in sys.stdin.buffer:
             self.assertIn("是否继续下一轮：否", moderator_round.claim)
             self.assertIn("高度复读", moderator_round.claim)
             self.assertFalse(any("正方结案" in turn.claim or "反方结案" in turn.claim for turn in report.debate))
-            self.assertEqual(report.debate[-1].round_index, 1)
+            self.assertEqual(report.debate[-1].round_index, 2)
 
     def test_run_report_records_provider_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
