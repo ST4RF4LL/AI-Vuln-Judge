@@ -1545,6 +1545,24 @@ def app_html() -> str:
       border-bottom: 1px solid var(--line);
       background: #fbfcfe;
     }}
+    .detail-summary {{
+      margin: 0;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfe;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 700;
+    }}
+    .detail-summary .chips {{
+      display: inline-flex;
+      margin-left: 10px;
+      vertical-align: middle;
+      font-weight: 400;
+    }}
+    details.detail:not([open]) .detail-summary {{
+      border-bottom: 0;
+    }}
     .detail-body {{ padding: 14px; display: grid; gap: 12px; }}
     #agent-affirmative-profile-panel,
     #agent-negative-profile-panel {{
@@ -3447,8 +3465,14 @@ def app_html() -> str:
       const providers = run.llm_providers || {{}};
       const agents = run.agent_configs || {{}};
       const origin = runOriginLabel(run);
-      return `<div class="detail metadata-section">
-        <h3>运行元数据</h3>
+      return `<details class="detail metadata-section" open>
+        <summary class="detail-summary">运行元数据
+          <span class="chips">
+            <span class="chip origin">${{esc(origin)}}</span>
+            <span class="${{statusChipClass(status)}}">${{esc(statusLabel(status))}}</span>
+            <span class="chip">${{esc(findings.length)}} 个发现</span>
+          </span>
+        </summary>
         <div class="detail-body">
           <div class="chips">
             <span class="chip origin">${{esc(origin)}}</span>
@@ -3485,7 +3509,7 @@ def app_html() -> str:
           ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : `<div class="muted">${{esc(runningMessage)}}</div>`}}
           ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
         </div>
-      </div>`;
+      </details>`;
     }}
 
     function renderFindingsOverview(findings) {{
