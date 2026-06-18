@@ -222,6 +222,42 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(any("第 2/4 次失败" in item for item in prepared.diagnostics))
             self.assertTrue(any("第 3/4 次尝试成功" in item for item in prepared.diagnostics))
 
+    def test_markdown_split_accepts_common_line_range_shapes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markdown = root / "report.md"
+            markdown.write_text(
+                "\n".join(
+                    [
+                        "# 报告",
+                        "第一个漏洞描述。",
+                        "## 第二个漏洞",
+                        "第二个漏洞描述。",
+                        "第二个漏洞影响。",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            split_result = {
+                "findings": [
+                    {"title": "第一个漏洞", "line_range": {"start": "第 1 行", "end": "第 2 行"}},
+                    {"title": "第二个漏洞", "lines": "3-5"},
+                ]
+            }
+            moderator = FakeLLM(json.dumps(split_result, ensure_ascii=False))
+
+            prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
+            findings = prepared.findings or []
+
+            self.assertEqual(len(findings), 2)
+            self.assertEqual(findings[0].properties["markdown_start_line"], 1)
+            self.assertEqual(findings[0].properties["markdown_end_line"], 2)
+            self.assertIn("第一个漏洞描述", findings[0].raw["markdown"])
+            self.assertNotIn("第二个漏洞描述", findings[0].raw["markdown"])
+            self.assertEqual(findings[1].properties["markdown_start_line"], 3)
+            self.assertEqual(findings[1].properties["markdown_end_line"], 5)
+            self.assertIn("第二个漏洞影响", findings[1].raw["markdown"])
+
     def test_long_markdown_report_is_split_in_segments(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

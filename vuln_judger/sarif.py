@@ -365,26 +365,15 @@ def _markdown_ranges_from_response(data: Dict[str, Any], total_lines: int) -> Li
     raw_findings = data.get("findings")
     if raw_findings is None:
         raw_findings = data.get("vulnerabilities") or data.get("reports") or data.get("ranges")
+    if isinstance(raw_findings, dict):
+        raw_findings = [raw_findings]
     if not isinstance(raw_findings, list):
         raise ReportPreparationError("Moderator LLM Markdown 分割 JSON 缺少 findings 数组")
     ranges: List[MarkdownFindingRange] = []
     for index, item in enumerate(raw_findings, start=1):
         if not isinstance(item, dict):
             continue
-        start_line = _optional_int(
-            item.get("start_line")
-            or item.get("startLine")
-            or item.get("line_start")
-            or item.get("from_line")
-            or item.get("start")
-        )
-        end_line = _optional_int(
-            item.get("end_line")
-            or item.get("endLine")
-            or item.get("line_end")
-            or item.get("to_line")
-            or item.get("end")
-        )
+        start_line, end_line = _markdown_line_range_from_item(item)
         if start_line is None or end_line is None:
             continue
         start_line = max(1, min(start_line, max(1, total_lines)))
@@ -403,6 +392,118 @@ def _markdown_ranges_from_response(data: Dict[str, Any], total_lines: int) -> Li
         seen.add(marker)
         deduped.append(item)
     return deduped
+
+
+def _markdown_line_range_from_item(item: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
+    start_line = _optional_int(
+        _first_present(
+            item,
+            (
+                "start_line",
+                "startLine",
+                "startLineNumber",
+                "line_start",
+                "lineStart",
+                "from_line",
+                "fromLine",
+                "begin_line",
+                "beginLine",
+                "start",
+                "from",
+                "begin",
+            ),
+        )
+    )
+    end_line = _optional_int(
+        _first_present(
+            item,
+            (
+                "end_line",
+                "endLine",
+                "endLineNumber",
+                "line_end",
+                "lineEnd",
+                "to_line",
+                "toLine",
+                "finish_line",
+                "finishLine",
+                "last_line",
+                "lastLine",
+                "end",
+                "to",
+                "finish",
+            ),
+        )
+    )
+    for key in (
+        "line_range",
+        "lineRange",
+        "line_span",
+        "lineSpan",
+        "line_numbers",
+        "lineNumbers",
+        "lineNumberRange",
+        "lines",
+        "rows",
+        "range",
+        "source_lines",
+        "sourceLines",
+    ):
+        nested_start, nested_end = _markdown_line_range_from_value(item.get(key))
+        if start_line is None:
+            start_line = nested_start
+        if end_line is None:
+            end_line = nested_end
+        if start_line is not None and end_line is not None:
+            return start_line, end_line
+    line = _optional_int(
+        _first_present(
+            item,
+            (
+                "line",
+                "line_number",
+                "lineNumber",
+                "row",
+                "row_number",
+                "rowNumber",
+            ),
+        )
+    )
+    if start_line is None and end_line is None and line is not None:
+        return line, line
+    line_count = _optional_int(item.get("line_count") or item.get("lineCount"))
+    if start_line is not None and end_line is None and line_count is not None and line_count > 0:
+        return start_line, start_line + line_count - 1
+    return start_line, end_line
+
+
+def _markdown_line_range_from_value(value: Any) -> tuple[Optional[int], Optional[int]]:
+    if value is None:
+        return None, None
+    if isinstance(value, dict):
+        return _markdown_line_range_from_item(value)
+    if isinstance(value, (list, tuple)):
+        values = [_optional_int(item) for item in value]
+        values = [item for item in values if item is not None]
+        if len(values) >= 2:
+            return values[0], values[1]
+        if len(values) == 1:
+            return values[0], values[0]
+        return None, None
+    if isinstance(value, str):
+        values = [int(item) for item in re.findall(r"\d+", value)]
+        if len(values) >= 2:
+            return values[0], values[1]
+        if len(values) == 1:
+            return values[0], values[0]
+    return None, None
+
+
+def _first_present(item: Dict[str, Any], keys: Sequence[str]) -> Any:
+    for key in keys:
+        if key in item and item[key] is not None:
+            return item[key]
+    return None
 
 
 def _write_markdown_findings(
@@ -870,18 +971,21 @@ def _complete_moderator_llm(moderator_client: LLMClient, system: str, user: str,
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     cleaned = text.strip()
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
     if fenced:
         cleaned = fenced.group(1).strip()
-    elif not cleaned.startswith("{"):
-        start = cleaned.find("{")
-        end = cleaned.rfind("}")
+    elif not cleaned.startswith(("{", "[")):
+        starts = [position for position in (cleaned.find("{"), cleaned.find("[")) if position >= 0]
+        start = min(starts) if starts else -1
+        end = max(cleaned.rfind("}"), cleaned.rfind("]"))
         if start >= 0 and end > start:
             cleaned = cleaned[start : end + 1]
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
         return None
+    if isinstance(data, list):
+        return {"findings": data}
     return data if isinstance(data, dict) else None
 
 
@@ -968,7 +1072,10 @@ def _optional_int(value: Any) -> Optional[int]:
     try:
         return int(value)
     except (TypeError, ValueError):
-        return None
+        if not isinstance(value, str):
+            return None
+        match = re.search(r"\d+", value)
+        return int(match.group(0)) if match else None
 
 
 def _normalize_uri(uri: str) -> str:
