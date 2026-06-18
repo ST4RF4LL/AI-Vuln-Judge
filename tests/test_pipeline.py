@@ -1,5 +1,6 @@
 import http.client
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -140,7 +141,7 @@ class PipelineTests(unittest.TestCase):
                     )
                 )
 
-    def test_markdown_table_report_is_moderated_into_temp_markdown_findings(self):
+    def test_markdown_table_report_is_moderated_into_persistent_markdown_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
@@ -156,14 +157,26 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            split_result = {"findings": [{"title": "python-command-injection", "start_line": 1, "end_line": 5}]}
-            moderator = FakeLLM(json.dumps(split_result, ensure_ascii=False))
+            generated_markdown = "\n".join(
+                [
+                    "# python-command-injection",
+                    "",
+                    "| 漏洞类型 | 危险函数 | 漏洞描述 | 文件 | 行号 | 严重性 |",
+                    "|------|-----|-----|-----|-----|-----|",
+                    "| python-command-injection | os.system | 用户输入可到达命令执行点 | app.py | 5 | error |",
+                ]
+            )
+            response = {"reports": [{"title": "python-command-injection", "markdown": generated_markdown}]}
+            moderator = FakeLLM(json.dumps(response, ensure_ascii=False))
 
-            prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
+            tmp_dir = root / ".vuln-judger" / "tmp"
+            with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(tmp_dir)}):
+                prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
             self.assertNotEqual(prepared.effective_path, markdown.resolve())
             self.assertTrue(prepared.temporary)
             self.assertTrue(moderator.calls)
             self.assertTrue(prepared.effective_path.name.endswith(".md"))
+            self.assertEqual(prepared.effective_path.parent, tmp_dir.resolve())
             self.assertEqual(len(prepared.findings or []), 1)
             finding = prepared.findings[0]
             self.assertEqual(finding.rule_id, "markdown-finding-1")
@@ -171,11 +184,15 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(finding.locations, [])
             self.assertIn("| python-command-injection | os.system |", finding.raw["markdown"])
             self.assertEqual(prepared.effective_path.read_text(encoding="utf-8"), finding.raw["markdown"])
-            self.assertIn("0001 | # Markdown 表格报告", moderator.calls[0][1])
+            self.assertEqual(finding.properties["source_report_format"], "markdown")
+            self.assertTrue(finding.properties["generated_report_persisted"])
+            self.assertIn("Markdown 报告原文开始", moderator.calls[0][1])
+            self.assertIn("# Markdown 表格报告", moderator.calls[0][1])
+            self.assertNotIn("0001 | # Markdown 表格报告", moderator.calls[0][1])
             self.assertNotIn("转换为 SARIF 2.1.0", moderator.calls[0][1])
-            self.assertTrue(any("分割为 1 个临时单漏洞 Markdown 报告" in item for item in prepared.diagnostics))
+            self.assertTrue(any("整理为 1 个持久单漏洞 Markdown 报告" in item for item in prepared.diagnostics))
 
-    def test_moderator_llm_splits_markdown_before_sarif_validation(self):
+    def test_moderator_llm_analyzes_markdown_before_sarif_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
@@ -189,30 +206,33 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            split_result = {"findings": [{"title": "自然语言漏洞报告", "start_line": 1, "end_line": 3}]}
-            moderator = FakeLLM(json.dumps(split_result, ensure_ascii=False))
+            generated_markdown = "# 自然语言漏洞报告\n\n该报告描述了一个命令注入问题，危险函数是 os.system，位置在 app.py 第 5 行。"
+            response = {"reports": [{"title": "自然语言漏洞报告", "markdown": generated_markdown}]}
+            moderator = FakeLLM(json.dumps(response, ensure_ascii=False))
 
-            prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
+            with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(root / ".vuln-judger" / "tmp")}):
+                prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
             findings = prepared.findings or []
 
             self.assertTrue(moderator.calls)
-            self.assertIn("Markdown 报告原文（带行号）开始", moderator.calls[0][1])
+            self.assertIn("Markdown 报告原文开始", moderator.calls[0][1])
             self.assertEqual(findings[0].rule_id, "markdown-finding-1")
             self.assertEqual(findings[0].message, "自然语言漏洞报告")
-            self.assertEqual(findings[0].properties["markdown_start_line"], 1)
-            self.assertEqual(findings[0].properties["markdown_end_line"], 3)
+            self.assertNotIn("markdown_start_line", findings[0].properties)
+            self.assertNotIn("markdown_end_line", findings[0].properties)
             self.assertIn("危险函数是 os.system", findings[0].raw["markdown"])
-            self.assertTrue(any("Moderator LLM 已读取 Markdown 并确定 1 个漏洞报告范围" in item for item in prepared.diagnostics))
+            self.assertTrue(any("Moderator LLM 已读取完整 Markdown 并生成 1 个单漏洞报告" in item for item in prepared.diagnostics))
 
-    def test_markdown_split_retries_until_valid_ranges(self):
+    def test_markdown_moderation_retries_until_valid_reports(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
             markdown.write_text("# 报告\n\napp.py 第 5 行存在命令注入，危险函数 os.system。", encoding="utf-8")
-            split_result = {"findings": [{"title": "第三次重试后解析成功", "start_line": 1, "end_line": 3}]}
-            moderator = SequenceLLM(["不是 JSON", "", json.dumps(split_result, ensure_ascii=False)])
+            response = {"reports": [{"title": "第三次重试后解析成功", "markdown": "# 报告\n\napp.py 第 5 行存在命令注入，危险函数 os.system。"}]}
+            moderator = SequenceLLM(["不是 JSON", "", json.dumps(response, ensure_ascii=False)])
 
-            prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
+            with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(root / ".vuln-judger" / "tmp")}):
+                prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
             findings = prepared.findings or []
 
             self.assertEqual(len(moderator.calls), 3)
@@ -222,7 +242,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(any("第 2/4 次失败" in item for item in prepared.diagnostics))
             self.assertTrue(any("第 3/4 次尝试成功" in item for item in prepared.diagnostics))
 
-    def test_markdown_split_accepts_common_line_range_shapes(self):
+    def test_markdown_moderation_accepts_findings_alias_and_body_field(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
@@ -238,27 +258,39 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            split_result = {
+            response = {
                 "findings": [
-                    {"title": "第一个漏洞", "line_range": {"start": "第 1 行", "end": "第 2 行"}},
-                    {"title": "第二个漏洞", "lines": "3-5"},
+                    {"title": "第一个漏洞", "body": "# 第一个漏洞\n\n第一个漏洞描述。"},
+                    {"title": "第二个漏洞", "body": "# 第二个漏洞\n\n第二个漏洞描述。\n第二个漏洞影响。"},
                 ]
             }
-            moderator = FakeLLM(json.dumps(split_result, ensure_ascii=False))
+            moderator = FakeLLM(json.dumps(response, ensure_ascii=False))
 
-            prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
+            with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(root / ".vuln-judger" / "tmp")}):
+                prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
             findings = prepared.findings or []
 
             self.assertEqual(len(findings), 2)
-            self.assertEqual(findings[0].properties["markdown_start_line"], 1)
-            self.assertEqual(findings[0].properties["markdown_end_line"], 2)
             self.assertIn("第一个漏洞描述", findings[0].raw["markdown"])
             self.assertNotIn("第二个漏洞描述", findings[0].raw["markdown"])
-            self.assertEqual(findings[1].properties["markdown_start_line"], 3)
-            self.assertEqual(findings[1].properties["markdown_end_line"], 5)
             self.assertIn("第二个漏洞影响", findings[1].raw["markdown"])
 
-    def test_long_markdown_report_is_split_in_segments(self):
+    def test_markdown_moderation_accepts_plain_markdown_report_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            markdown = root / "report.md"
+            markdown.write_text("# 报告\n\napp.py 第 5 行存在命令注入，危险函数 os.system。", encoding="utf-8")
+            moderator = FakeLLM("# 命令注入单漏洞报告\n\napp.py 第 5 行存在命令注入，危险函数 os.system。")
+
+            with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(root / ".vuln-judger" / "tmp")}):
+                prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
+            findings = prepared.findings or []
+
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].message, "命令注入单漏洞报告")
+            self.assertIn("os.system", findings[0].raw["markdown"])
+
+    def test_long_markdown_report_is_sent_to_moderator_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
@@ -275,33 +307,27 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            first_segment = {"findings": [{"title": "漏洞 A", "start_line": 1, "end_line": 4}]}
-            second_segment = {"findings": [{"title": "漏洞 B", "start_line": 5, "end_line": 6}]}
-            consolidated = {
-                "findings": [
-                    {"title": "漏洞 A", "start_line": 1, "end_line": 4},
-                    {"title": "漏洞 B", "start_line": 5, "end_line": 6},
+            response = {
+                "reports": [
+                    {"title": "漏洞 A", "markdown": "# 漏洞 A\n\n" + "A" * 600},
+                    {"title": "漏洞 B", "markdown": "# 漏洞 B\n\n" + "B" * 600},
                 ]
             }
-            moderator = SequenceLLM(
-                [
-                    json.dumps(first_segment, ensure_ascii=False),
-                    json.dumps(second_segment, ensure_ascii=False),
-                    json.dumps(consolidated, ensure_ascii=False),
-                ]
-            )
+            moderator = SequenceLLM([json.dumps(response, ensure_ascii=False)])
 
-            with patch("vuln_judger.sarif.MARKDOWN_SPLIT_CHUNK_MAX_CHARS", 700):
+            with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(root / ".vuln-judger" / "tmp")}):
                 prepared = prepare_report_for_processing(markdown, moderator_client=moderator)
 
-            self.assertGreaterEqual(len(moderator.calls), 3)
+            self.assertEqual(len(moderator.calls), 1)
             self.assertEqual(len(prepared.findings or []), 2)
             self.assertIn("A" * 60, prepared.findings[0].raw["markdown"])
             self.assertIn("B" * 60, prepared.findings[1].raw["markdown"])
-            self.assertTrue(any("Markdown 报告过长，已按行分为" in item for item in prepared.diagnostics))
-            self.assertTrue(any("已合并分段结果并确定 2 个漏洞报告范围" in item for item in prepared.diagnostics))
+            self.assertIn("A" * 60, moderator.calls[0][1])
+            self.assertIn("B" * 60, moderator.calls[0][1])
+            self.assertFalse(any("分段" in item for item in prepared.diagnostics))
+            self.assertTrue(any("已读取完整 Markdown 并生成 2 个单漏洞报告" in item for item in prepared.diagnostics))
 
-    def test_markdown_split_fails_after_three_retries(self):
+    def test_markdown_moderation_fails_after_three_retries(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             markdown = root / "report.md"
@@ -313,7 +339,7 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(len(moderator.calls), 4)
 
-    def test_pipeline_uses_moderator_llm_for_markdown_split(self):
+    def test_pipeline_uses_moderator_llm_for_markdown_moderation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _sarif, skills = write_python_fixture(root)
@@ -346,21 +372,22 @@ class PipelineTests(unittest.TestCase):
                 )
                 store.set_defaults("fake", "fake", "fake")
 
-                report = run_judgement(
-                    RunConfig(
-                        sarif_path=markdown,
-                        source_path=root,
-                        skills_path=skills,
-                        providers_file=providers_file,
-                        enable_external_tools=False,
-                        enable_llm=True,
+                with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(root / ".vuln-judger" / "tmp")}):
+                    report = run_judgement(
+                        RunConfig(
+                            sarif_path=markdown,
+                            source_path=root,
+                            skills_path=skills,
+                            providers_file=providers_file,
+                            enable_external_tools=False,
+                            enable_llm=True,
+                        )
                     )
-                )
             finally:
                 llm_server.shutdown()
                 llm_server.server_close()
 
-            self.assertTrue(any("Moderator LLM 已读取 Markdown 并确定 1 个漏洞报告范围" in item for item in report.diagnostics))
+            self.assertTrue(any("Moderator LLM 已读取完整 Markdown 并生成 1 个单漏洞报告" in item for item in report.diagnostics))
             self.assertEqual(report.reports[0].rule_id, "markdown-finding-1")
             report_evidence = next(item for item in report.reports[0].evidence_chain if item.kind == EvidenceKind.REPORT)
             self.assertIn("请由 Moderator 解读", report_evidence.snippet)
@@ -407,8 +434,19 @@ class PipelineTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            split_result = {"findings": [{"title": "FAISS report", "start_line": 1, "end_line": 6}]}
-            prepared = prepare_report_for_processing(markdown, moderator_client=FakeLLM(json.dumps(split_result)))
+            generated_markdown = "\n".join(
+                [
+                    "# FAISS report",
+                    "",
+                    "## Affected Code",
+                    "",
+                    "- `faiss/impl/index_read.cpp`: additive fast-scan deserialization branches",
+                    "- `faiss/IndexFastScan.cpp`: `IndexFastScan::compute_quantized_LUT()`",
+                ]
+            )
+            response = {"reports": [{"title": "FAISS report", "markdown": generated_markdown}]}
+            with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(root / ".vuln-judger" / "tmp")}):
+                prepared = prepare_report_for_processing(markdown, moderator_client=FakeLLM(json.dumps(response)))
             finding = (prepared.findings or [])[0]
             self.assertEqual(finding.locations, [])
             self.assertIn("faiss/impl/index_read.cpp", finding.raw["markdown"])
@@ -438,9 +476,12 @@ class PipelineTests(unittest.TestCase):
             }
             moderator = FakeLLM(json.dumps(response, ensure_ascii=False))
 
-            prepared = prepare_report_for_processing(sarif, moderator_client=moderator, source_path=root)
+            tmp_dir = root / ".vuln-judger" / "tmp"
+            with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(tmp_dir)}):
+                prepared = prepare_report_for_processing(sarif, moderator_client=moderator, source_path=root)
 
             self.assertTrue(prepared.temporary)
+            self.assertEqual(prepared.effective_path.parent, tmp_dir.resolve())
             self.assertEqual(len(prepared.findings or []), 1)
             finding = prepared.findings[0]
             self.assertEqual(finding.rule_id, "python-command-injection")
@@ -4135,11 +4176,14 @@ class FakeOpenAIHandler(BaseHTTPRequestHandler):
                     },
                     ensure_ascii=False,
                 )
-            elif "按独立漏洞条目分割" in system_prompt or "Markdown 报告原文（带行号）开始" in user_prompt:
+            elif "完整 Markdown 静态漏洞报告" in system_prompt or "Markdown 报告原文开始" in user_prompt:
                 content = json.dumps(
                     {
-                        "findings": [
-                            {"title": "自然语言漏洞报告", "start_line": 1, "end_line": 3},
+                        "reports": [
+                            {
+                                "title": "自然语言漏洞报告",
+                                "markdown": "# 自然语言漏洞报告\n\n请由 Moderator 解读：app.py 第 5 行存在命令注入，危险函数 os.system。",
+                            },
                         ]
                     },
                     ensure_ascii=False,

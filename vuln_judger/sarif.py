@@ -4,11 +4,13 @@ import dataclasses
 import copy
 import hashlib
 import json
+import os
 import re
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import unquote, urlparse
+from uuid import uuid4
 
 from .agents import DEFAULT_MODERATOR_AGENT
 from .llm import LLMClient
@@ -17,9 +19,9 @@ from .models import Finding, SourceLocation
 from .source import SourceIndexer
 
 
-MARKDOWN_SPLIT_RETRIES = 3
-MARKDOWN_SPLIT_CHUNK_MAX_CHARS = 18000
+MARKDOWN_MODERATION_RETRIES = 3
 SARIF_MODERATION_RETRIES = 2
+DEFAULT_GENERATED_REPORTS_TMP_DIR = Path(".vuln-judger") / "tmp"
 
 
 @dataclasses.dataclass
@@ -33,10 +35,9 @@ class PreparedReport:
 
 
 @dataclasses.dataclass(frozen=True)
-class MarkdownFindingRange:
+class ModeratedMarkdownReport:
     title: str
-    start_line: int
-    end_line: int
+    markdown: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,7 +54,7 @@ class ReportPreparationError(RuntimeError):
 def load_report(path: Path) -> List[Finding]:
     suffix = path.suffix.lower()
     if suffix in {".md", ".markdown"}:
-        raise ReportPreparationError("Markdown 报告必须先由 Moderator LLM 分割为单漏洞 Markdown 报告")
+        raise ReportPreparationError("Markdown 报告必须先由 Moderator LLM 整理为单漏洞 Markdown 报告")
     if suffix in {".sarif", ".json"}:
         return load_sarif(path)
     with path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -61,7 +62,7 @@ def load_report(path: Path) -> List[Finding]:
     try:
         return parse_sarif(json.loads(text))
     except json.JSONDecodeError:
-        raise ReportPreparationError("非 JSON 报告必须先由 Moderator LLM 分割为单漏洞报告") from None
+        raise ReportPreparationError("非 JSON 报告必须先由 Moderator LLM 整理为单漏洞报告") from None
 
 
 def load_sarif(path: Path) -> List[Finding]:
@@ -82,15 +83,14 @@ def prepare_report_for_processing(
     diagnostics: List[str] = []
     if suffix in {".md", ".markdown"}:
         text = report_path.read_text(encoding="utf-8", errors="replace")
-        ranges, split_diagnostics = moderator_split_markdown_report(
+        findings, temp_paths, markdown_diagnostics = moderator_prepare_markdown_report(
             text,
             source_name=str(report_path),
             moderator_client=moderator_client,
             moderator_agent=moderator_agent,
         )
-        findings, temp_paths = _write_markdown_findings(text, ranges, report_path)
-        diagnostics.extend(split_diagnostics)
-        diagnostics.append(f"Moderator 已将 Markdown 报告分割为 {len(findings)} 个临时单漏洞 Markdown 报告")
+        diagnostics.extend(markdown_diagnostics)
+        diagnostics.append(f"Moderator 已将 Markdown 报告整理为 {len(findings)} 个持久单漏洞 Markdown 报告")
         return PreparedReport(
             report_path,
             temp_paths[0] if temp_paths else report_path,
@@ -104,15 +104,14 @@ def prepare_report_for_processing(
         data = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
     except json.JSONDecodeError:
         text = report_path.read_text(encoding="utf-8", errors="replace")
-        ranges, split_diagnostics = moderator_split_markdown_report(
+        findings, temp_paths, markdown_diagnostics = moderator_prepare_markdown_report(
             text,
             source_name=str(report_path),
             moderator_client=moderator_client,
             moderator_agent=moderator_agent,
         )
-        findings, temp_paths = _write_markdown_findings(text, ranges, report_path)
-        diagnostics.extend(split_diagnostics)
-        diagnostics.append(f"Moderator 已将非 JSON 文本报告分割为 {len(findings)} 个临时单漏洞报告")
+        diagnostics.extend(markdown_diagnostics)
+        diagnostics.append(f"Moderator 已将非 JSON 文本报告整理为 {len(findings)} 个持久单漏洞 Markdown 报告")
         return PreparedReport(
             report_path,
             temp_paths[0] if temp_paths else report_path,
@@ -141,7 +140,7 @@ def prepare_report_for_processing(
             diagnostics.append(f"Moderator SARIF 预处理失败，回退原始 SARIF：{exc}")
         else:
             diagnostics.extend(sarif_diagnostics)
-            diagnostics.append(f"Moderator 已将 SARIF 报告整理为 {len(findings)} 个临时单漏洞 Markdown 报告")
+            diagnostics.append(f"Moderator 已将 SARIF 报告整理为 {len(findings)} 个持久单漏洞 Markdown 报告")
             return PreparedReport(
                 report_path,
                 temp_paths[0] if temp_paths else report_path,
@@ -161,91 +160,50 @@ def prepare_report_for_processing(
     return PreparedReport(report_path, report_path, diagnostics, temporary=False)
 
 
-def moderator_split_markdown_report(
+def moderator_prepare_markdown_report(
     text: str,
     source_name: str = "markdown-report",
     moderator_client: Optional[LLMClient] = None,
     moderator_agent: Optional[AgentConfig] = None,
-) -> tuple[List[MarkdownFindingRange], List[str]]:
+) -> tuple[List[Finding], List[Path], List[str]]:
     diagnostics: List[str] = []
     if moderator_client is None:
-        raise ReportPreparationError("Moderator LLM 不可用，无法分割 Markdown 报告")
-    lines = text.splitlines()
-    chunks = _markdown_line_chunks(lines)
-    if len(chunks) == 1:
-        ranges = _moderator_markdown_ranges_with_retries(
-            moderator_client,
-            _markdown_split_prompt(
-                lines,
-                source_name,
-                moderator_agent,
-                chunk_index=1,
-                chunk_count=1,
-                start_line=1,
-                end_line=max(1, len(lines)),
-            ),
-            total_lines=len(lines),
-            action="Moderator LLM Markdown 分割",
-            diagnostics=diagnostics,
-        )
-        diagnostics.append(f"Moderator LLM 已读取 Markdown 并确定 {len(ranges)} 个漏洞报告范围")
-        return ranges, diagnostics
-
-    candidate_ranges: List[MarkdownFindingRange] = []
-    diagnostics.append(f"Markdown 报告过长，已按行分为 {len(chunks)} 段交给 Moderator 分段读取")
-    for chunk_index, (start_line, end_line) in enumerate(chunks, start=1):
-        chunk_ranges = _moderator_markdown_ranges_with_retries(
-            moderator_client,
-            _markdown_split_prompt(
-                lines,
-                source_name,
-                moderator_agent,
-                chunk_index=chunk_index,
-                chunk_count=len(chunks),
-                start_line=start_line,
-                end_line=end_line,
-            ),
-            total_lines=len(lines),
-            action=f"Moderator LLM Markdown 分段 {chunk_index}/{len(chunks)} 分割",
-            diagnostics=diagnostics,
-        )
-        diagnostics.append(f"Moderator LLM Markdown 分段 {chunk_index}/{len(chunks)} 识别候选范围 {len(chunk_ranges)} 个")
-        candidate_ranges.extend(chunk_ranges)
-    if not candidate_ranges:
-        raise ReportPreparationError("Moderator LLM 未从 Markdown 分段中识别出漏洞报告范围")
-    final_ranges = _moderator_consolidate_markdown_ranges(
+        raise ReportPreparationError("Moderator LLM 不可用，无法整理 Markdown 报告")
+    reports = _moderator_markdown_reports_with_retries(
         moderator_client,
-        source_name,
-        candidate_ranges,
-        total_lines=len(lines),
-        moderator_agent=moderator_agent,
+        _markdown_moderation_prompt(text, source_name, moderator_agent),
+        action="Moderator LLM Markdown 整理",
         diagnostics=diagnostics,
     )
-    diagnostics.append(f"Moderator LLM 已合并分段结果并确定 {len(final_ranges)} 个漏洞报告范围")
-    return final_ranges, diagnostics
+    findings, temp_paths = _write_moderated_markdown_findings(reports, Path(source_name))
+    diagnostics.append(f"Moderator LLM 已读取完整 Markdown 并生成 {len(findings)} 个单漏洞报告")
+    return findings, temp_paths, diagnostics
 
 
-def _moderator_markdown_ranges_with_retries(
+def _moderator_markdown_reports_with_retries(
     moderator_client: LLMClient,
     prompts: tuple[str, str],
-    total_lines: int,
     action: str,
     diagnostics: List[str],
-) -> List[MarkdownFindingRange]:
+) -> List[ModeratedMarkdownReport]:
     system, user = prompts
-    attempts = MARKDOWN_SPLIT_RETRIES + 1
+    attempts = MARKDOWN_MODERATION_RETRIES + 1
     last_error = "unknown error"
     for attempt in range(1, attempts + 1):
         try:
             response = _complete_moderator_llm(moderator_client, system, user, action)
             if not response:
-                raise ReportPreparationError("Moderator LLM 未返回 Markdown 分割结果")
+                raise ReportPreparationError("Moderator LLM 未返回 Markdown 整理结果")
             data = _extract_json_object(response)
             if data is None:
-                raise ReportPreparationError("Moderator LLM Markdown 分割结果不是合法 JSON object")
-            ranges = _markdown_ranges_from_response(data, total_lines)
-            if not ranges:
-                raise ReportPreparationError("Moderator LLM Markdown 分割结果未包含有效 findings 行号范围")
+                plain_report = _plain_markdown_report_from_response(response)
+                if plain_report is None:
+                    raise ReportPreparationError("Moderator LLM Markdown 整理结果不是合法 JSON object")
+                reports = [plain_report]
+            else:
+                reports = _moderated_markdown_reports_from_response(data)
+            if not reports:
+                raise ReportPreparationError("Moderator LLM Markdown 整理结果未包含有效 reports[].markdown")
         except ReportPreparationError as exc:
             last_error = str(exc)
             if attempt < attempts:
@@ -255,273 +213,108 @@ def _moderator_markdown_ranges_with_retries(
             break
         if attempt > 1:
             diagnostics.append(f"{action} 第 {attempt}/{attempts} 次尝试成功")
-        return ranges
+        return reports
     raise ReportPreparationError(f"{action} 在 {attempts} 次尝试后仍失败：{last_error}")
 
 
-def _moderator_consolidate_markdown_ranges(
-    moderator_client: LLMClient,
-    source_name: str,
-    candidate_ranges: Sequence[MarkdownFindingRange],
-    total_lines: int,
-    moderator_agent: Optional[AgentConfig],
-    diagnostics: List[str],
-) -> List[MarkdownFindingRange]:
-    agent = moderator_agent or DEFAULT_MODERATOR_AGENT
-    system = (
-        f"你是 {agent.name or '中立 Moderator'}，负责合并 Markdown 漏洞报告的分段读取结果。"
-        "只输出 JSON object，不要输出 Markdown、代码块、SARIF、漏洞事实摘要或额外解释。"
-    )
-    if agent.instructions.strip():
-        system += f"\nModerator 配置：\n{agent.instructions.strip()}"
-    candidates = [
-        {"title": item.title, "start_line": item.start_line, "end_line": item.end_line}
-        for item in candidate_ranges
-    ]
-    user = (
-        "下面是 Moderator 分段读取同一份 Markdown 报告后得到的候选漏洞范围。"
-        "请只合并重叠/重复范围，并输出最终漏洞报告范围；不要改写成 SARIF，不要提取漏洞字段。"
-        "行号是原始 Markdown 的 1-based inclusive 行号。\n\n"
-        f"source_report: {source_name}\n"
-        f"total_lines: {total_lines}\n"
-        "输出 JSON 格式：{\"findings\":[{\"title\":\"...\",\"start_line\":1,\"end_line\":20}]}\n\n"
-        "候选范围 JSON：\n"
-        + json.dumps({"findings": candidates}, ensure_ascii=False, indent=2)
-    )
-    return _moderator_markdown_ranges_with_retries(
-        moderator_client,
-        (system, user),
-        total_lines=total_lines,
-        action="Moderator LLM Markdown 分段范围合并",
-        diagnostics=diagnostics,
-    )
-
-
-def _markdown_line_chunks(lines: Sequence[str]) -> List[tuple[int, int]]:
-    if not lines:
-        return [(1, 1)]
-    chunks: List[tuple[int, int]] = []
-    start_index = 0
-    current_size = 0
-    for index, line in enumerate(lines):
-        line_size = len(line) + 16
-        if index > start_index and current_size + line_size > MARKDOWN_SPLIT_CHUNK_MAX_CHARS:
-            chunks.append((start_index + 1, index))
-            start_index = index
-            current_size = 0
-        current_size += line_size
-    chunks.append((start_index + 1, len(lines)))
-    return chunks
-
-
-def _markdown_split_prompt(
-    lines: Sequence[str],
+def _markdown_moderation_prompt(
+    text: str,
     source_name: str,
     moderator_agent: Optional[AgentConfig],
-    chunk_index: int,
-    chunk_count: int,
-    start_line: int,
-    end_line: int,
 ) -> tuple[str, str]:
     agent = moderator_agent or DEFAULT_MODERATOR_AGENT
     agent_instructions = (agent.instructions or "").strip()
     system = (
-        f"你是 {agent.name or '中立 Moderator'}，负责将 Markdown 静态漏洞报告按独立漏洞条目分割。"
-        "你必须先阅读报告内容，判断这一段中有多少个漏洞条目，再提取每个条目的原始 Markdown 行号范围。"
-        "禁止把 Markdown 转换为 SARIF；禁止输出漏洞字段抽取结果；禁止基于文件名、危险函数、CWE、表格列名等关键词规则猜测边界。"
-        "只输出一个 JSON object，不要输出 Markdown、代码块或解释。"
+        f"你是 {agent.name or '中立 Moderator'}，负责读取完整 Markdown 静态漏洞报告，"
+        "并整理成若干份可直接交给正反方研判的单漏洞 Markdown 报告。"
+        "不要返回行号范围，不要把 Markdown 转换为 SARIF，不要输出正反方结论或真实漏洞/误报判定。"
+        "只输出 JSON object，不要输出代码块、额外解释或 SARIF。"
     )
     if agent_instructions:
         system += f"\nModerator 配置：\n{agent_instructions}"
     user = (
-        "请读取下面带原始行号的 Markdown 报告"
-        + (f"分段 {chunk_index}/{chunk_count}" if chunk_count > 1 else "")
-        + "，输出这一段中应拆出的独立漏洞报告范围。\n"
-        "要求：\n"
-        "1. 行号必须是原始 Markdown 的 1-based inclusive 行号。\n"
-        "2. 每个范围必须包含该漏洞所需的标题、描述、表格行、代码块、影响、复现、调用链等上下文；不确定时扩大范围，不要缩小。\n"
-        "3. 如果同一漏洞跨越本段边界，只输出本段可见且应归属该漏洞的最大行号范围。\n"
-        "4. 不要输出 ruleId、message、locations、codeFlows 或 SARIF 字段。\n"
-        "5. 输出 JSON 格式：{\"findings\":[{\"title\":\"可选标题\",\"start_line\":1,\"end_line\":20}]}\n\n"
-        f"source_report: {source_name}\n"
-        f"segment: {chunk_index}/{chunk_count}\n"
-        f"segment_lines: {start_line}-{end_line}\n\n"
-        "Markdown 报告原文（带行号）开始：\n"
-        + _line_numbered_markdown(lines, start_line, end_line)
-        + "\nMarkdown 报告原文（带行号）结束。"
+        "请完整读取下面 Markdown 报告，按独立漏洞生成单漏洞 Markdown 报告。\n"
+        "输出要求：\n"
+        "1. 输出 JSON 格式：{\"reports\":[{\"title\":\"...\",\"markdown\":\"# ...\"}]}。\n"
+        "2. 每个 reports[].markdown 必须是一份完整单漏洞报告，保留原始报告中的规则、描述、文件路径、行号、代码块、表格行、调用链、数据流、影响和待核验缺口。\n"
+        "3. 如果原报告只有一个漏洞或无法可靠拆分，输出一份包含完整原始上下文的单漏洞报告。\n"
+        "4. 不要输出 start_line、end_line、line_range 或任何只供本地切片的字段；由你直接生成最终 Markdown 报告正文。\n"
+        "5. 不要新增没有原文支持的漏洞事实，不要做最终真实漏洞/误报裁决。\n\n"
+        f"source_report: {source_name}\n\n"
+        "Markdown 报告原文开始：\n"
+        + text
+        + "\nMarkdown 报告原文结束。"
     )
     return system, user
 
 
-def _line_numbered_markdown(lines: Sequence[str], start_line: int, end_line: int) -> str:
-    if not lines:
-        return "1 | "
-    selected = lines[start_line - 1 : end_line]
-    width = max(4, len(str(end_line)))
-    return "\n".join(f"{line_number:0{width}d} | {line}" for line_number, line in enumerate(selected, start=start_line))
-
-
-def _markdown_ranges_from_response(data: Dict[str, Any], total_lines: int) -> List[MarkdownFindingRange]:
-    raw_findings = data.get("findings")
-    if raw_findings is None:
-        raw_findings = data.get("vulnerabilities") or data.get("reports") or data.get("ranges")
-    if isinstance(raw_findings, dict):
-        raw_findings = [raw_findings]
-    if not isinstance(raw_findings, list):
-        raise ReportPreparationError("Moderator LLM Markdown 分割 JSON 缺少 findings 数组")
-    ranges: List[MarkdownFindingRange] = []
-    for index, item in enumerate(raw_findings, start=1):
-        if not isinstance(item, dict):
+def _moderated_markdown_reports_from_response(data: Dict[str, Any]) -> List[ModeratedMarkdownReport]:
+    raw_reports = data.get("reports")
+    if raw_reports is None:
+        raw_reports = data.get("findings") or data.get("vulnerabilities")
+    if isinstance(raw_reports, (dict, str)):
+        raw_reports = [raw_reports]
+    if not isinstance(raw_reports, list):
+        raise ReportPreparationError("Moderator LLM Markdown 整理 JSON 缺少 reports 数组")
+    reports: List[ModeratedMarkdownReport] = []
+    for report_index, item in enumerate(raw_reports, start=1):
+        title = f"Markdown moderated finding {report_index}"
+        markdown = ""
+        if isinstance(item, str):
+            markdown = item.strip()
+            title = _markdown_title(markdown) or title
+        elif isinstance(item, dict):
+            title = str(item.get("title") or item.get("name") or item.get("heading") or title).strip()
+            markdown = str(
+                item.get("markdown")
+                or item.get("report")
+                or item.get("body")
+                or item.get("content")
+                or item.get("analysis")
+                or ""
+            ).strip()
+        if not markdown:
             continue
-        start_line, end_line = _markdown_line_range_from_item(item)
-        if start_line is None or end_line is None:
-            continue
-        start_line = max(1, min(start_line, max(1, total_lines)))
-        end_line = max(1, min(end_line, max(1, total_lines)))
-        if end_line < start_line:
-            start_line, end_line = end_line, start_line
-        title = str(item.get("title") or item.get("name") or item.get("heading") or f"Markdown finding {index}").strip()
-        ranges.append(MarkdownFindingRange(title=title or f"Markdown finding {index}", start_line=start_line, end_line=end_line))
-    ranges.sort(key=lambda item: (item.start_line, item.end_line, item.title))
-    deduped: List[MarkdownFindingRange] = []
-    seen = set()
-    for item in ranges:
-        marker = (item.start_line, item.end_line)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        deduped.append(item)
-    return deduped
+        reports.append(ModeratedMarkdownReport(title=title or f"Markdown moderated finding {report_index}", markdown=markdown))
+    return reports
 
 
-def _markdown_line_range_from_item(item: Dict[str, Any]) -> tuple[Optional[int], Optional[int]]:
-    start_line = _optional_int(
-        _first_present(
-            item,
-            (
-                "start_line",
-                "startLine",
-                "startLineNumber",
-                "line_start",
-                "lineStart",
-                "from_line",
-                "fromLine",
-                "begin_line",
-                "beginLine",
-                "start",
-                "from",
-                "begin",
-            ),
-        )
-    )
-    end_line = _optional_int(
-        _first_present(
-            item,
-            (
-                "end_line",
-                "endLine",
-                "endLineNumber",
-                "line_end",
-                "lineEnd",
-                "to_line",
-                "toLine",
-                "finish_line",
-                "finishLine",
-                "last_line",
-                "lastLine",
-                "end",
-                "to",
-                "finish",
-            ),
-        )
-    )
-    for key in (
-        "line_range",
-        "lineRange",
-        "line_span",
-        "lineSpan",
-        "line_numbers",
-        "lineNumbers",
-        "lineNumberRange",
-        "lines",
-        "rows",
-        "range",
-        "source_lines",
-        "sourceLines",
-    ):
-        nested_start, nested_end = _markdown_line_range_from_value(item.get(key))
-        if start_line is None:
-            start_line = nested_start
-        if end_line is None:
-            end_line = nested_end
-        if start_line is not None and end_line is not None:
-            return start_line, end_line
-    line = _optional_int(
-        _first_present(
-            item,
-            (
-                "line",
-                "line_number",
-                "lineNumber",
-                "row",
-                "row_number",
-                "rowNumber",
-            ),
-        )
-    )
-    if start_line is None and end_line is None and line is not None:
-        return line, line
-    line_count = _optional_int(item.get("line_count") or item.get("lineCount"))
-    if start_line is not None and end_line is None and line_count is not None and line_count > 0:
-        return start_line, start_line + line_count - 1
-    return start_line, end_line
+def _plain_markdown_report_from_response(text: str) -> Optional[ModeratedMarkdownReport]:
+    cleaned = text.strip()
+    fenced = re.fullmatch(r"```(?:markdown|md)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        cleaned = fenced.group(1).strip()
+    if not re.search(r"^\s*#{1,6}\s+\S+", cleaned, flags=re.MULTILINE):
+        return None
+    if len(cleaned) < 40 and "\n" not in cleaned:
+        return None
+    return ModeratedMarkdownReport(title=_markdown_title(cleaned) or "Markdown moderated finding 1", markdown=cleaned)
 
 
-def _markdown_line_range_from_value(value: Any) -> tuple[Optional[int], Optional[int]]:
-    if value is None:
-        return None, None
-    if isinstance(value, dict):
-        return _markdown_line_range_from_item(value)
-    if isinstance(value, (list, tuple)):
-        values = [_optional_int(item) for item in value]
-        values = [item for item in values if item is not None]
-        if len(values) >= 2:
-            return values[0], values[1]
-        if len(values) == 1:
-            return values[0], values[0]
-        return None, None
-    if isinstance(value, str):
-        values = [int(item) for item in re.findall(r"\d+", value)]
-        if len(values) >= 2:
-            return values[0], values[1]
-        if len(values) == 1:
-            return values[0], values[0]
-    return None, None
+def _markdown_title(markdown: str) -> str:
+    for line in markdown.splitlines():
+        heading = re.match(r"^\s*#{1,6}\s+(.+?)\s*$", line)
+        if heading:
+            return heading.group(1).strip()
+    for line in markdown.splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            return cleaned[:120]
+    return ""
 
 
-def _first_present(item: Dict[str, Any], keys: Sequence[str]) -> Any:
-    for key in keys:
-        if key in item and item[key] is not None:
-            return item[key]
-    return None
-
-
-def _write_markdown_findings(
-    text: str,
-    ranges: Sequence[MarkdownFindingRange],
+def _write_moderated_markdown_findings(
+    reports: Sequence[ModeratedMarkdownReport],
     original_path: Path,
 ) -> tuple[List[Finding], List[Path]]:
-    lines = text.splitlines()
-    if not lines:
-        lines = [""]
     findings: List[Finding] = []
     temp_paths: List[Path] = []
-    for index, item in enumerate(ranges, start=1):
-        body = "\n".join(lines[item.start_line - 1 : item.end_line]).rstrip() + "\n"
+    for index, report in enumerate(reports, start=1):
+        body = report.markdown.rstrip() + "\n"
         temp_path = _write_temp_markdown(body, original_path, index)
         temp_paths.append(temp_path)
-        finding_id = _markdown_finding_id(original_path, index, item, body)
-        title = item.title or f"Markdown finding {index}"
+        title = report.title or _markdown_title(body) or f"Markdown finding {index}"
+        finding_id = _moderated_markdown_finding_id(original_path, index, report, body)
         findings.append(
             Finding(
                 finding_id=finding_id,
@@ -532,34 +325,32 @@ def _write_markdown_findings(
                 code_flows=[],
                 properties={
                     "source_format": "markdown",
+                    "source_report_format": "markdown",
                     "source_report": str(original_path),
                     "temporary_markdown_report": str(temp_path),
-                    "markdown_start_line": item.start_line,
-                    "markdown_end_line": item.end_line,
-                    "moderator_split": True,
+                    "moderator_markdown_preprocessed": True,
+                    "generated_report_persisted": True,
                 },
                 raw={
-                    "format": "markdown",
+                    "format": "markdown_moderated_report",
                     "source_report": str(original_path),
                     "temporary_report": str(temp_path),
                     "finding_index": index,
                     "title": title,
-                    "line_range": {"start_line": item.start_line, "end_line": item.end_line},
                     "markdown": body,
                 },
             )
         )
     if not findings:
-        raise ReportPreparationError("Moderator LLM 未生成任何可处理的 Markdown finding")
+        raise ReportPreparationError("Moderator LLM 未生成任何可处理的 Markdown 单漏洞报告")
     return findings, temp_paths
 
 
-def _markdown_finding_id(original_path: Path, index: int, item: MarkdownFindingRange, body: str) -> str:
+def _moderated_markdown_finding_id(original_path: Path, index: int, report: ModeratedMarkdownReport, body: str) -> str:
     seed = {
         "path": str(original_path),
         "index": index,
-        "start_line": item.start_line,
-        "end_line": item.end_line,
+        "title": report.title,
         "body": body,
     }
     digest = hashlib.sha256(json.dumps(seed, sort_keys=True).encode("utf-8")).hexdigest()
@@ -568,15 +359,27 @@ def _markdown_finding_id(original_path: Path, index: int, item: MarkdownFindingR
 
 def _write_temp_markdown(text: str, original_path: Path, index: int) -> Path:
     safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", original_path.stem)[:40] or "report"
-    with tempfile.NamedTemporaryFile(
-        "w",
-        encoding="utf-8",
-        suffix=".md",
-        prefix=f"vuln-judger-{safe_stem}-finding-{index}-",
-        delete=False,
-    ) as handle:
+    tmp_dir = _generated_reports_tmp_dir()
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    for _attempt in range(10):
+        path = tmp_dir / f"vuln-judger-{safe_stem}-finding-{index}-{uuid4().hex[:12]}.md"
+        try:
+            with path.open("x", encoding="utf-8") as handle:
+                handle.write(text)
+        except FileExistsError:
+            continue
+        return path.resolve()
+    path = tmp_dir / f"vuln-judger-{safe_stem}-finding-{index}-{uuid4().hex}.md"
+    with path.open("x", encoding="utf-8") as handle:
         handle.write(text)
-        return Path(handle.name)
+    return path.resolve()
+
+
+def _generated_reports_tmp_dir() -> Path:
+    configured = os.environ.get("VULN_JUDGER_TMP_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return DEFAULT_GENERATED_REPORTS_TMP_DIR
 
 
 def moderator_prepare_sarif_report(

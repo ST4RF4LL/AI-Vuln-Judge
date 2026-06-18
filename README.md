@@ -27,6 +27,9 @@ uv run vuln-judger run \
   --skills ./skills
 ```
 
+Markdown 或 SARIF 报告经 Moderator 预处理后生成的单漏洞 Markdown 报告会保存在
+`.vuln-judger/tmp/` 下，默认不会自动删除，便于复查模型整理后的输入。
+
 命令会输出 JSON 研判报告，包含每个发现的结论、置信度、证据链、正反方与主持人博弈回合、争议点、
 源码位置和建议下一步。项目语言构成会在分析源码目录时自动检测；默认语言为中文；
 机器接口字段名和枚举值保持稳定。
