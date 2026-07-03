@@ -1103,9 +1103,9 @@ def _agent_atlas_tool_instruction(source_path: Optional[Path]) -> str:
         "Atlas MCP 自主工具调用：\n"
         f"- 源码根目录：{source_path}\n"
         "- 你可以自主决定是否调用 Atlas MCP；如需调用，当前回复必须只输出 JSON，不要夹杂解释。\n"
-        "- JSON 格式：{\"atlas_tool_calls\":[{\"tool\":\"project\",\"arguments\":{\"action\":\"open\",\"project_path\":\"源码根目录\",\"storage\":\"auto\"}}]}\n"
+        "- JSON 格式：{\"atlas_tool_calls\":[{\"tool\":\"project\",\"arguments\":{\"action\":\"open\",\"project_path\":\"源码根目录\"}}]}\n"
         "- 可用工具：project, search, symbol, calls, trace, path, impact, file_dependencies, explore。\n"
-        "- 禁止调用 index；project/open 只用于激活项目，不能附加 scan_files 或 background。\n"
+        "- 禁止调用 index；project/open 只用于激活项目，不能附加 storage、scan_files 或 background。\n"
         "- Atlas Focus 由 search 触发：open 后优先围绕报告中的文件、符号和行号调用 search，并给 search 传入尽量窄的 scope，"
         "例如 {\"query\":\"危险函数或类名\",\"scope\":\"项目相对路径\",\"limit\":20}。\n"
         "- 如果 project/status 提示 No project facts have been materialized yet，这不是 Atlas 不可用；应先执行 scoped search，"
@@ -1134,11 +1134,11 @@ def _normalize_agent_atlas_tool_arguments(
 ) -> Dict[str, Any]:
     normalized = dict(arguments)
     if tool == "project" and str(normalized.get("action") or "").strip().lower() == "open":
+        normalized.pop("storage", None)
         normalized.pop("scan_files", None)
         normalized.pop("background", None)
         if source_path is not None and not normalized.get("project_path"):
             normalized["project_path"] = str(source_path)
-        normalized.setdefault("storage", "auto")
     if tool == "search":
         normalized.setdefault("limit", 20)
         if _optional_int(normalized.get("limit")) and int(normalized["limit"]) > 50:

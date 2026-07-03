@@ -378,13 +378,11 @@ class AtlasAnalyzer(Analyzer):
             ]
 
     def _agentic_project_open_evidence(
-        self, client: MCPStdioClient, finding: Finding, indexer: SourceIndexer, settings: AnalyzerSettings
+        self, client: MCPStdioClient, finding: Finding, indexer: SourceIndexer, _settings: AnalyzerSettings
     ) -> CodeEvidence:
-        storage = "persistent" if settings.auto_index else "auto"
         arguments = {
             "action": "open",
             "project_path": str(indexer.source_root),
-            "storage": storage,
         }
         payload, raw_text, is_error = _safe_mcp_tool_payload(client, "project", arguments)
         if is_error or not isinstance(payload, dict):
@@ -401,7 +399,6 @@ class AtlasAnalyzer(Analyzer):
                     "mcp_success": False,
                     "agentic_atlas": True,
                     "focus_runtime": True,
-                    "storage": storage,
                     "project_path": str(indexer.source_root),
                     "raw": raw_text[:1000],
                 },
@@ -410,7 +407,7 @@ class AtlasAnalyzer(Analyzer):
             evidence_id=evidence_id(finding.finding_id, self.name, "agentic-open"),
             kind=EvidenceKind.TOOL_DIAGNOSTIC,
             strength=EvidenceStrength.MEDIUM,
-            summary=f"Atlas MCP 预分析 project/open 已激活项目：storage={storage}",
+            summary="Atlas MCP 预分析 project/open 已激活项目",
             source="atlas-agent-mcp",
             data={
                 "transport": "mcp",
@@ -418,7 +415,6 @@ class AtlasAnalyzer(Analyzer):
                 "mcp_success": True,
                 "agentic_atlas": True,
                 "focus_runtime": True,
-                "storage": storage,
                 "project_path": str(indexer.source_root),
                 "project": payload.get("project") or payload.get("result") or {},
                 "analysis": payload.get("analysis") or {},

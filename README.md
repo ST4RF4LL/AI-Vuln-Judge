@@ -61,7 +61,7 @@ v1.5.0+ 的 Focus Runtime：即使源码目录尚未存在 `.atlas/atlas.db`，�
 MCP 工具循环：Agent 自主决定是否请求 `project`、`search`、`symbol`、`trace`、
 `calls`、`path`、`impact`、`file_dependencies` 或 `explore`，平台只负责执行这些
 MCP 工具调用、把 observation 转换为 `agent-atlas-mcp:<role>` 来源的证据并回灌给同一
-Agent 继续分析。默认不开放 `index` 工具；`project(action="open", storage="auto")`
+Agent 继续分析。默认不开放 `index` 工具；`project(action="open", project_path=...)`
 只负责激活项目，Focus 由 Agent 围绕报告文件和符号主动调用 scoped `search(query, scope)`
 触发，然后继续 `trace` / `calls` / `symbol` 等追溯。未启用 LLM
 时，Atlas 预分析器仍可作为非 LLM 模式的兼容补证路径。AI 自主源码阅读会同时运行，输出

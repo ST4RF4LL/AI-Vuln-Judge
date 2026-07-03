@@ -2966,6 +2966,12 @@ for raw in sys.stdin.buffer:
     def test_llm_agent_normalizes_common_atlas_argument_aliases(self):
         from vuln_judger.debate import _normalize_agent_atlas_tool_arguments
 
+        project_args = _normalize_agent_atlas_tool_arguments(
+            "project",
+            {"action": "open", "storage": "auto", "scan_files": True, "background": True},
+            Path("/tmp/source"),
+            None,
+        )
         calls_args = _normalize_agent_atlas_tool_arguments(
             "calls",
             {"function": "read_index", "scope": "faiss/impl/index_read.cpp", "direction": "upstream"},
@@ -2989,6 +2995,7 @@ for raw in sys.stdin.buffer:
             None,
         )
 
+        self.assertEqual(project_args, {"action": "open", "project_path": "/tmp/source"})
         self.assertEqual(calls_args, {"symbol": "read_index", "direction": "incoming"})
         self.assertEqual(
             symbol_args,
