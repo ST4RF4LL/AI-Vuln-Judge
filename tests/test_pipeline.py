@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
 from vuln_judger.api import _codex_terminal_page, _config_from_payload, _stop_codex_sessions, app_html, make_handler
-from vuln_judger.codex_runner import CodexTmuxSession, _ensure_codex_project_trust
+from vuln_judger.codex_runner import DEFAULT_CODEX_WORKSPACES_DIR, CodexTmuxSession, _ensure_codex_project_trust
 from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
@@ -2025,7 +2025,7 @@ for raw in sys.stdin.buffer:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "config.toml"
-            workspace = root / ".vuln_judger" / "workspaces" / "run-1"
+            workspace = root / ".workspaces" / "runs" / "run-1"
             workspace.mkdir(parents=True)
 
             _ensure_codex_project_trust(workspace, config_path=config_path)
@@ -2034,6 +2034,11 @@ for raw in sys.stdin.buffer:
             config = config_path.read_text(encoding="utf-8")
             self.assertEqual(config.count(f'[projects."{workspace.resolve()}"]'), 1)
             self.assertIn('trust_level = "trusted"', config)
+
+    def test_codex_default_workspaces_dir_uses_dot_workspaces_runs(self):
+        self.assertEqual(DEFAULT_CODEX_WORKSPACES_DIR.name, "runs")
+        self.assertEqual(DEFAULT_CODEX_WORKSPACES_DIR.parent.name, ".workspaces")
+        self.assertNotIn(".vuln_judger", str(DEFAULT_CODEX_WORKSPACES_DIR))
 
     def test_codex_config_ignores_legacy_llm_and_mcp_payload(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -27,7 +27,7 @@ from .source import SourceIndexer, detect_project_languages
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CODEX_WORKSPACES_DIR = REPO_ROOT / ".vuln_judger" / "workspaces"
+DEFAULT_CODEX_WORKSPACES_DIR = REPO_ROOT / ".workspaces" / "runs"
 CODEX_ENGINE = "codex"
 CODEX_ROLES = ("moderator", "affirmative", "negative")
 ROLE_LABELS = {
