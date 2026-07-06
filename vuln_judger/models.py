@@ -195,6 +195,7 @@ class VerdictReport:
 class RunConfig:
     sarif_path: Path
     source_path: Path
+    engine: str = "builtin"
     skills_path: Optional[Path] = None
     providers_file: Optional[Path] = None
     mcp_servers_file: Optional[Path] = None

@@ -76,9 +76,11 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
     for report in payload.get("reports", []):
         verdict = report.get("verdict", "UNKNOWN")
         verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+    workflow = payload.get("codex_workflow") if isinstance(payload.get("codex_workflow"), dict) else {}
     return {
         "run_id": payload.get("run_id"),
         "status": payload.get("status", "completed"),
+        "engine": payload.get("engine") or (payload.get("config") or {}).get("engine") or "builtin",
         "run_origin": normalize_run_origin(payload),
         "created_at": payload.get("created_at"),
         "source_path": payload.get("source_path"),
@@ -93,6 +95,7 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
         "current_finding_index": payload.get("current_finding_index"),
         "resume_from_finding_id": payload.get("resume_from_finding_id"),
         "resume_from_finding_index": payload.get("resume_from_finding_index"),
+        "codex_sessions": payload.get("codex_sessions") or workflow.get("sessions") or [],
     }
 
 

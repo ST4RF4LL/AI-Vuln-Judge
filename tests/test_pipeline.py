@@ -12,11 +12,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from unittest.mock import patch
 
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
-from vuln_judger.api import app_html, make_handler
+from vuln_judger.api import _codex_terminal_page, _config_from_payload, _stop_codex_sessions, app_html, make_handler
+from vuln_judger.codex_runner import CodexTmuxSession, _ensure_codex_project_trust
 from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
@@ -1807,9 +1808,11 @@ for raw in sys.stdin.buffer:
         self.assertIn('function plainText(value)', html)
         self.assertIn('function rawText(value)', html)
         self.assertIn('function displayText(value)', html)
+        self.assertIn('line.match(/^(#{1,6})\\s+(.+)$/)', html)
+        self.assertNotIn('#(1, 6)', html)
         self.assertIn('promptEchoPatterns', html)
-        self.assertIn('plainText(turn.claim)', html)
-        self.assertNotIn('renderMarkdown(turn.claim)', html)
+        self.assertIn('markdownBlock(turn.claim)', html)
+        self.assertNotIn('plainText(turn.claim)', html)
         self.assertIn('class="plain-text"', html)
         self.assertIn('原始报告详情', html)
         self.assertIn('renderOriginalReportSection(detail)', html)
@@ -1870,6 +1873,171 @@ for raw in sys.stdin.buffer:
         self.assertIn("SOURCE_ROOT: '源码根目录'", html)
         self.assertIn("fetchJson('/mcp-servers')", html)
         self.assertIn("fetchJson('/skill-sources')", html)
+        self.assertIn('id="run-provider-agent-grid"', html)
+        self.assertIn('id="run-tool-provider-options"', html)
+        self.assertIn('id="run-codex-config-note"', html)
+        self.assertIn('function updateRunEngineVisibility()', html)
+        self.assertIn('Codex 三方复核使用项目 .codex/config.toml', html)
+        self.assertIn('/terminal-ui', html)
+        self.assertIn('id="codex-terminal-frame-modal"', html)
+        self.assertIn('id="close-codex-terminal-frame"', html)
+        self.assertIn('id="codex-terminal-frame"', html)
+        self.assertIn('在当前页面打开原始 Codex TUI', html)
+        self.assertIn("el.codexTerminalFrame.src = url", html)
+        self.assertIn("el.codexTerminalFrame.src = 'about:blank'", html)
+        self.assertIn('button.danger-button', html)
+        self.assertIn('class="danger-button"', html)
+        self.assertIn('data-codex-stop-sessions="true"', html)
+        self.assertIn('关闭全部 Codex Sessions', html)
+        self.assertIn('async function stopCodexSessions(runId, button)', html)
+        self.assertIn('/codex-sessions/stop', html)
+        self.assertIn('关闭当前任务的全部 Codex tmux session', html)
+        self.assertLess(html.index('data-codex-terminal-role'), html.index('data-codex-stop-sessions="true"'))
+        self.assertIn('function markdownBlock(value', html)
+        self.assertIn('function renderCodexStructuredContent(data', html)
+        self.assertIn('function renderDebateStructuredTurn(turn)', html)
+        self.assertIn("markdownField('最终结论'", html)
+        self.assertIn("markdownField('防护研判'", html)
+        self.assertIn('markdownBlock(turn.claim)', html)
+        self.assertIn('renderDebateStructuredTurn(turn)', html)
+        self.assertIn('class="debate-structured"', html)
+        self.assertNotIn('plainText(moderatorText', html)
+        self.assertNotIn('plainText(summary ||', html)
+        self.assertNotIn("window.open(url", html)
+        self.assertNotIn('id="codex-terminal-modal"', html)
+        self.assertNotIn('id="codex-terminal-input"', html)
+
+    def test_codex_terminal_page_uses_xterm_websocket(self):
+        html = _codex_terminal_page(
+            "run-1",
+            "moderator",
+            {"target": "vj-run-1-moderator:codex", "session_name": "vj-run-1-moderator"},
+        )
+        self.assertIn('/static/vendor/xterm/xterm.css', html)
+        self.assertIn('/static/vendor/xterm/xterm.js', html)
+        self.assertIn('/static/vendor/xterm/addon-fit.js', html)
+        self.assertIn('/runs/run-1/codex-sessions/moderator/ws', html)
+        self.assertIn('new WebSocket(websocketURL(websocketPath))', html)
+        self.assertIn("tmux attach · raw TUI", html)
+
+    def test_stop_codex_sessions_closes_all_live_sessions(self):
+        payload = {
+            "run_id": "run-1",
+            "codex_sessions": [
+                {"role": "moderator", "session_name": "vj-run-1-moderator"},
+                {"role": "affirmative", "session_name": "vj-run-1-affirmative"},
+                {"role": "negative", "session_name": "vj-run-1-negative"},
+            ],
+        }
+
+        class Store:
+            def get(self, run_id):
+                return payload if run_id == "run-1" else None
+
+        before = [
+            {"role": "moderator", "live": True},
+            {"role": "affirmative", "live": True},
+            {"role": "negative", "live": False},
+        ]
+        after = [
+            {"role": "moderator", "live": False},
+            {"role": "affirmative", "live": False},
+            {"role": "negative", "live": False},
+        ]
+        with patch("vuln_judger.api._codex_sessions", side_effect=[before, after]) as sessions:
+            with patch("vuln_judger.api.stop_sessions") as stop:
+                result = _stop_codex_sessions(Store(), {}, Lock(), "run-1")
+
+        self.assertEqual(result["run_id"], "run-1")
+        self.assertEqual(result["stopped"], 2)
+        self.assertEqual(result["sessions"], after)
+        self.assertEqual(sessions.call_count, 2)
+        stop.assert_called_once()
+
+    def test_codex_start_uses_yolo_mode_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            run_dir = root / "workspace"
+            source.mkdir()
+            run_dir.mkdir()
+            session = CodexTmuxSession(
+                role="moderator",
+                run_id="run-1",
+                cwd=run_dir,
+                source_path=source,
+                run_dir=run_dir,
+                command="codex",
+            )
+            completed = [
+                subprocess.CompletedProcess(["tmux"], 1, "", ""),
+                subprocess.CompletedProcess(["tmux"], 0, "", ""),
+            ]
+            with patch("vuln_judger.codex_runner._run_tmux", side_effect=completed) as run_tmux:
+                with patch.object(CodexTmuxSession, "_accept_trust_prompt"), patch.object(
+                    CodexTmuxSession, "_wait_until_input_ready"
+                ):
+                    session.start()
+
+            launch_args = run_tmux.call_args_list[1].args[0]
+            self.assertIn("--dangerously-bypass-approvals-and-sandbox", launch_args)
+            self.assertNotIn("--sandbox", launch_args)
+            self.assertNotIn("--ask-for-approval", launch_args)
+            self.assertEqual(launch_args[launch_args.index("--cd") + 1], str(run_dir.resolve()))
+
+    def test_codex_project_trust_is_written_for_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            workspace = root / ".vuln_judger" / "workspaces" / "run-1"
+            workspace.mkdir(parents=True)
+
+            _ensure_codex_project_trust(workspace, config_path=config_path)
+            _ensure_codex_project_trust(workspace, config_path=config_path)
+
+            config = config_path.read_text(encoding="utf-8")
+            self.assertEqual(config.count(f'[projects."{workspace.resolve()}"]'), 1)
+            self.assertIn('trust_level = "trusted"', config)
+
+    def test_codex_config_ignores_legacy_llm_and_mcp_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = {
+                "report_path": str(root / "report.sarif"),
+                "source_path": str(root / "source"),
+                "engine": "codex",
+                "enable_external_tools": False,
+                "auto_index_tools": True,
+                "enable_llm": True,
+                "llm_model": "legacy-model",
+                "llm_endpoint": "http://127.0.0.1/v1/chat/completions",
+                "affirmative_provider_id": "affirmative-provider",
+                "negative_provider_id": "negative-provider",
+                "moderator_provider_id": "moderator-provider",
+                "affirmative_agent": {"name": "old-affirmative"},
+                "negative_agent": {"name": "old-negative"},
+                "moderator_agent": {"name": "old-moderator"},
+            }
+
+            config = _config_from_payload(
+                payload,
+                providers_file=root / "providers.json",
+                mcp_servers_file=root / "mcp.json",
+            )
+
+            self.assertEqual(config.engine, "codex")
+            self.assertIsNone(config.mcp_servers_file)
+            self.assertTrue(config.enable_external_tools)
+            self.assertFalse(config.auto_index_tools)
+            self.assertFalse(config.enable_llm)
+            self.assertIsNone(config.llm_model)
+            self.assertIsNone(config.llm_endpoint)
+            self.assertIsNone(config.affirmative_provider_id)
+            self.assertIsNone(config.negative_provider_id)
+            self.assertIsNone(config.moderator_provider_id)
+            self.assertIsNone(config.affirmative_agent)
+            self.assertIsNone(config.negative_agent)
+            self.assertIsNone(config.moderator_agent)
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:

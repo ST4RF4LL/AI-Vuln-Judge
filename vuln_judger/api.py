@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime, timezone
 from html import escape
 from http import HTTPStatus
@@ -12,6 +13,17 @@ from urllib.parse import parse_qs, unquote, urlparse
 from uuid import uuid4
 
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
+from .codex_runner import (
+    CODEX_ENGINE,
+    CodexDrivenRunner,
+    CodexRunnerError,
+    CodexRunnerStopped,
+    attach_session_websocket,
+    capture_session,
+    send_session_input,
+    session_live,
+    stop_sessions,
+)
 from .evidence_graph import build_evidence_graph, graph_to_markdown
 from .llm import test_provider_connection
 from .logging_config import DEFAULT_LOG_FILE, configure_logging, logger
@@ -24,6 +36,7 @@ from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore
 
 
 DEFAULT_RECORDS_DIR = Path(".vuln-judger") / "runs"
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 RUN_ORIGIN_WEB = "web"
 LOG = logger("api")
 PROMPT_ECHO_MARKERS = (
@@ -188,6 +201,26 @@ def make_handler(
                         LOG.info("收到恢复任务请求 run_id=%s status=%s", parts[1], result.get("status"))
                         self._json(result)
                     return
+                if len(parts) == 4 and parts[0] == "runs" and parts[2] == "codex-sessions" and parts[3] == "stop":
+                    result = _stop_codex_sessions(store, tasks, tasks_lock, parts[1])
+                    if result is None:
+                        self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
+                    else:
+                        LOG.info(
+                            "收到关闭 Codex sessions 请求 run_id=%s stopped=%s",
+                            parts[1],
+                            result.get("stopped"),
+                        )
+                        self._json(result)
+                    return
+                if len(parts) == 5 and parts[0] == "runs" and parts[2] == "codex-sessions" and parts[4] == "input":
+                    payload = self._read_json()
+                    result = _send_codex_session_input(store, tasks, tasks_lock, parts[1], parts[3], str(payload.get("message") or ""))
+                    if result is None:
+                        self._json({"error": "Codex session 未找到"}, HTTPStatus.NOT_FOUND)
+                    else:
+                        self._json(result)
+                    return
                 if parts == ["providers"]:
                     self._json(provider_store.upsert(self._read_json()), HTTPStatus.CREATED)
                     return
@@ -305,6 +338,9 @@ def make_handler(
             if not parts or parts == ["ui"]:
                 self._html(app_html())
                 return
+            if parts and parts[0] == "static":
+                self._static(parts[1:])
+                return
             if parts == ["healthz"]:
                 self._json({"ok": True})
                 return
@@ -360,6 +396,21 @@ def make_handler(
                 run = store.get(parts[1])
                 task = _get_task(tasks, tasks_lock, parts[1])
                 active_task = task if task is not None and task.get("status") != "completed" else None
+                terminal_payload = active_task if active_task is not None else run if run is not None else task
+                if len(parts) == 5 and parts[2] == "codex-sessions" and parts[4] in {"terminal-ui", "ws"}:
+                    if terminal_payload is None:
+                        self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
+                        return
+                    session = _codex_session_for_role(terminal_payload, parts[3])
+                    if session is None:
+                        self._json({"error": "Codex session 未找到"}, HTTPStatus.NOT_FOUND)
+                        return
+                    target = str(session.get("target") or session.get("session_name") or "")
+                    if parts[4] == "terminal-ui":
+                        self._html(_codex_terminal_page(parts[1], parts[3], session))
+                        return
+                    attach_session_websocket(self, target)
+                    return
                 if len(parts) == 3 and parts[2] == "export":
                     payload = active_task if active_task is not None else run if run is not None else task
                     if payload is None:
@@ -387,6 +438,12 @@ def make_handler(
                                 return
                         self._json({"error": "发现尚未生成或未找到"}, HTTPStatus.NOT_FOUND)
                         return
+                    if len(parts) == 3 and parts[2] == "codex-sessions":
+                        self._json(_codex_sessions(active_task))
+                        return
+                    if len(parts) == 5 and parts[2] == "codex-sessions" and parts[4] == "terminal":
+                        self._json(_codex_session_terminal(active_task, parts[3]))
+                        return
                 if run is None:
                     if task is None:
                         self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
@@ -408,6 +465,12 @@ def make_handler(
                     return
                 if len(parts) == 2:
                     self._json(_run_detail(run))
+                    return
+                if len(parts) == 3 and parts[2] == "codex-sessions":
+                    self._json(_codex_sessions(run))
+                    return
+                if len(parts) == 5 and parts[2] == "codex-sessions" and parts[4] == "terminal":
+                    self._json(_codex_session_terminal(run, parts[3]))
                     return
                 if len(parts) == 3 and parts[2] == "findings":
                     self._json([_finding_summary(report) for report in run.get("reports", [])])
@@ -456,6 +519,29 @@ def make_handler(
             self.end_headers()
             self.wfile.write(raw)
 
+        def _static(self, parts: list[str]) -> None:
+            if not parts:
+                self._json({"error": "静态资源未找到"}, HTTPStatus.NOT_FOUND)
+                return
+            root = STATIC_DIR.resolve()
+            candidate = (root / Path(*parts)).resolve()
+            if root not in candidate.parents or not candidate.is_file():
+                self._json({"error": "静态资源未找到"}, HTTPStatus.NOT_FOUND)
+                return
+            suffix = candidate.suffix.lower()
+            content_type = {
+                ".css": "text/css; charset=utf-8",
+                ".js": "application/javascript; charset=utf-8",
+                ".txt": "text/plain; charset=utf-8",
+            }.get(suffix, "application/octet-stream")
+            raw = candidate.read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("content-type", content_type)
+            self.send_header("cache-control", "public, max-age=3600")
+            self.send_header("content-length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
     return Handler
 
 
@@ -486,32 +572,39 @@ def _config_from_payload(
     report_path = payload.get("sarif_path") or payload.get("report_path")
     if not report_path:
         raise ValueError("report_path 或 sarif_path 不能为空")
-    affirmative_agent = _agent_config_from_payload(payload, "affirmative")
-    negative_agent = _agent_config_from_payload(payload, "negative")
-    moderator_agent = _agent_config_from_payload(payload, "moderator")
-    if agent_store is not None:
-        if affirmative_agent is None:
-            affirmative_agent = agent_store.agent("affirmative", payload.get("affirmative_agent_profile"))
-        if negative_agent is None:
-            negative_agent = agent_store.agent("negative", payload.get("negative_agent_profile"))
-        if moderator_agent is None:
-            moderator_agent = agent_store.agent("moderator", payload.get("moderator_agent_profile"))
+    engine = str(payload.get("engine") or "builtin").strip().lower() or "builtin"
+    codex_engine = engine == CODEX_ENGINE
+    affirmative_agent = None
+    negative_agent = None
+    moderator_agent = None
+    if not codex_engine:
+        affirmative_agent = _agent_config_from_payload(payload, "affirmative")
+        negative_agent = _agent_config_from_payload(payload, "negative")
+        moderator_agent = _agent_config_from_payload(payload, "moderator")
+        if agent_store is not None:
+            if affirmative_agent is None:
+                affirmative_agent = agent_store.agent("affirmative", payload.get("affirmative_agent_profile"))
+            if negative_agent is None:
+                negative_agent = agent_store.agent("negative", payload.get("negative_agent_profile"))
+            if moderator_agent is None:
+                moderator_agent = agent_store.agent("moderator", payload.get("moderator_agent_profile"))
     return RunConfig(
         sarif_path=Path(report_path),
         source_path=Path(payload["source_path"]),
+        engine=engine,
         skills_path=skills_path,
         providers_file=providers_file,
-        mcp_servers_file=mcp_servers_file,
+        mcp_servers_file=None if codex_engine else mcp_servers_file,
         run_id=run_id,
         max_rounds=int(payload.get("max_rounds") or 4),
-        auto_index_tools=bool(payload.get("auto_index_tools") or False),
-        enable_external_tools=bool(payload.get("enable_external_tools", True)),
-        enable_llm=bool(payload.get("enable_llm", False)),
-        llm_model=payload.get("llm_model"),
-        llm_endpoint=payload.get("llm_endpoint"),
-        affirmative_provider_id=payload.get("affirmative_provider_id"),
-        negative_provider_id=payload.get("negative_provider_id"),
-        moderator_provider_id=payload.get("moderator_provider_id"),
+        auto_index_tools=False if codex_engine else bool(payload.get("auto_index_tools") or False),
+        enable_external_tools=True if codex_engine else bool(payload.get("enable_external_tools", True)),
+        enable_llm=False if codex_engine else bool(payload.get("enable_llm", False)),
+        llm_model=None if codex_engine else payload.get("llm_model"),
+        llm_endpoint=None if codex_engine else payload.get("llm_endpoint"),
+        affirmative_provider_id=None if codex_engine else payload.get("affirmative_provider_id"),
+        negative_provider_id=None if codex_engine else payload.get("negative_provider_id"),
+        moderator_provider_id=None if codex_engine else payload.get("moderator_provider_id"),
         affirmative_agent=affirmative_agent,
         negative_agent=negative_agent,
         moderator_agent=moderator_agent,
@@ -522,6 +615,7 @@ def _run_detail(run):
     return {
         "run_id": run.get("run_id"),
         "status": run.get("status", "completed"),
+        "engine": run.get("engine") or (run.get("config") or {}).get("engine") or "builtin",
         "run_origin": normalize_run_origin(run),
         "created_at": run.get("created_at"),
         "source_path": run.get("source_path"),
@@ -539,6 +633,8 @@ def _run_detail(run):
         "resume_from_finding_id": run.get("resume_from_finding_id"),
         "resume_from_finding_index": run.get("resume_from_finding_index"),
         "config": run.get("config", {}),
+        "codex_sessions": _codex_sessions(run),
+        "codex_workflow": run.get("codex_workflow", {}),
     }
 
 
@@ -580,6 +676,7 @@ def _task_from_config(config: RunConfig, run_id: str, status: str, error: Option
     return {
         "run_id": run_id,
         "status": status,
+        "engine": config.engine,
         "run_origin": RUN_ORIGIN_WEB,
         "created_at": _now(),
         "source_path": str(config.source_path),
@@ -613,6 +710,9 @@ def _run_task(
     stop_event: Event,
     pause_event: Event,
 ) -> None:
+    if config.engine == CODEX_ENGINE:
+        _run_codex_task(config, store, tasks, stop_events, pause_events, tasks_lock, stop_event, pause_event)
+        return
     last_payload = None
     try:
         LOG.info("后台任务开始 run_id=%s report=%s source=%s", config.run_id, config.sarif_path, config.source_path)
@@ -682,10 +782,101 @@ def _run_task(
             pause_events.pop(config.run_id, None)
 
 
+def _run_codex_task(
+    config: RunConfig,
+    store: RunRecordStore,
+    tasks: dict,
+    stop_events: dict,
+    pause_events: dict,
+    tasks_lock: Lock,
+    stop_event: Event,
+    pause_event: Event,
+) -> None:
+    last_payload = None
+    try:
+        LOG.info("Codex-driven 后台任务开始 run_id=%s report=%s source=%s", config.run_id, config.sarif_path, config.source_path)
+
+        def on_progress(progress_payload):
+            nonlocal last_payload
+            payload = dict(progress_payload)
+            payload["run_origin"] = RUN_ORIGIN_WEB
+            payload["engine"] = CODEX_ENGINE
+            payload["config"] = payload.get("config") or _config_task_snapshot(config)
+            status = payload.get("status") or "running"
+            if status == "running":
+                status = "stopping" if stop_event.is_set() else "pausing" if pause_event.is_set() else "running"
+                payload["status"] = status
+            last_payload = payload
+            with tasks_lock:
+                tasks[payload["run_id"]] = _task_from_report_payload(payload, status)
+            store.save_payload(payload)
+            LOG.info(
+                "Codex-driven 任务进度 run_id=%s status=%s reports=%s",
+                payload["run_id"],
+                status,
+                len(payload.get("reports", [])),
+            )
+
+        runner = CodexDrivenRunner(records_dir=store.root)
+        payload = runner.run(
+            config,
+            store=store,
+            progress_callback=on_progress,
+            should_stop=lambda: stop_event.is_set() or pause_event.is_set(),
+        )
+        payload["run_origin"] = RUN_ORIGIN_WEB
+        payload["engine"] = CODEX_ENGINE
+        payload["config"] = payload.get("config") or _config_task_snapshot(config)
+        store.save_payload(payload)
+        with tasks_lock:
+            tasks[payload["run_id"]] = _task_from_report_payload(payload, "completed")
+        LOG.info("Codex-driven 后台任务完成 run_id=%s findings=%s", payload.get("run_id"), payload.get("finding_count"))
+    except CodexRunnerStopped as exc:
+        stop_sessions(last_payload or {})
+        if pause_event.is_set() and not stop_event.is_set():
+            LOG.info("Codex-driven 后台任务已暂停 run_id=%s", config.run_id)
+            stopped_payload = _pause_payload(config, last_payload, str(exc))
+            status = "paused"
+        else:
+            LOG.info("Codex-driven 后台任务已停止 run_id=%s", config.run_id)
+            stopped_payload = dict(last_payload or _task_from_config(config, config.run_id or _new_run_id(), "stopped"))
+            stopped_payload["status"] = "stopped"
+            stopped_payload["engine"] = CODEX_ENGINE
+            stopped_payload["error"] = None
+            diagnostics = list(stopped_payload.get("diagnostics", []))
+            diagnostics.append(str(exc))
+            stopped_payload["diagnostics"] = diagnostics
+            stopped_payload["config"] = stopped_payload.get("config") or _config_task_snapshot(config)
+            status = "stopped"
+        store.save_payload(stopped_payload)
+        with tasks_lock:
+            tasks[stopped_payload["run_id"]] = _task_from_report_payload(stopped_payload, status)
+    except Exception as exc:
+        LOG.exception("Codex-driven 后台任务失败 run_id=%s", config.run_id)
+        stop_sessions(last_payload or {})
+        with tasks_lock:
+            existing = tasks.get(config.run_id or "")
+            failed = dict(existing or last_payload or _task_from_config(config, config.run_id or _new_run_id(), "failed"))
+            failed["status"] = "failed"
+            failed["engine"] = CODEX_ENGINE
+            failed["error"] = str(exc)
+            diagnostics = list(failed.get("diagnostics") or [])
+            diagnostics.append(str(exc))
+            failed["diagnostics"] = diagnostics
+            failed["config"] = failed.get("config") or _config_task_snapshot(config)
+            tasks[failed["run_id"]] = failed
+            store.save_payload(failed)
+    finally:
+        with tasks_lock:
+            stop_events.pop(config.run_id, None)
+            pause_events.pop(config.run_id, None)
+
+
 def _task_from_report_payload(payload: dict, status: str) -> dict:
     return {
         "run_id": payload.get("run_id"),
         "status": status,
+        "engine": payload.get("engine") or (payload.get("config") or {}).get("engine") or "builtin",
         "run_origin": normalize_run_origin(payload),
         "created_at": payload.get("created_at"),
         "source_path": payload.get("source_path"),
@@ -706,11 +897,199 @@ def _task_from_report_payload(payload: dict, status: str) -> dict:
         "current_finding_index": payload.get("current_finding_index"),
         "resume_from_finding_id": payload.get("resume_from_finding_id"),
         "resume_from_finding_index": payload.get("resume_from_finding_index"),
+        "codex_sessions": _codex_sessions(payload),
+        "codex_workflow": payload.get("codex_workflow", {}),
     }
+
+
+def _codex_sessions(payload: dict) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("codex_sessions")
+    if raw is None and isinstance(payload.get("codex_workflow"), dict):
+        raw = payload["codex_workflow"].get("sessions")
+    result = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        session = dict(item)
+        target = str(session.get("target") or session.get("session_name") or "")
+        session["live"] = session_live(target) if target else False
+        result.append(session)
+    return result
+
+
+def _codex_session_for_role(payload: dict, role: str) -> Optional[dict]:
+    role = str(role or "").strip().lower()
+    for session in _codex_sessions(payload):
+        if str(session.get("role") or "").lower() == role:
+            return session
+    return None
+
+
+def _codex_session_terminal(payload: dict, role: str) -> dict:
+    session = _codex_session_for_role(payload, role)
+    if session is None:
+        return {"error": "Codex session 未找到", "role": role, "live": False, "output": ""}
+    target = str(session.get("target") or session.get("session_name") or "")
+    return {
+        "role": session.get("role"),
+        "session_name": session.get("session_name"),
+        "window_name": session.get("window_name"),
+        "target": target,
+        "live": session_live(target),
+        "output": capture_session(target),
+    }
+
+
+def _stop_codex_sessions(
+    store: RunRecordStore,
+    tasks: dict,
+    tasks_lock: Lock,
+    run_id: str,
+) -> Optional[dict]:
+    with tasks_lock:
+        payload = dict(tasks.get(run_id) or {})
+    if not payload:
+        record = store.get(run_id)
+        payload = dict(record or {})
+    if not payload:
+        return None
+    before = _codex_sessions(payload)
+    stopped = sum(1 for session in before if session.get("live"))
+    stop_sessions(payload)
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "stopped": stopped,
+        "sessions": _codex_sessions(payload),
+    }
+
+
+def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
+    target = str(session.get("target") or session.get("session_name") or "")
+    label = {"moderator": "Moderator", "affirmative": "正方", "negative": "反方"}.get(role, role)
+    websocket_path = f"/runs/{run_id}/codex-sessions/{role}/ws"
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(label)} · Codex TUI</title>
+  <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
+  <style>
+    html, body {{ height: 100%; margin: 0; background: #0d1117; color: #c9d1d9; }}
+    body {{ display: grid; grid-template-rows: auto minmax(0, 1fr); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    header {{ display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #30363d; background: #161b22; }}
+    h1 {{ margin: 0; font-size: 14px; font-weight: 650; }}
+    .meta {{ color: #8b949e; font-size: 12px; overflow-wrap: anywhere; }}
+    #terminal {{ min-height: 0; height: 100%; padding: 8px; box-sizing: border-box; }}
+    .xterm {{ height: 100%; }}
+    .error {{ color: #ff7b72; padding: 12px; white-space: pre-wrap; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>{escape(label)} Codex TUI</h1>
+      <div class="meta">{escape(run_id)} · {escape(target)}</div>
+    </div>
+    <div class="meta">tmux attach · raw TUI</div>
+  </header>
+  <div id="terminal"></div>
+  <script src="/static/vendor/xterm/xterm.js"></script>
+  <script src="/static/vendor/xterm/addon-fit.js"></script>
+  <script>
+    const websocketPath = {json.dumps(websocket_path)};
+    const terminalNode = document.getElementById('terminal');
+    const TerminalCtor = window.Terminal;
+    const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
+    function websocketURL(path) {{
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${{protocol}}//${{window.location.host}}${{path}}`;
+    }}
+    if (!TerminalCtor || !FitAddonCtor) {{
+      terminalNode.innerHTML = '<div class="error">xterm.js 未加载，无法打开 Codex TUI。</div>';
+    }} else {{
+      const term = new TerminalCtor({{
+        cursorBlink: true,
+        fontSize: 14,
+        fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
+        scrollback: 10000,
+        theme: {{
+          background: '#0d1117',
+          foreground: '#c9d1d9',
+          cursor: '#58a6ff',
+          selectionBackground: '#264f78'
+        }}
+      }});
+      const fitAddon = new FitAddonCtor();
+      term.loadAddon(fitAddon);
+      term.open(terminalNode);
+      const ws = new WebSocket(websocketURL(websocketPath));
+      ws.binaryType = 'arraybuffer';
+      function sendResize() {{
+        if (ws.readyState !== WebSocket.OPEN) return;
+        fitAddon.fit();
+        ws.send(JSON.stringify({{ type: 'resize', rows: term.rows, cols: term.cols }}));
+      }}
+      ws.onopen = () => {{
+        sendResize();
+        term.focus();
+      }};
+      ws.onmessage = event => {{
+        if (event.data instanceof ArrayBuffer) {{
+          term.write(new Uint8Array(event.data));
+        }} else if (event.data instanceof Blob) {{
+          event.data.arrayBuffer().then(buffer => term.write(new Uint8Array(buffer)));
+        }}
+      }};
+      ws.onclose = () => term.write('\\r\\n\\x1b[33m[tmux connection closed]\\x1b[0m\\r\\n');
+      ws.onerror = () => term.write('\\r\\n\\x1b[31m[websocket error]\\x1b[0m\\r\\n');
+      term.onData(data => {{
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({{ type: 'input', data }}));
+      }});
+      const resizeObserver = new ResizeObserver(() => setTimeout(sendResize, 50));
+      resizeObserver.observe(terminalNode);
+      window.addEventListener('beforeunload', () => ws.close());
+      requestAnimationFrame(sendResize);
+    }}
+  </script>
+</body>
+</html>"""
+
+
+def _send_codex_session_input(
+    store: RunRecordStore,
+    tasks: dict,
+    tasks_lock: Lock,
+    run_id: str,
+    role: str,
+    message: str,
+) -> Optional[dict]:
+    with tasks_lock:
+        payload = dict(tasks.get(run_id) or {})
+    if not payload:
+        record = store.get(run_id)
+        payload = dict(record or {})
+    if not payload:
+        return None
+    session = _codex_session_for_role(payload, role)
+    if session is None:
+        return None
+    target = str(session.get("target") or session.get("session_name") or "")
+    if not target:
+        return None
+    try:
+        send_session_input(target, message)
+    except (CodexRunnerError, subprocess.CalledProcessError) as exc:
+        return {"ok": False, "role": role, "error": str(exc)}
+    return {"ok": True, "role": role, "target": target}
 
 
 def _config_task_snapshot(config: RunConfig) -> dict:
     return {
+        "engine": config.engine,
         "report_path": str(config.sarif_path),
         "source_path": str(config.source_path),
         "skills_path": str(config.skills_path) if config.skills_path is not None else None,
@@ -1281,6 +1660,17 @@ def app_html() -> str:
     }}
     button:hover {{ border-color: var(--accent); color: #0d4f6f; }}
     button:disabled {{ cursor: not-allowed; opacity: 0.52; border-color: var(--line); color: var(--muted); }}
+    button.danger-button {{
+      border-color: #e19090;
+      background: #fff1f1;
+      color: #9a2f2f;
+      font-weight: 700;
+    }}
+    button.danger-button:hover:not(:disabled) {{
+      border-color: #b42318;
+      background: #ffe4e1;
+      color: #7f1d1d;
+    }}
     button.toggle-active {{ border-color: var(--accent); background: #edf7fb; color: #0d4f6f; }}
     input, select, textarea {{
       width: 100%;
@@ -1693,6 +2083,25 @@ def app_html() -> str:
       white-space: pre-wrap;
     }}
     .markdown-body pre code {{ background: transparent; padding: 0; color: inherit; }}
+    .markdown-field {{
+      display: grid;
+      gap: 5px;
+    }}
+    .markdown-field > strong {{
+      color: var(--text);
+    }}
+    .codex-evidence-list {{
+      display: grid;
+      gap: 8px;
+      margin: 0;
+      padding-left: 20px;
+    }}
+    .codex-evidence-list > li {{
+      padding-left: 2px;
+    }}
+    .debate-turn .markdown-body {{
+      gap: 6px;
+    }}
     .plain-text {{
       white-space: pre-wrap;
       overflow-wrap: anywhere;
@@ -1705,6 +2114,23 @@ def app_html() -> str:
     .debate-turn {{
       display: grid;
       gap: 8px;
+    }}
+    .debate-structured {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfe;
+      overflow: hidden;
+    }}
+    .debate-structured summary {{
+      cursor: pointer;
+      padding: 8px 10px;
+      color: var(--muted);
+      font-weight: 700;
+    }}
+    .debate-structured .detail-body {{
+      padding: 10px;
+      border-top: 1px solid var(--line);
+      background: #ffffff;
     }}
     .path-overview {{
       white-space: pre-wrap;
@@ -1787,6 +2213,17 @@ def app_html() -> str:
     .profile-actions {{ display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }}
     .profile-actions button {{ padding: 6px 9px; min-height: 30px; }}
     .profile-actions button:disabled {{ cursor: not-allowed; opacity: 0.52; border-color: var(--line); color: var(--muted); }}
+    .codex-session-buttons {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .codex-terminal-frame-panel {{ width: min(1280px, 100%); height: min(860px, 94vh); }}
+    .codex-terminal-frame-body {{ flex: 1 1 auto; padding: 0; display: block; min-height: 0; height: 100%; }}
+    .codex-terminal-frame {{
+      display: block;
+      width: 100%;
+      height: 100%;
+      min-height: 560px;
+      border: 0;
+      background: #0d1117;
+    }}
     @media (max-width: 900px) {{
       header {{ align-items: flex-start; flex-direction: column; }}
       main {{ grid-template-columns: 1fr; height: auto; min-height: 0; }}
@@ -2023,8 +2460,9 @@ def app_html() -> str:
               <label class="wide">源码路径<input id="run-source" placeholder="fixtures/demo_sarif/source"></label>
               <label>Skill Source<select id="run-skill-source"></select></label>
               <label class="wide">Skills 路径<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
+              <label>执行引擎<select id="run-engine"><option value="codex" selected>Codex 三方复核</option><option value="builtin">内置旧流程</option></select></label>
               <label>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
-              <div class="run-agent-grid">
+              <div class="run-agent-grid" id="run-provider-agent-grid">
                 <label>正方提供商<select id="run-affirmative-provider"></select></label>
                 <label>正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
                 <label>反方提供商<select id="run-negative-provider"></select></label>
@@ -2033,17 +2471,32 @@ def app_html() -> str:
                 <label>主持人 Agent 配置档案<select id="run-moderator-agent-profile"></select></label>
               </div>
             </div>
-            <div class="chips">
+            <div class="chips" id="run-tool-provider-options">
               <label><input id="run-external-tools" type="checkbox" checked> 启用外部工具</label>
               <label><input id="run-auto-index" type="checkbox"> 预热 Atlas 持久缓存</label>
               <label><input id="run-llm" type="checkbox"> 使用 LLM 博弈</label>
             </div>
+            <div class="muted" id="run-codex-config-note" hidden>Codex 三方复核使用项目 .codex/config.toml 中的模型、MCP 与环境变量默认配置。</div>
             <div class="toolbar">
               <button id="start-run" type="button">启动任务</button>
             </div>
             <pre id="run-result">尚未启动任务。</pre>
           </div>
         </div>
+      </div>
+    </section>
+  </div>
+  <div class="modal-backdrop" id="codex-terminal-frame-modal" role="dialog" aria-modal="true" aria-labelledby="codex-terminal-frame-title">
+    <section class="settings-panel codex-terminal-frame-panel" aria-label="Codex TUI">
+      <div class="settings-head">
+        <div>
+          <h2 id="codex-terminal-frame-title">Codex TUI</h2>
+          <div class="muted" id="codex-terminal-frame-meta">未连接</div>
+        </div>
+        <button id="close-codex-terminal-frame" type="button" title="关闭 Codex TUI">关闭</button>
+      </div>
+      <div class="settings-body codex-terminal-frame-body">
+        <iframe id="codex-terminal-frame" class="codex-terminal-frame" title="Codex TUI"></iframe>
       </div>
     </section>
   </div>
@@ -2063,6 +2516,10 @@ def app_html() -> str:
       agentPromptsModal: document.getElementById('agent-prompts-modal'),
       integrationsModal: document.getElementById('integrations-modal'),
       runConfigModal: document.getElementById('run-config-modal'),
+      codexTerminalFrameModal: document.getElementById('codex-terminal-frame-modal'),
+      codexTerminalFrameTitle: document.getElementById('codex-terminal-frame-title'),
+      codexTerminalFrameMeta: document.getElementById('codex-terminal-frame-meta'),
+      codexTerminalFrame: document.getElementById('codex-terminal-frame'),
       autoRefresh: document.getElementById('auto-refresh'),
       providerResult: document.getElementById('provider-result'),
       agentPromptsResult: document.getElementById('agent-prompts-result'),
@@ -2114,7 +2571,11 @@ def app_html() -> str:
       runSource: document.getElementById('run-source'),
       runSkillSource: document.getElementById('run-skill-source'),
       runSkills: document.getElementById('run-skills'),
+      runEngine: document.getElementById('run-engine'),
       runMaxRounds: document.getElementById('run-max-rounds'),
+      runProviderAgentGrid: document.getElementById('run-provider-agent-grid'),
+      runToolProviderOptions: document.getElementById('run-tool-provider-options'),
+      runCodexConfigNote: document.getElementById('run-codex-config-note'),
       runAffirmativeProvider: document.getElementById('run-affirmative-provider'),
       runNegativeProvider: document.getElementById('run-negative-provider'),
       runModeratorProvider: document.getElementById('run-moderator-provider'),
@@ -2130,12 +2591,17 @@ def app_html() -> str:
     document.getElementById('open-run-config').addEventListener('click', async () => {{
       el.runConfigModal.classList.add('open');
       await Promise.all([loadProviders(), loadAgentPrompts(), loadIntegrations()]);
+      updateRunEngineVisibility();
     }});
     document.getElementById('close-run-config').addEventListener('click', () => {{
       el.runConfigModal.classList.remove('open');
     }});
     el.runConfigModal.addEventListener('click', (event) => {{
       if (event.target === el.runConfigModal) el.runConfigModal.classList.remove('open');
+    }});
+    document.getElementById('close-codex-terminal-frame').addEventListener('click', closeCodexTerminal);
+    el.codexTerminalFrameModal.addEventListener('click', (event) => {{
+      if (event.target === el.codexTerminalFrameModal) closeCodexTerminal();
     }});
     document.getElementById('open-providers').addEventListener('click', async () => {{
       el.providersModal.classList.add('open');
@@ -2197,6 +2663,7 @@ def app_html() -> str:
     document.getElementById('delete-skill').addEventListener('click', deleteSkillSource);
     document.getElementById('save-skill-defaults').addEventListener('click', saveSkillDefaults);
     document.getElementById('start-run').addEventListener('click', startRun);
+    el.runEngine.addEventListener('change', updateRunEngineVisibility);
     el.runAffirmativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
     el.runNegativeProvider.addEventListener('change', enableRunLlmForSelectedProviders);
     el.runModeratorProvider.addEventListener('change', enableRunLlmForSelectedProviders);
@@ -2394,7 +2861,7 @@ def app_html() -> str:
           index = renderTable(index) - 1;
           continue;
         }}
-        const heading = line.match(/^(#{1,6})\\s+(.+)$/);
+        const heading = line.match(/^(#{{1,6}})\\s+(.+)$/);
         if (heading) {{
           flushParagraph();
           closeLists();
@@ -2432,6 +2899,23 @@ def app_html() -> str:
       flushParagraph();
       closeLists();
       return html.join('');
+    }}
+    function markdownBlock(value, fallback = '') {{
+      const text = displayText(value);
+      if (!text.trim()) return fallback ? `<div class="muted">${{esc(fallback)}}</div>` : '';
+      return `<div class="markdown-body">${{renderMarkdown(text)}}</div>`;
+    }}
+    function markdownField(label, value, fallback = '') {{
+      const body = markdownBlock(value, fallback);
+      if (!body) return '';
+      return `<div class="markdown-field"><strong>${{esc(label)}}：</strong>${{body}}</div>`;
+    }}
+    function markdownList(label, values) {{
+      const items = (Array.isArray(values) ? values : []).map(value => displayText(value)).filter(Boolean);
+      if (!items.length) return '';
+      return `<div class="markdown-field"><strong>${{esc(label)}}：</strong><div class="markdown-body"><ul>
+        ${{items.map(value => `<li>${{renderMarkdown(value)}}</li>`).join('')}}
+      </ul></div></div>`;
     }}
     function fmtDate(value) {{
       if (!value) return '未知时间';
@@ -2716,6 +3200,32 @@ def app_html() -> str:
       select.value = normalized;
     }}
 
+    function isCodexRunEngine() {{
+      return (el.runEngine.value || 'codex') === 'codex';
+    }}
+
+    function updateRunEngineVisibility() {{
+      const codexMode = isCodexRunEngine();
+      el.runProviderAgentGrid.hidden = codexMode;
+      el.runToolProviderOptions.hidden = codexMode;
+      el.runCodexConfigNote.hidden = !codexMode;
+      if (codexMode) {{
+        el.runLlm.checked = false;
+        el.runAutoIndex.checked = false;
+        el.runExternalTools.checked = true;
+        for (const select of [
+          el.runAffirmativeProvider,
+          el.runNegativeProvider,
+          el.runModeratorProvider,
+          el.runAffirmativeAgentProfile,
+          el.runNegativeAgentProfile,
+          el.runModeratorAgentProfile
+        ]) {{
+          select.value = '';
+        }}
+      }}
+    }}
+
     async function copyRunToConfig(runId) {{
       if (!runId) return;
       try {{
@@ -2741,6 +3251,7 @@ def app_html() -> str:
       el.runSarif.value = config.report_path || config.sarif_path || run.sarif_path || '';
       el.runSource.value = config.source_path || run.source_path || '';
       el.runSkills.value = config.skills_path || '';
+      el.runEngine.value = config.engine || run.engine || 'codex';
       setSelectValue(el.runSkillSource, config.skill_source_id || '');
       setSelectValue(el.runAffirmativeProvider, config.affirmative_provider_id || '');
       setSelectValue(el.runNegativeProvider, config.negative_provider_id || '');
@@ -2757,6 +3268,7 @@ def app_html() -> str:
         config.negative_provider_id ||
         config.moderator_provider_id
       );
+      updateRunEngineVisibility();
       el.runResult.textContent = `已从 ${{run.run_id || '历史任务'}} 填入配置。可调整参数后再启动。`;
     }}
 
@@ -3041,9 +3553,11 @@ def app_html() -> str:
       el.runNegativeProvider.value = state.defaults.negative || '';
       el.runModeratorProvider.value = state.defaults.moderator || '';
       enableRunLlmForSelectedProviders();
+      updateRunEngineVisibility();
     }}
 
     function enableRunLlmForSelectedProviders() {{
+      if (isCodexRunEngine()) return;
       if (el.runAffirmativeProvider.value || el.runNegativeProvider.value || el.runModeratorProvider.value) {{
         el.runLlm.checked = true;
       }}
@@ -3121,21 +3635,23 @@ def app_html() -> str:
 
     async function startRun() {{
       try {{
+        const codexMode = isCodexRunEngine();
         const payload = {{
           report_path: el.runSarif.value.trim(),
           source_path: el.runSource.value.trim(),
+          engine: el.runEngine.value || 'codex',
           skill_source_id: el.runSkillSource.value || null,
           skills_path: el.runSkills.value.trim() || null,
           max_rounds: Number(el.runMaxRounds.value || 4),
-          enable_external_tools: el.runExternalTools.checked,
-          auto_index_tools: el.runAutoIndex.checked,
-          enable_llm: el.runLlm.checked,
-          affirmative_provider_id: el.runAffirmativeProvider.value || null,
-          negative_provider_id: el.runNegativeProvider.value || null,
-          moderator_provider_id: el.runModeratorProvider.value || null,
-          affirmative_agent_profile: el.runAffirmativeAgentProfile.value || null,
-          negative_agent_profile: el.runNegativeAgentProfile.value || null,
-          moderator_agent_profile: el.runModeratorAgentProfile.value || null
+          enable_external_tools: codexMode ? true : el.runExternalTools.checked,
+          auto_index_tools: codexMode ? false : el.runAutoIndex.checked,
+          enable_llm: codexMode ? false : el.runLlm.checked,
+          affirmative_provider_id: codexMode ? null : (el.runAffirmativeProvider.value || null),
+          negative_provider_id: codexMode ? null : (el.runNegativeProvider.value || null),
+          moderator_provider_id: codexMode ? null : (el.runModeratorProvider.value || null),
+          affirmative_agent_profile: codexMode ? null : (el.runAffirmativeAgentProfile.value || null),
+          negative_agent_profile: codexMode ? null : (el.runNegativeAgentProfile.value || null),
+          moderator_agent_profile: codexMode ? null : (el.runModeratorAgentProfile.value || null)
         }};
         if (!payload.report_path || !payload.source_path) {{
           throw new Error('报告路径和源码路径不能为空。');
@@ -3374,6 +3890,29 @@ def app_html() -> str:
       }}
     }}
 
+    async function stopCodexSessions(runId, button) {{
+      if (!runId) return;
+      const originalText = button ? button.textContent : '';
+      try {{
+        if (button) {{
+          button.disabled = true;
+          button.textContent = '关闭中...';
+        }}
+        await fetchJson(`/runs/${{encodeURIComponent(runId)}}/codex-sessions/stop`, jsonPost({{}}));
+        closeCodexTerminal();
+        await loadRuns();
+        if (state.selectedRun === runId) {{
+          await selectRun(runId, false);
+        }}
+      }} catch (error) {{
+        if (button) {{
+          button.disabled = false;
+          button.textContent = originalText;
+        }}
+        renderError(error);
+      }}
+    }}
+
     async function deleteRun(runId) {{
       if (!runId) return;
       try {{
@@ -3465,10 +4004,22 @@ def app_html() -> str:
       const providers = run.llm_providers || {{}};
       const agents = run.agent_configs || {{}};
       const origin = runOriginLabel(run);
+      const engine = run.engine || (run.config && run.config.engine) || 'builtin';
+      const codexEngine = engine === 'codex';
+      const legacyRuntimeHtml = `
+          <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
+          <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
+          <div><strong>主持人 LLM：</strong> ${{esc(providerLabel(providers.moderator, providers.enabled))}}</div>
+          <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
+          <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
+          <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
+          ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}`;
+      const codexRuntimeHtml = '<div><strong>Codex 配置：</strong> 使用项目 <span class="path">.codex/config.toml</span> 中的模型、MCP 与环境变量默认配置。</div>';
       return `<details class="detail metadata-section" open>
         <summary class="detail-summary">运行元数据
           <span class="chips">
             <span class="chip origin">${{esc(origin)}}</span>
+            <span class="chip">${{esc(engineLabel(engine))}}</span>
             <span class="${{statusChipClass(status)}}">${{esc(statusLabel(status))}}</span>
             <span class="chip">${{esc(findings.length)}} 个发现</span>
           </span>
@@ -3492,6 +4043,8 @@ def app_html() -> str:
             <button type="button" data-run-export="json" data-run-id="${{esc(run.run_id)}}">导出 JSON</button>
           </div>
           <div><strong>任务来源：</strong> ${{esc(origin)}}</div>
+          <div><strong>执行引擎：</strong> ${{esc(engineLabel(engine))}}</div>
+          ${{renderCodexSessionButtons(run)}}
           <div><strong>创建时间：</strong> ${{esc(fmtDate(run.created_at))}}</div>
           <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
           <div><strong>源码：</strong> <span class="path">${{esc(run.source_path)}}</span></div>
@@ -3499,13 +4052,7 @@ def app_html() -> str:
           <div><strong>发现进度：</strong> ${{esc(run.completed_finding_count ?? findings.length)}} / ${{esc(run.finding_count || findings.length)}}</div>
           ${{currentHint ? `<div><strong>当前状态：</strong> ${{esc(currentHint)}}</div>` : ''}}
           ${{resumeHint ? `<div><strong>恢复点：</strong> ${{esc(resumeHint)}}</div>` : ''}}
-          <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
-          <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
-          <div><strong>主持人 LLM：</strong> ${{esc(providerLabel(providers.moderator, providers.enabled))}}</div>
-          <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
-          <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
-          <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
-          ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}
+          ${{codexEngine ? codexRuntimeHtml : legacyRuntimeHtml}}
           ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : `<div class="muted">${{esc(runningMessage)}}</div>`}}
           ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
         </div>
@@ -3595,6 +4142,38 @@ def app_html() -> str:
           stopRun(button.dataset.runId);
         }});
       }}
+      for (const button of root.querySelectorAll('[data-codex-terminal-role]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          openCodexTerminal(button.dataset.runId, button.dataset.codexTerminalRole);
+        }});
+      }}
+      for (const button of root.querySelectorAll('[data-codex-stop-sessions]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          stopCodexSessions(button.dataset.runId, button);
+        }});
+      }}
+    }}
+
+    function engineLabel(engine) {{
+      if (engine === 'codex') return 'Codex 三方复核';
+      return '内置旧流程';
+    }}
+
+    function renderCodexSessionButtons(run) {{
+      const sessions = Array.isArray(run.codex_sessions) ? run.codex_sessions : [];
+      if (!sessions.length) return '';
+      const labels = {{ moderator: 'Moderator 终端', affirmative: '正方终端', negative: '反方终端' }};
+      const liveCount = sessions.filter(session => session.live).length;
+      return `<div><strong>Codex Sessions：</strong><div class="codex-session-buttons">
+        ${{sessions.map(session => `<button type="button" title="在当前页面打开原始 Codex TUI" data-run-id="${{esc(run.run_id)}}" data-codex-terminal-role="${{esc(session.role || '')}}">
+          ${{esc(labels[session.role] || session.role || 'Codex')}}${{session.live ? ' · live' : ''}}
+        </button>`).join('')}}
+        <button type="button" class="danger-button" title="关闭当前任务的全部 Codex tmux session" data-run-id="${{esc(run.run_id)}}" data-codex-stop-sessions="true" ${{liveCount ? '' : 'disabled'}}>
+          关闭全部 Codex Sessions${{liveCount ? ` · ${{liveCount}} live` : ''}}
+        </button>
+      </div></div>`;
     }}
 
     function bindRunExportButtons() {{
@@ -3613,6 +4192,21 @@ def app_html() -> str:
       document.body.appendChild(link);
       link.click();
       link.remove();
+    }}
+
+    async function openCodexTerminal(runId, role) {{
+      if (!runId || !role) return;
+      const url = `/runs/${{encodeURIComponent(runId)}}/codex-sessions/${{encodeURIComponent(role)}}/terminal-ui`;
+      const labels = {{ moderator: 'Moderator', affirmative: '正方', negative: '反方' }};
+      el.codexTerminalFrameTitle.textContent = `${{labels[role] || role}} Codex TUI`;
+      el.codexTerminalFrameMeta.textContent = `${{runId}} · ${{role}}`;
+      el.codexTerminalFrame.src = url;
+      el.codexTerminalFrameModal.classList.add('open');
+    }}
+
+    function closeCodexTerminal() {{
+      el.codexTerminalFrame.src = 'about:blank';
+      el.codexTerminalFrameModal.classList.remove('open');
     }}
 
     function bindFindingRows(findings) {{
@@ -4032,6 +4626,15 @@ def app_html() -> str:
       return `<details class="raw-debug"><summary>原始输出</summary><pre>${{esc(raw)}}</pre></details>`;
     }}
 
+    function renderDebateStructuredTurn(turn) {{
+      const structured = turn && turn.structured && typeof turn.structured === 'object' ? turn.structured : null;
+      if (!structured || !Object.keys(structured).length) return '';
+      return `<details class="debate-structured" open>
+        <summary>结构化材料</summary>
+        <div class="detail-body">${{renderCodexStructuredContent(structured, {{ showSummary: false }})}}</div>
+      </details>`;
+    }}
+
     function statusLabel(status) {{
       const labels = {{
         confirmed: '已确认',
@@ -4042,6 +4645,89 @@ def app_html() -> str:
         blocks: '已阻断',
       }};
       return labels[String(status || '')] || String(status || '未知');
+    }}
+
+    function renderCodexWorkflowSection(detail) {{
+      const workflow = detail.codex_workflow && typeof detail.codex_workflow === 'object' ? detail.codex_workflow : null;
+      if (!workflow) return '';
+      const moderator = workflow.moderator && typeof workflow.moderator === 'object' ? workflow.moderator : {{}};
+      const affirmative = workflow.affirmative && typeof workflow.affirmative === 'object' ? workflow.affirmative : {{}};
+      const negative = workflow.negative && typeof workflow.negative === 'object' ? workflow.negative : {{}};
+      const moderatorText = moderator.final_conclusion || moderator.reasoning_summary || detail.final_conclusion || detail.reasoning_summary || '';
+      return `<div class="detail">
+        <h3>Codex 三方复核</h3>
+        <div class="detail-body">
+          <div>
+            <strong>Moderator 总结：</strong>
+            ${{markdownBlock(moderatorText || '暂无 Moderator 总结。')}}
+          </div>
+          ${{renderCodexRoleConclusion('正方 finding', affirmative, false)}}
+          ${{renderCodexRoleConclusion('反方 finding', negative, false)}}
+        </div>
+      </div>`;
+    }}
+
+    function renderCodexEvidenceList(label, values) {{
+      const items = Array.isArray(values) ? values : [];
+      if (!items.length) return '';
+      return `<div class="markdown-field"><strong>${{esc(label)}}：</strong><ol class="codex-evidence-list">
+        ${{items.map(item => {{
+          const lines = [];
+          if (item && typeof item === 'object') {{
+            if (item.claim) lines.push(`**论点**：${{item.claim}}`);
+            if (item.evidence) lines.push(`**证据**：${{item.evidence}}`);
+            if (item.location) lines.push(`**位置**：\`${{item.location}}\``);
+            if (item.tool) lines.push(`**工具**：${{item.tool}}`);
+          }} else {{
+            lines.push(String(item ?? ''));
+          }}
+          return `<li>${{markdownBlock(lines.join('\\n\\n'))}}</li>`;
+        }}).join('')}}
+      </ol></div>`;
+    }}
+
+    function renderLocationList(label, locations) {{
+      const values = (Array.isArray(locations) ? locations : []).map(location => {{
+        if (!location || typeof location !== 'object') return String(location ?? '');
+        const file = location.file || '';
+        const line = location.line !== undefined && location.line !== null ? `:${{location.line}}` : '';
+        const column = location.column !== undefined && location.column !== null ? `:${{location.column}}` : '';
+        const symbol = location.symbol ? ` — ${{location.symbol}}` : '';
+        return `\`${{file}}${{line}}${{column}}\`${{symbol}}`;
+      }});
+      return markdownList(label, values);
+    }}
+
+    function renderCodexStructuredContent(data, options = {{}}) {{
+      if (!data || typeof data !== 'object' || !Object.keys(data).length) return '';
+      const showSummary = options.showSummary !== false;
+      const summary = data.summary || data.reasoning_summary || data.final_conclusion || '';
+      const evidence = Array.isArray(data.key_evidence) ? data.key_evidence : [];
+      const limitations = Array.isArray(data.limitations) ? data.limitations : [];
+      const nextSteps = Array.isArray(data.recommended_next_steps) ? data.recommended_next_steps : [];
+      const disputed = Array.isArray(data.disputed_points) ? data.disputed_points : [];
+      return `
+        ${{showSummary ? markdownField('摘要', summary || '无摘要。') : ''}}
+        ${{markdownField('攻击链', data.attack_chain)}}
+        ${{markdownField('数据流', data.data_flow)}}
+        ${{markdownField('防护研判', data.protection_assessment)}}
+        ${{markdownField('影响研判', data.impact_assessment)}}
+        ${{renderCodexEvidenceList('关键证据', evidence)}}
+        ${{markdownList('限制', limitations)}}
+        ${{markdownList('争议点', disputed)}}
+        ${{markdownList('建议下一步', nextSteps)}}
+        ${{renderLocationList('源码位置', data.source_locations)}}`;
+    }}
+
+    function renderCodexRoleConclusion(title, data, open) {{
+      if (!data || !Object.keys(data).length) return `<details><summary>${{esc(title)}}：暂无结果</summary></details>`;
+      return `<details ${{open ? 'open' : ''}}>
+        <summary>${{esc(title)}} · ${{esc(data.position || data.verdict || 'INCONCLUSIVE')}} · 置信度 ${{esc(data.confidence ?? '')}}</summary>
+        <div class="detail-body">
+          ${{renderCodexStructuredContent(data)}}
+          <details><summary>原始 JSON</summary><pre>${{esc(jsonBlock(data))}}</pre></details>
+        </div>
+      </details>`;
     }}
 
     function renderFindingDetail(detail) {{
@@ -4058,13 +4744,14 @@ def app_html() -> str:
               <span class="chip">置信度 ${{esc(detail.confidence)}}</span>
               <span class="chip">${{esc(detail.rule_id)}}</span>
             </div>
-            ${{conclusion ? `<div><strong>最终结论：</strong> <span class="plain-text">${{plainText(conclusion)}}</span></div>` : ''}}
-            <div class="plain-text">${{plainText(detail.reasoning_summary)}}</div>
-            <div><strong>防护研判：</strong> <span class="plain-text">${{plainText(detail.protection_assessment)}}</span></div>
-            <div><strong>影响研判：</strong> <span class="plain-text">${{plainText(detail.impact_assessment)}}</span></div>
-            ${{(detail.disputed_points || []).length ? `<div><strong>争议点：</strong><ul>${{detail.disputed_points.map(point => `<li><span class="plain-text">${{plainText(point)}}</span></li>`).join('')}}</ul></div>` : ''}}
+            ${{markdownField('最终结论', conclusion)}}
+            ${{markdownField('理由摘要', detail.reasoning_summary)}}
+            ${{markdownField('防护研判', detail.protection_assessment)}}
+            ${{markdownField('影响研判', detail.impact_assessment)}}
+            ${{markdownList('争议点', detail.disputed_points || [])}}
           </div>
         </div>
+        ${{renderCodexWorkflowSection(detail)}}
         ${{renderVerificationCaseSection(detail)}}
         ${{renderScorecardSection(detail)}}
         ${{renderPathOverviewSection(detail)}}
@@ -4074,7 +4761,8 @@ def app_html() -> str:
           <div class="detail-body">
             ${{debate.map(turn => `<div class="debate-turn">
               <strong>${{esc(roleLabel(turn.role))}} 第 ${{esc(turn.round_index)}} 回合</strong>
-              <div class="plain-text">${{plainText(turn.claim)}}</div>
+              ${{markdownBlock(turn.claim)}}
+              ${{renderDebateStructuredTurn(turn)}}
               <div class="path">证据：${{esc((turn.evidence_ids || []).join(', '))}}</div>
               ${{renderRawTurn(turn)}}
             </div>`).join('') || '<div class="muted">暂无博弈回合记录。</div>'}}
@@ -4090,7 +4778,7 @@ def app_html() -> str:
                 <span class="chip">${{esc(evidenceStrengthLabel(item.strength))}}</span>
                 <span class="chip">${{esc(item.source)}}</span>
               </div>
-              <div class="plain-text">${{plainText(item.summary)}}</div>
+              ${{markdownBlock(item.summary)}}
               ${{item.locations && item.locations.length ? `<div class="path">位置：${{esc(item.locations.map(locationText).join(' -> '))}}</div>` : ''}}
               ${{item.data && (item.data.requested_file || item.data.resolved_file) ? `<div class="path">路径映射：${{esc(item.data.requested_file || '')}}${{item.data.resolved_file ? ' => ' + esc(item.data.resolved_file) : ''}}</div>` : ''}}
               ${{item.snippet ? `<pre>${{esc(item.snippet)}}</pre>` : ''}}
