@@ -153,20 +153,7 @@ class CodexTmuxSession:
             self.start()
         self._wait_until_input_ready()
         buffer_name = _safe_tmux_name(f"{self.session_name}-input")
-        load = subprocess.run(
-            ["tmux", "load-buffer", "-b", buffer_name, "-"],
-            input=text,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
-        if load.returncode != 0:
-            raise CodexRunnerError((load.stderr or load.stdout or "tmux load-buffer failed").strip())
-        _run_tmux(["tmux", "paste-buffer", "-d", "-b", buffer_name, "-t", self.target], timeout=10)
-        time.sleep(float(os.environ.get("VULN_JUDGER_CODEX_PASTE_SETTLE", "0.5")))
-        submit_key = os.environ.get("VULN_JUDGER_CODEX_SUBMIT_KEY", "Enter")
-        _run_tmux(["tmux", "send-keys", "-t", self.target, submit_key], timeout=10)
+        _send_text_to_tmux_target(self.target, buffer_name, text)
 
     def capture(self, lines: int = 240) -> str:
         if not self.is_live():
@@ -189,7 +176,7 @@ class CodexTmuxSession:
         while time.monotonic() < deadline:
             text = self.capture(lines=80).lower()
             if any(marker in text for marker in markers):
-                _run_tmux(["tmux", "send-keys", "-t", self.target, "Enter"], timeout=5)
+                _run_tmux(["tmux", "send-keys", "-t", self.target, _codex_submit_key()], timeout=5)
                 return
             time.sleep(0.25)
 
@@ -223,7 +210,7 @@ class CodexTmuxSession:
             "2. no, quit",
         )
         if any(marker in text.lower() for marker in markers):
-            _run_tmux(["tmux", "send-keys", "-t", self.target, "Enter"], timeout=5)
+            _run_tmux(["tmux", "send-keys", "-t", self.target, _codex_submit_key()], timeout=5)
             return True
         return False
 
@@ -415,18 +402,33 @@ def send_session_input(session_name: str, text: str) -> None:
     if not text or len(text) > 20000:
         raise CodexRunnerError("input must contain 1-20000 characters")
     buffer_name = _safe_tmux_name(f"{session_name}-web-input")
-    subprocess.run(
+    _send_text_to_tmux_target(session_name, buffer_name, text)
+
+
+def _send_text_to_tmux_target(target: str, buffer_name: str, text: str) -> None:
+    normalized = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    load = subprocess.run(
         ["tmux", "load-buffer", "-b", buffer_name, "-"],
-        input=text,
+        input=normalized,
         text=True,
         capture_output=True,
-        check=True,
+        check=False,
         timeout=10,
     )
-    _run_tmux(["tmux", "paste-buffer", "-d", "-b", buffer_name, "-t", session_name], timeout=10)
-    time.sleep(float(os.environ.get("VULN_JUDGER_CODEX_PASTE_SETTLE", "0.5")))
-    submit_key = os.environ.get("VULN_JUDGER_CODEX_SUBMIT_KEY", "Enter")
-    _run_tmux(["tmux", "send-keys", "-t", session_name, submit_key], timeout=10)
+    if load.returncode != 0:
+        raise CodexRunnerError((load.stderr or load.stdout or "tmux load-buffer failed").strip())
+    # Bracketed paste with LF preservation avoids WSL/Codex treating prompt newlines as submit keys.
+    paste = _run_tmux(["tmux", "paste-buffer", "-d", "-p", "-r", "-b", buffer_name, "-t", target], timeout=10, check=False)
+    if paste.returncode != 0:
+        fallback = _run_tmux(["tmux", "paste-buffer", "-d", "-b", buffer_name, "-t", target], timeout=10, check=False)
+        if fallback.returncode != 0:
+            raise CodexRunnerError((fallback.stderr or paste.stderr or fallback.stdout or paste.stdout or "tmux paste-buffer failed").strip())
+    time.sleep(float(os.environ.get("VULN_JUDGER_CODEX_PASTE_SETTLE", "0.75")))
+    _run_tmux(["tmux", "send-keys", "-t", target, _codex_submit_key()], timeout=10)
+
+
+def _codex_submit_key() -> str:
+    return os.environ.get("VULN_JUDGER_CODEX_SUBMIT_KEY", "C-m")
 
 
 def session_live(session_name: str) -> bool:

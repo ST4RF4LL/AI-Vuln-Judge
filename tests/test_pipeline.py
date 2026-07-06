@@ -1985,6 +1985,42 @@ for raw in sys.stdin.buffer:
             self.assertNotIn("--ask-for-approval", launch_args)
             self.assertEqual(launch_args[launch_args.index("--cd") + 1], str(run_dir.resolve()))
 
+    def test_codex_send_uses_bracketed_paste_and_control_submit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            run_dir = root / "workspace"
+            source.mkdir()
+            run_dir.mkdir()
+            session = CodexTmuxSession(
+                role="moderator",
+                run_id="run-1",
+                cwd=run_dir,
+                source_path=source,
+                run_dir=run_dir,
+                command="codex",
+            )
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+            with patch.object(session, "is_live", return_value=True), patch.object(
+                session, "_wait_until_input_ready"
+            ), patch("vuln_judger.codex_runner.subprocess.run", return_value=completed) as run, patch(
+                "vuln_judger.codex_runner._run_tmux", return_value=completed
+            ) as run_tmux, patch.dict(
+                os.environ,
+                {"VULN_JUDGER_CODEX_PASTE_SETTLE": "0", "VULN_JUDGER_CODEX_SUBMIT_KEY": "C-m"},
+                clear=False,
+            ):
+                session.send("line one\r\nline two")
+
+            self.assertEqual(run.call_args.kwargs["input"], "line one\nline two")
+            tmux_calls = [call.args[0] for call in run_tmux.call_args_list]
+            self.assertIn(
+                ["tmux", "paste-buffer", "-d", "-p", "-r", "-b", "vj-run-1-moderator-input", "-t", session.target],
+                tmux_calls,
+            )
+            self.assertIn(["tmux", "send-keys", "-t", session.target, "C-m"], tmux_calls)
+            self.assertNotIn(["tmux", "send-keys", "-t", session.target, "Enter"], tmux_calls)
+
     def test_codex_project_trust_is_written_for_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
