@@ -17,7 +17,13 @@ from unittest.mock import patch
 
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
 from vuln_judger.api import _codex_terminal_page, _config_from_payload, _stop_codex_sessions, app_html, make_handler
-from vuln_judger.codex_runner import DEFAULT_CODEX_WORKSPACES_DIR, CodexTmuxSession, _ensure_codex_project_trust
+from vuln_judger.codex_runner import (
+    DEFAULT_CODEX_WORKSPACES_DIR,
+    CodexDrivenRunner,
+    CodexTmuxSession,
+    _ensure_codex_project_trust,
+    _prepare_codex_agent_dirs,
+)
 from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
@@ -1874,9 +1880,16 @@ for raw in sys.stdin.buffer:
         self.assertIn("fetchJson('/mcp-servers')", html)
         self.assertIn("fetchJson('/skill-sources')", html)
         self.assertIn('id="run-provider-agent-grid"', html)
+        self.assertIn('class="run-provider-control"', html)
+        self.assertIn('class="run-agent-control"', html)
         self.assertIn('id="run-tool-provider-options"', html)
         self.assertIn('id="run-codex-config-note"', html)
         self.assertIn('function updateRunEngineVisibility()', html)
+        self.assertIn("el.runProviderAgentGrid.hidden = false", html)
+        self.assertIn("document.querySelectorAll('.run-provider-control')", html)
+        self.assertIn("affirmative_agent_profile: el.runAffirmativeAgentProfile.value || null", html)
+        self.assertNotIn("affirmative_agent_profile: codexMode ? null", html)
+        self.assertNotIn("el.runProviderAgentGrid.hidden = codexMode", html)
         self.assertIn('Codex 三方复核使用项目 .codex/config.toml', html)
         self.assertIn('/terminal-ui', html)
         self.assertIn('id="codex-terminal-frame-modal"', html)
@@ -2079,6 +2092,77 @@ for raw in sys.stdin.buffer:
             self.assertIsNone(config.affirmative_agent)
             self.assertIsNone(config.negative_agent)
             self.assertIsNone(config.moderator_agent)
+
+    def test_codex_config_uses_agent_profiles_from_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = AgentDirectoryStore(root / "agents")
+            store.save_profile("affirmative", "Affirmative_custom", "Codex 正方初始约束。")
+            store.save_profile("negative", "Negative_default", "Codex 反方默认约束。")
+            store.save_profile("moderator", "Moderator_default", "Codex Moderator 默认约束。")
+            payload = {
+                "report_path": str(root / "report.sarif"),
+                "source_path": str(root / "source"),
+                "engine": "codex",
+                "enable_external_tools": False,
+                "auto_index_tools": True,
+                "enable_llm": True,
+                "affirmative_provider_id": "ignored-provider",
+                "affirmative_agent_profile": "Affirmative_custom",
+                "negative_agent_profile": "Negative_default",
+                "moderator_agent_profile": "Moderator_default",
+            }
+
+            config = _config_from_payload(
+                payload,
+                providers_file=root / "providers.json",
+                agent_store=store,
+                mcp_servers_file=root / "mcp.json",
+            )
+
+            self.assertEqual(config.engine, "codex")
+            self.assertIsNone(config.mcp_servers_file)
+            self.assertFalse(config.enable_llm)
+            self.assertIsNone(config.affirmative_provider_id)
+            self.assertEqual(config.affirmative_agent.profile_id, "Affirmative_custom")
+            self.assertEqual(config.affirmative_agent.instructions, "Codex 正方初始约束。")
+            self.assertEqual(config.negative_agent.instructions, "Codex 反方默认约束。")
+            self.assertEqual(config.moderator_agent.instructions, "Codex Moderator 默认约束。")
+
+    def test_codex_agent_profile_files_are_written_per_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            run_dir = root / ".workspaces" / "runs" / "run-1"
+            source.mkdir(parents=True)
+            run_dir.mkdir(parents=True)
+            agents = {
+                "moderator": AgentConfig("Moderator_custom", "中立裁决约束。", role="Moderator", profile_id="Moderator_custom"),
+                "affirmative": AgentConfig("Affirmative_custom", "正方验证约束。", role="Affirmative", profile_id="Affirmative_custom"),
+                "negative": AgentConfig("Negative_custom", "反方复核约束。", role="Negative", profile_id="Negative_custom"),
+            }
+
+            with patch("vuln_judger.codex_runner._ensure_codex_project_trust") as trust:
+                session_dirs = _prepare_codex_agent_dirs(run_dir, agents, source)
+
+            self.assertEqual(set(session_dirs), {"moderator", "affirmative", "negative"})
+            self.assertEqual(trust.call_count, 3)
+            affirmative_dir = session_dirs["affirmative"]
+            agents_md = affirmative_dir / "AGENTS.md"
+            agent_md = affirmative_dir / "AGENT.md"
+            self.assertTrue(agents_md.exists())
+            self.assertTrue(agent_md.exists())
+            self.assertEqual(agents_md.read_text(encoding="utf-8"), agent_md.read_text(encoding="utf-8"))
+            text = agents_md.read_text(encoding="utf-8")
+            self.assertIn("Affirmative_custom", text)
+            self.assertIn("正方验证约束。", text)
+            self.assertIn(str(source), text)
+            self.assertIn(str(run_dir), text)
+            self.assertIn("Atlas MCP", text)
+            runner = CodexDrivenRunner(records_dir=root / "records", codex_command="codex")
+            sessions = runner._sessions("run-1", source, run_dir, session_dirs)
+            self.assertEqual(sessions["affirmative"].cwd, affirmative_dir.resolve())
+            self.assertEqual(sessions["moderator"].cwd, session_dirs["moderator"].resolve())
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:

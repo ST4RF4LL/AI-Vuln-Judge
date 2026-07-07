@@ -577,7 +577,12 @@ def _config_from_payload(
     affirmative_agent = None
     negative_agent = None
     moderator_agent = None
-    if not codex_engine:
+    if codex_engine:
+        if agent_store is not None:
+            affirmative_agent = agent_store.agent("affirmative", payload.get("affirmative_agent_profile"))
+            negative_agent = agent_store.agent("negative", payload.get("negative_agent_profile"))
+            moderator_agent = agent_store.agent("moderator", payload.get("moderator_agent_profile"))
+    else:
         affirmative_agent = _agent_config_from_payload(payload, "affirmative")
         negative_agent = _agent_config_from_payload(payload, "negative")
         moderator_agent = _agent_config_from_payload(payload, "moderator")
@@ -2463,12 +2468,12 @@ def app_html() -> str:
               <label>执行引擎<select id="run-engine"><option value="codex" selected>Codex 三方复核</option><option value="builtin">内置旧流程</option></select></label>
               <label>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
               <div class="run-agent-grid" id="run-provider-agent-grid">
-                <label>正方提供商<select id="run-affirmative-provider"></select></label>
-                <label>正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
-                <label>反方提供商<select id="run-negative-provider"></select></label>
-                <label>反方 Agent 配置档案<select id="run-negative-agent-profile"></select></label>
-                <label>主持人提供商<select id="run-moderator-provider"></select></label>
-                <label>主持人 Agent 配置档案<select id="run-moderator-agent-profile"></select></label>
+                <label class="run-provider-control">正方提供商<select id="run-affirmative-provider"></select></label>
+                <label class="run-agent-control">正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
+                <label class="run-provider-control">反方提供商<select id="run-negative-provider"></select></label>
+                <label class="run-agent-control">反方 Agent 配置档案<select id="run-negative-agent-profile"></select></label>
+                <label class="run-provider-control">主持人提供商<select id="run-moderator-provider"></select></label>
+                <label class="run-agent-control">主持人 Agent 配置档案<select id="run-moderator-agent-profile"></select></label>
               </div>
             </div>
             <div class="chips" id="run-tool-provider-options">
@@ -3206,7 +3211,9 @@ def app_html() -> str:
 
     function updateRunEngineVisibility() {{
       const codexMode = isCodexRunEngine();
-      el.runProviderAgentGrid.hidden = codexMode;
+      el.runProviderAgentGrid.hidden = false;
+      document.querySelectorAll('.run-provider-control').forEach(item => item.hidden = codexMode);
+      document.querySelectorAll('.run-agent-control').forEach(item => item.hidden = false);
       el.runToolProviderOptions.hidden = codexMode;
       el.runCodexConfigNote.hidden = !codexMode;
       if (codexMode) {{
@@ -3216,10 +3223,7 @@ def app_html() -> str:
         for (const select of [
           el.runAffirmativeProvider,
           el.runNegativeProvider,
-          el.runModeratorProvider,
-          el.runAffirmativeAgentProfile,
-          el.runNegativeAgentProfile,
-          el.runModeratorAgentProfile
+          el.runModeratorProvider
         ]) {{
           select.value = '';
         }}
@@ -3649,9 +3653,9 @@ def app_html() -> str:
           affirmative_provider_id: codexMode ? null : (el.runAffirmativeProvider.value || null),
           negative_provider_id: codexMode ? null : (el.runNegativeProvider.value || null),
           moderator_provider_id: codexMode ? null : (el.runModeratorProvider.value || null),
-          affirmative_agent_profile: codexMode ? null : (el.runAffirmativeAgentProfile.value || null),
-          negative_agent_profile: codexMode ? null : (el.runNegativeAgentProfile.value || null),
-          moderator_agent_profile: codexMode ? null : (el.runModeratorAgentProfile.value || null)
+          affirmative_agent_profile: el.runAffirmativeAgentProfile.value || null,
+          negative_agent_profile: el.runNegativeAgentProfile.value || null,
+          moderator_agent_profile: el.runModeratorAgentProfile.value || null
         }};
         if (!payload.report_path || !payload.source_path) {{
           throw new Error('报告路径和源码路径不能为空。');
@@ -4014,7 +4018,11 @@ def app_html() -> str:
           <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
           <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
           ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}`;
-      const codexRuntimeHtml = '<div><strong>Codex 配置：</strong> 使用项目 <span class="path">.codex/config.toml</span> 中的模型、MCP 与环境变量默认配置。</div>';
+      const codexRuntimeHtml = `
+          <div><strong>Codex 配置：</strong> 使用项目 <span class="path">.codex/config.toml</span> 中的模型、MCP 与环境变量默认配置。</div>
+          <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
+          <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
+          <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>`;
       return `<details class="detail metadata-section" open>
         <summary class="detail-summary">运行元数据
           <span class="chips">

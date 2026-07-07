@@ -20,7 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .models import Finding, RunConfig, SourceLocation, to_jsonable
+from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_NEGATIVE_AGENT
+from .models import AgentConfig, Finding, RunConfig, SourceLocation, to_jsonable
 from .records import RunRecordStore
 from .sarif import ReportPreparationError, load_report
 from .source import SourceIndexer, detect_project_languages
@@ -30,6 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CODEX_WORKSPACES_DIR = REPO_ROOT / ".workspaces" / "runs"
 CODEX_ENGINE = "codex"
 CODEX_ROLES = ("moderator", "affirmative", "negative")
+CODEX_AGENT_FILE_NAMES = ("AGENTS.md", "AGENT.md")
 ROLE_LABELS = {
     "moderator": "Moderator",
     "affirmative": "正方",
@@ -250,8 +252,10 @@ class CodexDrivenRunner:
 
         languages = list(detect_project_languages(source_path).languages)
         created_at = config.created_at or _now()
-        sessions = self._sessions(run_id, source_path, run_dir)
-        payload = _base_payload(config, run_id, created_at, languages, run_dir, sessions)
+        agent_configs = _codex_agent_configs(config)
+        session_dirs = _prepare_codex_agent_dirs(run_dir, agent_configs, source_path)
+        sessions = self._sessions(run_id, source_path, run_dir, session_dirs)
+        payload = _base_payload(config, run_id, created_at, languages, run_dir, sessions, agent_configs)
 
         def emit(status: str, **updates: Any) -> None:
             payload.update(updates)
@@ -372,18 +376,75 @@ class CodexDrivenRunner:
         emit("completed")
         return payload
 
-    def _sessions(self, run_id: str, source_path: Path, run_dir: Path) -> Dict[str, CodexTmuxSession]:
+    def _sessions(
+        self,
+        run_id: str,
+        source_path: Path,
+        run_dir: Path,
+        session_dirs: Dict[str, Path],
+    ) -> Dict[str, CodexTmuxSession]:
         return {
             role: CodexTmuxSession(
                 role=role,
                 run_id=run_id,
-                cwd=run_dir,
+                cwd=session_dirs[role],
                 source_path=source_path,
                 run_dir=run_dir,
                 command=self.codex_command,
             )
             for role in CODEX_ROLES
         }
+
+
+def _codex_agent_configs(config: RunConfig) -> Dict[str, AgentConfig]:
+    return {
+        "moderator": config.moderator_agent or DEFAULT_MODERATOR_AGENT,
+        "affirmative": config.affirmative_agent or DEFAULT_AFFIRMATIVE_AGENT,
+        "negative": config.negative_agent or DEFAULT_NEGATIVE_AGENT,
+    }
+
+
+def _prepare_codex_agent_dirs(
+    run_dir: Path,
+    agent_configs: Dict[str, AgentConfig],
+    source_path: Path,
+) -> Dict[str, Path]:
+    session_dirs: Dict[str, Path] = {}
+    for role in CODEX_ROLES:
+        role_dir = run_dir / "sessions" / role
+        role_dir.mkdir(parents=True, exist_ok=True)
+        _ensure_codex_project_trust(role_dir)
+        agent_text = _codex_agent_file_text(
+            role=role,
+            agent=agent_configs[role],
+            source_path=source_path,
+            run_dir=run_dir,
+        )
+        for file_name in CODEX_AGENT_FILE_NAMES:
+            (role_dir / file_name).write_text(agent_text + "\n", encoding="utf-8")
+        session_dirs[role] = role_dir
+    return session_dirs
+
+
+def _codex_agent_file_text(*, role: str, agent: AgentConfig, source_path: Path, run_dir: Path) -> str:
+    role_label = ROLE_LABELS.get(role, role)
+    profile = agent.profile_id or agent.name or role_label
+    instructions = (agent.instructions or "").strip() or "围绕当前阶段任务进行可复核的漏洞报告复核。"
+    return (
+        "# vuln-judger Codex Agent\n\n"
+        f"- 角色：{role_label}\n"
+        f"- Agent 配置档案：{profile}\n"
+        f"- 源码根目录：{source_path}\n"
+        f"- 共享任务工作目录：{run_dir}\n\n"
+        "## 会话约束\n\n"
+        "- 这份 AGENTS.md 是本 Codex session 的持续行为约束；后续每轮 prompt 只描述当前阶段、输入文件和输出 schema。\n"
+        "- 模型、MCP、skills 和 provider 都由 Codex 当前默认配置加载；不要要求 vuln-judger 在 prompt 中动态提供这些配置。\n"
+        "- 如 Atlas MCP 可用，开始代码图谱检索前先确认或打开源码根目录，不要把本 session 工作目录误当成待审源码。\n"
+        "- 只写入当前 prompt 指定的 JSON 输出文件，以及共享任务工作目录中的必要临时文件。\n"
+        "- 结论必须基于报告、源码、Atlas、rg/grep 或可复核工具输出；区分已证实证据、候选证据和未闭环缺口。\n\n"
+        "## 角色配置\n\n"
+        f"{instructions}\n"
+    ).strip()
 
 
 def capture_session(session_name: str, lines: int = 240) -> str:
@@ -702,7 +763,7 @@ def _input_payload(config: RunConfig, report_path: Path, source_path: Path, run_
 
 def _moderator_report_prompt(input_payload: Dict[str, Any], findings_path: Path) -> str:
     return (
-        "你是 vuln-judger 的中立 Moderator。当前任务是只处理输入漏洞报告，不做最终真假裁决。\n"
+        "当前阶段：报告拆分。请遵循本 session 初始 AGENTS.md 中的 Moderator 角色约束；本阶段只处理输入漏洞报告，不做最终真假裁决。\n"
         "请完整理解报告，将其拆分为独立 finding。SARIF 已解析结果如果存在，可以作为候选；Markdown/raw 报告需要你自行拆分。\n"
         "输出必须写入下面 JSON 文件，不能只在终端回答：\n"
         f"{findings_path}\n\n"
@@ -740,20 +801,13 @@ def _worker_prompt(
     round_index: int,
 ) -> str:
     is_affirmative = role == "affirmative"
-    objective = (
-        "证明该漏洞报告真实成立：补齐入口可达性、调用链、源到汇数据流、攻击前提、影响和限制。"
-        if is_affirmative
-        else "独立复核并尽力推翻或限制该漏洞报告：寻找误报、不可达、数据流断点、防护、输入不可控、变量语义误判或影响夸大。"
-    )
     peer = f"\n上一阶段正方结果文件：{peer_result_path}\n反方可以读取它进行质疑，但必须先独立复核源码证据。" if peer_result_path else ""
     return (
-        f"你是 {ROLE_LABELS[role]} Codex worker。当前是第 {round_index} 个 finding 的{'正方验证' if is_affirmative else '反方复核'}阶段。\n"
-        f"目标：{objective}\n"
+        f"当前阶段：第 {round_index} 个 finding 的{'正方验证' if is_affirmative else '反方复核'}。请遵循本 session 初始 AGENTS.md 中的 {ROLE_LABELS[role]} 角色约束。\n"
         f"源码根目录：{source_path}\n"
         f"finding brief：{brief_path}\n"
         f"{peer}\n"
-        "请主动使用本 Codex 会话可用的工具、shell、rg 和 Atlas MCP。Atlas MCP 配置在本项目 .codex/config.toml 中；"
-        "优先围绕报告文件、行号、符号和调用邻域做 scoped search/calls/trace/path，不要用全项目无关命中混证。\n"
+        "请围绕报告文件、行号、符号和调用邻域使用本 Codex 会话可用工具补证；Atlas MCP 如可用，先确认目标源码根目录后再检索。\n"
         "输出必须写入 JSON 文件，不能只在终端回答：\n"
         f"{result_path}\n\n"
         "JSON schema：\n"
@@ -784,7 +838,7 @@ def _moderator_final_prompt(
     final_path: Path,
 ) -> str:
     return (
-        "你是 vuln-judger 的中立 Moderator。现在基于正方和反方已保存的结果做最终裁决。\n"
+        "当前阶段：最终裁决。请遵循本 session 初始 AGENTS.md 中的 Moderator 角色约束，基于正方和反方已保存的结果做最终裁决。\n"
         f"源码根目录：{source_path}\n"
         f"finding brief：{brief_path}\n"
         f"正方结果：{affirmative_result}\n"
@@ -846,6 +900,7 @@ def _base_payload(
     languages: List[str],
     run_dir: Path,
     sessions: Dict[str, CodexTmuxSession],
+    agent_configs: Dict[str, AgentConfig],
 ) -> Dict[str, Any]:
     session_payload = [to_jsonable(session.info()) for session in sessions.values()]
     return {
@@ -862,11 +917,7 @@ def _base_payload(
         "reports": [],
         "diagnostics": list(config.resume_diagnostics or []),
         "llm_providers": {"enabled": False, "engine": CODEX_ENGINE},
-        "agent_configs": {
-            "moderator": {"name": "Codex Moderator", "role": "moderator"},
-            "affirmative": {"name": "Codex Affirmative", "role": "affirmative"},
-            "negative": {"name": "Codex Negative", "role": "negative"},
-        },
+        "agent_configs": {role: to_jsonable(agent_configs[role]) for role in CODEX_ROLES},
         "completed_finding_count": len(config.resume_reports or []),
         "current_finding_id": None,
         "current_finding_index": None,
