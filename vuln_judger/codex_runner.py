@@ -314,8 +314,17 @@ class CodexDrivenRunner:
             if should_stop is not None and should_stop():
                 raise CodexRunnerStopped(f"任务 {run_id} 已中断")
 
+        emit("running", diagnostics=["Codex-driven session 元数据已创建，正在启动三方 Codex TUI。"])
         for session in sessions.values():
+            check_stop()
             session.start()
+            emit(
+                "running",
+                diagnostics=[
+                    *payload.get("diagnostics", []),
+                    f"{ROLE_LABELS.get(session.role, session.role)} Codex session 已启动。",
+                ],
+            )
         emit("running", diagnostics=["Codex-driven 任务已启动，等待 Moderator 处理漏洞报告。"])
 
         input_payload = _input_payload(config, report_path, source_path, run_dir)

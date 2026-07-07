@@ -17,7 +17,14 @@ from threading import Lock, Thread
 from unittest.mock import patch
 
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
-from vuln_judger.api import _codex_terminal_page, _config_from_payload, _stop_codex_sessions, app_html, make_handler
+from vuln_judger.api import (
+    _codex_terminal_page,
+    _config_from_payload,
+    _finding_summary,
+    _stop_codex_sessions,
+    app_html,
+    make_handler,
+)
 from vuln_judger.codex_runner import (
     DEFAULT_CODEX_WORKSPACES_DIR,
     CodexDrivenRunner,
@@ -1923,6 +1930,15 @@ for raw in sys.stdin.buffer:
         self.assertNotIn("affirmative_agent_profile: codexMode ? null", html)
         self.assertNotIn("el.runProviderAgentGrid.hidden = codexMode", html)
         self.assertIn('Codex 三方复核使用项目 .codex/config.toml', html)
+        self.assertIn('当前活动 Agent', html)
+        self.assertIn('function renderCodexActiveAgent(run, findings, status)', html)
+        self.assertIn('function inferCodexActiveAgent(run, findings, status)', html)
+        self.assertIn('codex_delivery', html)
+        self.assertIn("ensurePolling(created.run_id);", html)
+        self.assertLess(html.index("ensurePolling(created.run_id);"), html.index("await loadRuns();"))
+        self.assertIn('正方验证阶段，等待正方 result.json', html)
+        self.assertIn('反方复核阶段，正方已交付', html)
+        self.assertIn('最终裁决阶段，正反方已交付', html)
         self.assertIn('/terminal-ui', html)
         self.assertIn('id="codex-terminal-frame-modal"', html)
         self.assertIn('id="close-codex-terminal-frame"', html)
@@ -1951,6 +1967,30 @@ for raw in sys.stdin.buffer:
         self.assertNotIn("window.open(url", html)
         self.assertNotIn('id="codex-terminal-modal"', html)
         self.assertNotIn('id="codex-terminal-input"', html)
+
+    def test_finding_summary_exposes_codex_delivery_state(self):
+        summary = _finding_summary(
+            {
+                "finding_id": "finding-1",
+                "rule_id": "demo-rule",
+                "verdict": "INCONCLUSIVE",
+                "confidence": 0.3,
+                "reasoning_summary": "等待反方复核。",
+                "evidence_chain": [],
+                "debate": [],
+                "codex_workflow": {
+                    "affirmative": {"summary": "正方已交付"},
+                    "negative": {},
+                    "moderator": None,
+                },
+            }
+        )
+
+        self.assertEqual(
+            summary["codex_delivery"],
+            {"affirmative": True, "negative": False, "moderator": False},
+        )
+        self.assertNotIn("codex_workflow", summary)
 
     def test_codex_terminal_page_uses_xterm_websocket(self):
         html = _codex_terminal_page(
@@ -2195,6 +2235,51 @@ for raw in sys.stdin.buffer:
             sessions = runner._sessions("run-1", source, run_dir, session_dirs)
             self.assertEqual(sessions["affirmative"].cwd, affirmative_dir.resolve())
             self.assertEqual(sessions["moderator"].cwd, session_dirs["moderator"].resolve())
+
+    def test_codex_runner_emits_session_metadata_before_tui_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            report = root / "report.sarif"
+            report.write_text("{}", encoding="utf-8")
+            captured = []
+
+            class Store:
+                def __init__(self, records_root):
+                    self.root = records_root
+
+                def save_payload(self, payload):
+                    captured.append(dict(payload))
+
+            config = RunConfig(
+                sarif_path=report,
+                source_path=source,
+                engine="codex",
+                run_id="run-session-buttons",
+            )
+            runner = CodexDrivenRunner(
+                records_dir=root / "records",
+                codex_runs_dir=root / ".workspaces" / "runs",
+                codex_command="codex",
+            )
+
+            with patch("vuln_judger.codex_runner._ensure_codex_project_trust"), patch.object(
+                CodexTmuxSession,
+                "start",
+                side_effect=RuntimeError("stop before tmux"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    runner.run(
+                        config,
+                        store=Store(root / "records"),
+                        progress_callback=lambda payload: captured.append(dict(payload)),
+                    )
+
+            first_with_sessions = next(item for item in captured if item.get("codex_sessions"))
+            self.assertEqual({item["role"] for item in first_with_sessions["codex_sessions"]}, {"moderator", "affirmative", "negative"})
+            self.assertIn("Codex-driven session 元数据已创建", "\n".join(first_with_sessions["diagnostics"]))
+            self.assertEqual(first_with_sessions["status"], "running")
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:

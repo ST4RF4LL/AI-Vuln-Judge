@@ -1307,6 +1307,16 @@ def _finding_summary(report):
         "source_locations": report.get("source_locations", []),
         "evidence_count": len(report.get("evidence_chain", [])),
         "debate_turn_count": len(report.get("debate", [])),
+        "codex_delivery": _codex_delivery_summary(report),
+    }
+
+
+def _codex_delivery_summary(report: dict) -> dict:
+    workflow = report.get("codex_workflow") if isinstance(report.get("codex_workflow"), dict) else {}
+    return {
+        "affirmative": bool(workflow.get("affirmative")),
+        "negative": bool(workflow.get("negative")),
+        "moderator": bool(workflow.get("moderator")),
     }
 
 
@@ -3691,10 +3701,12 @@ def app_html() -> str:
         el.runResult.textContent = JSON.stringify(created, null, 2);
         el.runConfigModal.classList.remove('open');
         state.autoRefreshEnabled = true;
+        if (created.run_id) {{
+          ensurePolling(created.run_id);
+        }}
         await loadRuns();
         if (created.run_id) {{
           await selectRun(created.run_id);
-          ensurePolling(created.run_id);
         }}
       }} catch (error) {{
         el.runResult.textContent = error.message;
@@ -4036,6 +4048,7 @@ def app_html() -> str:
       const origin = runOriginLabel(run);
       const engine = run.engine || (run.config && run.config.engine) || 'builtin';
       const codexEngine = engine === 'codex';
+      const codexActiveAgentHtml = codexEngine ? renderCodexActiveAgent(run, findings, status) : '';
       const legacyRuntimeHtml = `
           <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
           <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
@@ -4085,6 +4098,7 @@ def app_html() -> str:
           <div><strong>语言：</strong> ${{esc((run.languages || []).join(', '))}}</div>
           <div><strong>发现进度：</strong> ${{esc(run.completed_finding_count ?? findings.length)}} / ${{esc(run.finding_count || findings.length)}}</div>
           ${{currentHint ? `<div><strong>当前状态：</strong> ${{esc(currentHint)}}</div>` : ''}}
+          ${{codexActiveAgentHtml}}
           ${{resumeHint ? `<div><strong>恢复点：</strong> ${{esc(resumeHint)}}</div>` : ''}}
           ${{codexEngine ? codexRuntimeHtml : legacyRuntimeHtml}}
           ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : `<div class="muted">${{esc(runningMessage)}}</div>`}}
@@ -4208,6 +4222,56 @@ def app_html() -> str:
           关闭全部 Codex Sessions${{liveCount ? ` · ${{liveCount}} live` : ''}}
         </button>
       </div></div>`;
+    }}
+
+    function renderCodexActiveAgent(run, findings, status) {{
+      const state = inferCodexActiveAgent(run, findings, status);
+      if (!state) return '';
+      const chipClass = state.active ? 'chip status-running' : 'chip';
+      return `<div><strong>当前活动 Agent：</strong> <span class="${{chipClass}}">${{esc(state.agent)}}</span> <span class="muted">${{esc(state.stage)}}</span></div>`;
+    }}
+
+    function inferCodexActiveAgent(run, findings, status) {{
+      const total = Number(run.finding_count || (findings || []).length || 0);
+      const completed = Number((run.completed_finding_count ?? (findings || []).length) || 0);
+      if (status === 'completed') {{
+        return {{ agent: '无', stage: '任务已完成。', active: false }};
+      }}
+      if (status === 'failed') {{
+        return {{ agent: '无', stage: '任务失败，未继续推进。', active: false }};
+      }}
+      if (status === 'paused') {{
+        return {{ agent: '无', stage: '任务已暂停，恢复后从恢复点继续。', active: false }};
+      }}
+      if (status === 'stopped') {{
+        return {{ agent: '无', stage: '任务已停止。', active: false }};
+      }}
+      if (!total && !(findings || []).length) {{
+        return {{ agent: 'Moderator', stage: '报告拆分阶段，等待 findings.json 交付。', active: true }};
+      }}
+      const currentId = run.current_finding_id || '';
+      const current = currentId ? (findings || []).find(item => item.finding_id === currentId) : null;
+      if (!currentId || !current) {{
+        if (completed < total) {{
+          return {{ agent: '正方', stage: `下一个 finding 的正方验证阶段，等待 result.json 交付。`, active: true }};
+        }}
+        return {{ agent: 'Moderator', stage: '等待任务收尾。', active: true }};
+      }}
+      const delivery = current.codex_delivery && typeof current.codex_delivery === 'object' ? current.codex_delivery : {{}};
+      const findingText = `Finding：${{currentId}}`;
+      if (!delivery.affirmative) {{
+        return {{ agent: '正方', stage: `${{findingText}}，正方验证阶段，等待正方 result.json。`, active: true }};
+      }}
+      if (!delivery.negative) {{
+        return {{ agent: '反方', stage: `${{findingText}}，反方复核阶段，正方已交付。`, active: true }};
+      }}
+      if (!delivery.moderator) {{
+        return {{ agent: 'Moderator', stage: `${{findingText}}，最终裁决阶段，正反方已交付。`, active: true }};
+      }}
+      if (completed < total) {{
+        return {{ agent: '正方', stage: '当前 finding 已裁决，等待下一个 finding 的正方验证。', active: true }};
+      }}
+      return {{ agent: 'Moderator', stage: '全部 finding 已裁决，等待任务完成状态刷新。', active: true }};
     }}
 
     function bindRunExportButtons() {{
