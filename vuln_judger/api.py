@@ -26,7 +26,7 @@ from .codex_runner import (
 )
 from .evidence_graph import build_evidence_graph, graph_to_markdown
 from .llm import test_provider_connection
-from .logging_config import DEFAULT_LOG_FILE, configure_logging, logger
+from .logging_config import DEFAULT_LOG_FILE, DEFAULT_LOG_RETENTION_DAYS, configure_logging, logger
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE, MCPServerStore
 from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import RunStopped, run_judgement
@@ -81,8 +81,9 @@ def serve(
     log_file: Path = DEFAULT_LOG_FILE,
     mcp_servers_file: Path = DEFAULT_MCP_SERVERS_FILE,
     skills_file: Path = DEFAULT_SKILLS_FILE,
+    log_retention_days: int = DEFAULT_LOG_RETENTION_DAYS,
 ) -> None:
-    configured_log = configure_logging(log_file)
+    configured_log = configure_logging(log_file, retention_days=log_retention_days)
     store = RunRecordStore(records_dir)
     provider_store = ProviderStore(providers_file)
     agent_store = AgentDirectoryStore(agents_dir)
@@ -98,14 +99,19 @@ def serve(
     print(f"Skill Source 配置文件：{skill_store.path}")
     print(f"日志文件：{configured_log}")
     LOG.info(
-        "API 服务启动 host=%s port=%s records=%s providers=%s agents=%s mcp=%s skills=%s",
-        host,
-        port,
-        store.root,
-        provider_store.path,
-        agent_store.root,
-        mcp_store.path,
-        skill_store.path,
+        "API 服务启动",
+        extra={
+            "event": "api.start",
+            "host": host,
+            "port": port,
+            "records_dir": str(store.root),
+            "providers_file": str(provider_store.path),
+            "agents_dir": str(agent_store.root),
+            "mcp_file": str(mcp_store.path),
+            "skills_file": str(skill_store.path),
+            "log_file": str(configured_log),
+            "log_retention_days": log_retention_days,
+        },
     )
     server.serve_forever()
 
@@ -139,7 +145,15 @@ def make_handler(
                 if parts == ["runs"]:
                     payload = self._read_json()
                     run_id = _new_run_id()
-                    LOG.info("收到创建任务请求 run_id=%s payload=%s", run_id, _safe_payload(payload))
+                    LOG.info(
+                        "收到创建任务请求",
+                        extra={
+                            "event": "run.create",
+                            "run_id": run_id,
+                            "engine": str(payload.get("engine") or "builtin"),
+                            "payload": _safe_payload(payload),
+                        },
+                    )
                     config = _config_from_payload(payload, provider_store.path, run_id, agent_store, mcp_store.path, skill_store)
                     task = _task_from_config(config, run_id, "running")
                     stop_event = Event()
@@ -169,7 +183,10 @@ def make_handler(
                     if result is None:
                         self._json({"error": "运行任务未找到或已结束"}, HTTPStatus.NOT_FOUND)
                     else:
-                        LOG.info("收到停止任务请求 run_id=%s status=%s", parts[1], result.get("status"))
+                        LOG.info(
+                            "收到停止任务请求",
+                            extra={"event": "run.stop", "run_id": parts[1], "status": result.get("status")},
+                        )
                         store.save_payload(result)
                         self._json(result)
                     return
@@ -178,7 +195,10 @@ def make_handler(
                     if result is None:
                         self._json({"error": "运行任务未找到或已结束"}, HTTPStatus.NOT_FOUND)
                     else:
-                        LOG.info("收到暂停任务请求 run_id=%s status=%s", parts[1], result.get("status"))
+                        LOG.info(
+                            "收到暂停任务请求",
+                            extra={"event": "run.pause", "run_id": parts[1], "status": result.get("status")},
+                        )
                         store.save_payload(result)
                         self._json(result)
                     return
@@ -198,7 +218,10 @@ def make_handler(
                     if result is None:
                         self._json({"error": "暂停任务未找到或状态不允许恢复"}, HTTPStatus.NOT_FOUND)
                     else:
-                        LOG.info("收到恢复任务请求 run_id=%s status=%s", parts[1], result.get("status"))
+                        LOG.info(
+                            "收到恢复任务请求",
+                            extra={"event": "run.resume", "run_id": parts[1], "status": result.get("status")},
+                        )
                         self._json(result)
                     return
                 if len(parts) == 4 and parts[0] == "runs" and parts[2] == "codex-sessions" and parts[3] == "stop":
@@ -207,9 +230,12 @@ def make_handler(
                         self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
                     else:
                         LOG.info(
-                            "收到关闭 Codex sessions 请求 run_id=%s stopped=%s",
-                            parts[1],
-                            result.get("stopped"),
+                            "收到关闭 Codex sessions 请求",
+                            extra={
+                                "event": "codex.sessions.stop",
+                                "run_id": parts[1],
+                                "stopped": result.get("stopped"),
+                            },
                         )
                         self._json(result)
                     return

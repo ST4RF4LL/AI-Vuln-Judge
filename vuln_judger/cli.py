@@ -8,7 +8,7 @@ from typing import List, Optional
 
 from .api import DEFAULT_RECORDS_DIR, serve
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
-from .logging_config import DEFAULT_LOG_FILE, configure_logging, logger
+from .logging_config import DEFAULT_LOG_FILE, DEFAULT_LOG_RETENTION_DAYS, configure_logging, logger
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE
 from .mcp_server import JudgerMCPSettings, serve_mcp
 from .models import AgentConfig, RunConfig, to_jsonable
@@ -54,7 +54,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     run_parser.add_argument("--out", type=Path, help="将 JSON 研判报告写入该路径")
     run_parser.add_argument("--record", action="store_true", help="将本次运行保存到 Web 记录目录")
     run_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="运行记录保存目录")
-    run_parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE, help="日志文件路径")
+    run_parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE, help="日志文件前缀路径")
+    run_parser.add_argument("--log-retention-days", type=int, default=DEFAULT_LOG_RETENTION_DAYS, help="按天日志保留天数")
 
     api_parser = subparsers.add_parser(
         "api",
@@ -63,7 +64,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "不传参数时使用默认快速启动配置：127.0.0.1:8765，"
             ".vuln-judger/runs，.vuln-judger/providers.json，agents，"
             ".vuln-judger/mcp.json，.vuln-judger/skills.json，"
-            ".vuln-judger/logs/vuln-judger.log"
+            ".vuln-judger/logs/vuln-judger-YYYY-MM-DD.log"
         ),
     )
     api_parser.add_argument("--host", default="127.0.0.1")
@@ -73,7 +74,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     api_parser.add_argument("--mcp-servers-file", type=Path, default=DEFAULT_MCP_SERVERS_FILE, help="MCP Server 配置文件路径")
     api_parser.add_argument("--skills-file", type=Path, default=DEFAULT_SKILLS_FILE, help="Skill Source 配置文件路径")
     api_parser.add_argument("--agents-dir", type=Path, default=DEFAULT_AGENTS_DIR, help="包含角色 Agent 配置的目录")
-    api_parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE, help="日志文件路径")
+    api_parser.add_argument("--log-file", type=Path, default=DEFAULT_LOG_FILE, help="日志文件前缀路径")
+    api_parser.add_argument("--log-retention-days", type=int, default=DEFAULT_LOG_RETENTION_DAYS, help="按天日志保留天数")
 
     mcp_parser = subparsers.add_parser("mcp", help="启动 vuln-judger MCP stdio server")
     mcp_parser.add_argument("--records-dir", type=Path, default=DEFAULT_RECORDS_DIR, help="运行记录保存目录")
@@ -84,7 +86,17 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "api":
-        serve(args.host, args.port, args.records_dir, args.providers_file, args.agents_dir, args.log_file, args.mcp_servers_file, args.skills_file)
+        serve(
+            args.host,
+            args.port,
+            args.records_dir,
+            args.providers_file,
+            args.agents_dir,
+            args.log_file,
+            args.mcp_servers_file,
+            args.skills_file,
+            args.log_retention_days,
+        )
         return 0
     if args.command == "mcp":
         serve_mcp(
@@ -98,8 +110,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 0
     if args.command == "run":
-        log_path = configure_logging(args.log_file)
-        LOG.info("CLI 运行开始 report=%s source=%s log=%s", args.sarif, args.source, log_path)
+        log_path = configure_logging(args.log_file, retention_days=args.log_retention_days)
+        LOG.info(
+            "CLI 运行开始",
+            extra={
+                "event": "cli.run.start",
+                "report": str(args.sarif),
+                "source": str(args.source),
+                "log_file": str(log_path),
+                "log_retention_days": args.log_retention_days,
+            },
+        )
         agent_store = AgentDirectoryStore(args.agents_dir)
         skills_path = args.skills
         if skills_path is None and args.skill_source:

@@ -8,6 +8,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from datetime import date, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
@@ -28,6 +29,7 @@ from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
 from vuln_judger.llm import LLMClient
+from vuln_judger.logging_config import DEFAULT_LOG_RETENTION_DAYS, configure_logging, daily_log_path, logger
 from vuln_judger.mcp import MCPStdioClient
 from vuln_judger.mcp_config import MCPServerStore
 from vuln_judger.models import AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, Finding, RunConfig, SourceLocation, Verdict, to_jsonable
@@ -55,6 +57,35 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(profile.total_supported_files, 2)
             self.assertFalse(profile.fallback_used)
             self.assertEqual(set(profile.languages), {"python", "cpp"})
+
+    def test_daily_logging_uses_dated_key_value_files_and_retention(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_target = root / "logs" / "vuln-judger.log"
+            today = date.today()
+            old_log = root / "logs" / f"vuln-judger-{(today - timedelta(days=45)).isoformat()}.log"
+            keep_log = root / "logs" / f"vuln-judger-{(today - timedelta(days=5)).isoformat()}.log"
+            old_log.parent.mkdir(parents=True)
+            old_log.write_text("old\n", encoding="utf-8")
+            keep_log.write_text("keep\n", encoding="utf-8")
+
+            log_path = configure_logging(log_target, retention_days=DEFAULT_LOG_RETENTION_DAYS)
+            logger("test").info(
+                "hello world",
+                extra={"event": "unit.test", "run_id": "run-1", "payload": {"a": 1}},
+            )
+            for handler in logger("test").parent.handlers:
+                handler.flush()
+
+            self.assertEqual(log_path, daily_log_path(log_target, day=today).resolve())
+            self.assertTrue(log_path.exists())
+            self.assertFalse(old_log.exists())
+            self.assertTrue(keep_log.exists())
+            text = log_path.read_text(encoding="utf-8")
+            self.assertIn("event=unit.test", text)
+            self.assertIn("run_id=run-1", text)
+            self.assertIn('msg="hello world"', text)
+            self.assertIn('payload={"a":1}', text)
 
     def test_run_uses_detected_project_languages_not_payload_languages(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,6 +124,7 @@ class PipelineTests(unittest.TestCase):
                 Path(".vuln-judger") / "logs" / "vuln-judger.log",
                 Path(".vuln-judger") / "mcp.json",
                 Path(".vuln-judger") / "skills.json",
+                DEFAULT_LOG_RETENTION_DAYS,
             ),
         )
 

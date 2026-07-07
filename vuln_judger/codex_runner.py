@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_NEGATIVE_AGENT
+from .logging_config import logger
 from .models import AgentConfig, Finding, RunConfig, SourceLocation, to_jsonable
 from .records import RunRecordStore
 from .sarif import ReportPreparationError, load_report
@@ -32,6 +33,7 @@ DEFAULT_CODEX_WORKSPACES_DIR = REPO_ROOT / ".workspaces" / "runs"
 CODEX_ENGINE = "codex"
 CODEX_ROLES = ("moderator", "affirmative", "negative")
 CODEX_AGENT_FILE_NAMES = ("AGENTS.md", "AGENT.md")
+LOG = logger("codex_runner")
 ROLE_LABELS = {
     "moderator": "Moderator",
     "affirmative": "正方",
@@ -103,6 +105,20 @@ class CodexTmuxSession:
     def start(self) -> None:
         if self.is_live():
             return
+        yolo = _env_flag("VULN_JUDGER_CODEX_YOLO", default=True)
+        LOG.info(
+            "Codex session 启动",
+            extra={
+                "event": "codex.session.start",
+                "run_id": self.run_id,
+                "role": self.role,
+                "session_name": self.session_name,
+                "cwd": str(self.cwd),
+                "source_path": str(self.source_path),
+                "run_dir": str(self.run_dir),
+                "yolo": yolo,
+            },
+        )
         args = [
             "tmux",
             "new-session",
@@ -124,7 +140,7 @@ class CodexTmuxSession:
             str(self.run_dir),
             "--no-alt-screen",
         ]
-        if _env_flag("VULN_JUDGER_CODEX_YOLO", default=True):
+        if yolo:
             args.append("--dangerously-bypass-approvals-and-sandbox")
         else:
             args.extend(
@@ -138,6 +154,15 @@ class CodexTmuxSession:
         _run_tmux(args, timeout=30)
         self._accept_trust_prompt()
         self._wait_until_input_ready()
+        LOG.info(
+            "Codex session ready",
+            extra={
+                "event": "codex.session.ready",
+                "run_id": self.run_id,
+                "role": self.role,
+                "session_name": self.session_name,
+            },
+        )
 
     def is_live(self) -> bool:
         return _run_tmux(
@@ -149,11 +174,31 @@ class CodexTmuxSession:
     def stop(self) -> None:
         if self.is_live():
             _run_tmux(["tmux", "kill-session", "-t", self.session_name], timeout=10)
+            LOG.info(
+                "Codex session stopped",
+                extra={
+                    "event": "codex.session.stop",
+                    "run_id": self.run_id,
+                    "role": self.role,
+                    "session_name": self.session_name,
+                },
+            )
 
     def send(self, text: str) -> None:
         if not self.is_live():
             self.start()
         self._wait_until_input_ready()
+        LOG.info(
+            "Codex prompt 发送",
+            extra={
+                "event": "codex.prompt.send",
+                "run_id": self.run_id,
+                "role": self.role,
+                "session_name": self.session_name,
+                "text_chars": len(text),
+                "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+            },
+        )
         buffer_name = _safe_tmux_name(f"{self.session_name}-input")
         _send_text_to_tmux_target(self.target, buffer_name, text)
 
@@ -422,6 +467,16 @@ def _prepare_codex_agent_dirs(
         )
         for file_name in CODEX_AGENT_FILE_NAMES:
             (role_dir / file_name).write_text(agent_text + "\n", encoding="utf-8")
+        LOG.info(
+            "Codex Agent 文件写入",
+            extra={
+                "event": "codex.agent_file.write",
+                "role": role,
+                "agent_profile": agent_configs[role].profile_id or agent_configs[role].name,
+                "session_dir": str(role_dir),
+                "files": list(CODEX_AGENT_FILE_NAMES),
+            },
+        )
         session_dirs[role] = role_dir
     return session_dirs
 
@@ -722,6 +777,10 @@ def _wait_json(
     timeout_seconds: Optional[int] = None,
 ) -> Dict[str, Any]:
     timeout = timeout_seconds or int(os.environ.get("VULN_JUDGER_CODEX_STEP_TIMEOUT", "3600"))
+    LOG.info(
+        "等待 Codex JSON 输出",
+        extra={"event": "codex.output.wait", "output_path": str(path), "timeout_seconds": timeout},
+    )
     deadline = time.monotonic() + timeout
     last_error = ""
     while time.monotonic() < deadline:
@@ -731,11 +790,24 @@ def _wait_json(
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
+                    LOG.info(
+                        "Codex JSON 输出就绪",
+                        extra={"event": "codex.output.ready", "output_path": str(path)},
+                    )
                     return data
                 last_error = "JSON root is not an object"
             except json.JSONDecodeError as exc:
                 last_error = str(exc)
         time.sleep(1)
+    LOG.warning(
+        "等待 Codex JSON 输出超时",
+        extra={
+            "event": "codex.output.timeout",
+            "output_path": str(path),
+            "timeout_seconds": timeout,
+            "last_error": last_error,
+        },
+    )
     raise CodexRunnerError(f"等待 Codex 输出超时：{path}；最后错误：{last_error}")
 
 
