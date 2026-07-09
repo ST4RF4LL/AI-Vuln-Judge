@@ -19,8 +19,10 @@ from unittest.mock import patch
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
 from vuln_judger.api import (
     _codex_terminal_page,
+    _config_from_paused_payload,
     _config_from_payload,
     _finding_summary,
+    _pause_payload,
     _stop_codex_sessions,
     app_html,
     make_handler,
@@ -1672,6 +1674,7 @@ for raw in sys.stdin.buffer:
                 {
                     "run_id": "run-recover",
                     "status": "running",
+                    "engine": "codex",
                     "created_at": "2026-06-09T00:00:00Z",
                     "source_path": "/src",
                     "sarif_path": "/report.sarif",
@@ -1679,9 +1682,13 @@ for raw in sys.stdin.buffer:
                     "completed_finding_count": 1,
                     "current_finding_id": "finding-2",
                     "current_finding_index": 1,
-                    "reports": [{"finding_id": "finding-1", "verdict": "TRUE_POSITIVE"}, {"finding_id": "partial"}],
+                    "reports": [
+                        {"finding_id": "finding-1", "finding_status": "completed", "verdict": "TRUE_POSITIVE"},
+                        {"finding_id": "finding-2", "finding_status": "in_progress", "verdict": "INCONCLUSIVE"},
+                        {"finding_id": "finding-3", "finding_status": "pending", "verdict": None},
+                    ],
                     "diagnostics": [],
-                    "config": {"report_path": "/report.sarif", "source_path": "/src"},
+                    "config": {"engine": "codex", "report_path": "/report.sarif", "source_path": "/src"},
                 }
             )
 
@@ -1693,7 +1700,8 @@ for raw in sys.stdin.buffer:
             self.assertEqual(saved["completed_finding_count"], 1)
             self.assertEqual(saved["resume_from_finding_id"], "finding-2")
             self.assertEqual(saved["resume_from_finding_index"], 1)
-            self.assertEqual(len(saved["reports"]), 1)
+            self.assertEqual(len(saved["reports"]), 3)
+            self.assertEqual([item["finding_status"] for item in saved["reports"]], ["completed", "pending", "pending"])
             self.assertIn("服务重启时发现任务未完成", saved["diagnostics"][-1])
 
     def test_mcp_store_migrates_default_atlas_to_focus_args(self):
@@ -1964,6 +1972,11 @@ for raw in sys.stdin.buffer:
         self.assertIn('function renderCodexActiveAgent(run, findings, status)', html)
         self.assertIn('function inferCodexActiveAgent(run, findings, status)', html)
         self.assertIn('codex_delivery', html)
+        self.assertIn('function findingStatusChip(finding)', html)
+        self.assertIn("pending: '未完成'", html)
+        self.assertIn("in_progress: '处理中'", html)
+        self.assertIn(".chip.status-pending", html)
+        self.assertIn("该漏洞报告尚未完成三方复核", html)
         self.assertIn("ensurePolling(created.run_id);", html)
         self.assertLess(html.index("ensurePolling(created.run_id);"), html.index("await loadRuns();"))
         self.assertIn('正方验证阶段，等待正方 result.json', html)
@@ -2020,6 +2033,7 @@ for raw in sys.stdin.buffer:
             summary["codex_delivery"],
             {"affirmative": True, "negative": False, "moderator": False},
         )
+        self.assertEqual(summary["finding_status"], "in_progress")
         self.assertNotIn("codex_workflow", summary)
 
     def test_codex_terminal_page_uses_xterm_websocket(self):
@@ -2231,6 +2245,43 @@ for raw in sys.stdin.buffer:
             self.assertEqual(config.negative_agent.instructions, "Codex 反方默认约束。")
             self.assertEqual(config.moderator_agent.instructions, "Codex Moderator 默认约束。")
 
+    def test_codex_resume_config_preserves_all_findings_and_uses_first_pending_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = {
+                "run_id": "run-resume",
+                "status": "paused",
+                "engine": "codex",
+                "created_at": "2026-07-09T00:00:00Z",
+                "source_path": str(root / "source"),
+                "sarif_path": str(root / "report.md"),
+                "finding_count": 3,
+                "completed_finding_count": 1,
+                "reports": [
+                    {"finding_id": "finding-1", "finding_status": "completed", "verdict": "TRUE_POSITIVE"},
+                    {"finding_id": "finding-2", "finding_status": "pending", "verdict": None},
+                    {"finding_id": "finding-3", "finding_status": "pending", "verdict": None},
+                ],
+                "config": {
+                    "engine": "codex",
+                    "report_path": str(root / "report.md"),
+                    "source_path": str(root / "source"),
+                },
+            }
+
+            config = _config_from_paused_payload(
+                payload,
+                root / "providers.json",
+                AgentDirectoryStore(root / "agents"),
+                root / "mcp.json",
+                SkillSourceStore(root / "skills.json"),
+            )
+
+            self.assertEqual(config.engine, "codex")
+            self.assertEqual(len(config.resume_reports), 3)
+            self.assertEqual(config.resume_from_finding_index, 1)
+            self.assertEqual(config.resume_reports[0]["finding_id"], "finding-1")
+
     def test_codex_agent_profile_files_are_written_per_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2312,6 +2363,175 @@ for raw in sys.stdin.buffer:
             self.assertIn("Codex-driven session 元数据已创建", "\n".join(first_with_sessions["diagnostics"]))
             self.assertEqual(first_with_sessions["status"], "running")
             self.assertEqual(first_with_sessions["run_origin"], "mcp")
+
+    def test_codex_runner_persists_all_findings_and_resumes_from_first_incomplete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "app.py").write_text("print('demo')\n", encoding="utf-8")
+            report = root / "report.md"
+            report.write_text("# Demo report\n", encoding="utf-8")
+            records = RunRecordStore(root / "records")
+            run_dir = root / ".workspaces" / "runs" / "run-multi"
+            findings_data = {
+                "findings": [
+                    {"finding_id": f"finding-{index}", "rule_id": f"rule-{index}", "message": f"message-{index}"}
+                    for index in range(1, 4)
+                ]
+            }
+
+            class FakeSession:
+                def __init__(self, role, sent):
+                    self.role = role
+                    self.sent = sent
+
+                def info(self):
+                    return {
+                        "role": self.role,
+                        "session_name": f"vj-run-multi-{self.role}",
+                        "target": f"vj-run-multi-{self.role}:codex",
+                    }
+
+                def start(self):
+                    return None
+
+                def send(self, prompt):
+                    self.sent.append((self.role, prompt))
+
+            def sessions(sent):
+                return {role: FakeSession(role, sent) for role in ("moderator", "affirmative", "negative")}
+
+            affirmative = {"position": "TRUE_POSITIVE", "confidence": 0.8, "summary": "affirmative"}
+            negative = {"position": "TRUE_POSITIVE", "confidence": 0.7, "summary": "negative"}
+
+            def final(index):
+                return {
+                    "verdict": "TRUE_POSITIVE",
+                    "confidence": 0.9,
+                    "reasoning_summary": f"final-{index}",
+                    "final_conclusion": f"final-{index}",
+                }
+
+            initial_sent = []
+            initial_waits = iter(
+                [
+                    findings_data,
+                    affirmative,
+                    negative,
+                    final(1),
+                    CodexRunnerStopped("pause during finding-2"),
+                ]
+            )
+
+            def initial_wait(*_args, **_kwargs):
+                value = next(initial_waits)
+                if isinstance(value, Exception):
+                    raise value
+                return value
+
+            config = RunConfig(
+                sarif_path=report,
+                source_path=source,
+                engine="codex",
+                run_id="run-multi",
+            )
+            runner = CodexDrivenRunner(
+                records_dir=records.root,
+                codex_runs_dir=root / ".workspaces" / "runs",
+                codex_command="codex",
+            )
+            with patch("vuln_judger.codex_runner._ensure_codex_project_trust"), patch.object(
+                runner,
+                "_sessions",
+                return_value=sessions(initial_sent),
+            ), patch("vuln_judger.codex_runner._wait_json", side_effect=initial_wait):
+                with self.assertRaises(CodexRunnerStopped):
+                    runner.run(config, store=records)
+
+            running = records.get("run-multi")
+            self.assertEqual(len(running["reports"]), 3)
+            self.assertEqual(
+                [item["finding_status"] for item in running["reports"]],
+                ["completed", "in_progress", "pending"],
+            )
+            self.assertEqual(running["reports"][0]["final_conclusion"], "final-1")
+            self.assertTrue(
+                all(
+                    (run_dir / "findings" / f"finding-{index}" / "brief.json").exists()
+                    for index in range(1, 4)
+                )
+            )
+            (run_dir / "findings.json").write_text(
+                json.dumps(findings_data, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            paused = _pause_payload(config, running, "pause requested")
+            records.save_payload(paused)
+            self.assertEqual(len(paused["reports"]), 3)
+            self.assertEqual(
+                [item["finding_status"] for item in paused["reports"]],
+                ["completed", "pending", "pending"],
+            )
+            self.assertEqual(paused["completed_finding_count"], 1)
+            self.assertEqual(paused["resume_from_finding_id"], "finding-2")
+            self.assertEqual(paused["resume_from_finding_index"], 1)
+
+            stale_result = run_dir / "findings" / "finding-2" / "affirmative" / "result.json"
+            stale_result.parent.mkdir(parents=True, exist_ok=True)
+            stale_result.write_text('{"summary":"stale"}\n', encoding="utf-8")
+
+            resumed_sent = []
+            resumed_progress = []
+
+            def resumed_wait(path, **_kwargs):
+                value = str(path)
+                if value.endswith("findings.json"):
+                    return findings_data
+                if "finding-2" in value and value.endswith("affirmative/result.json"):
+                    self.assertFalse(stale_result.exists())
+                    return affirmative
+                if value.endswith("negative/result.json"):
+                    return negative
+                if "finding-2" in value and value.endswith("moderator/final.json"):
+                    return final(2)
+                if "finding-3" in value and value.endswith("affirmative/result.json"):
+                    return affirmative
+                if "finding-3" in value and value.endswith("moderator/final.json"):
+                    return final(3)
+                raise AssertionError(f"unexpected wait path: {path}")
+
+            resume_config = RunConfig(
+                sarif_path=report,
+                source_path=source,
+                engine="codex",
+                run_id="run-multi",
+                created_at=paused["created_at"],
+                resume_reports=paused["reports"],
+                resume_diagnostics=paused["diagnostics"],
+                resume_from_finding_index=paused["resume_from_finding_index"],
+            )
+            with patch("vuln_judger.codex_runner._ensure_codex_project_trust"), patch.object(
+                runner,
+                "_sessions",
+                return_value=sessions(resumed_sent),
+            ), patch("vuln_judger.codex_runner._wait_json", side_effect=resumed_wait):
+                completed = runner.run(
+                    resume_config,
+                    store=records,
+                    progress_callback=lambda payload: resumed_progress.append(
+                        json.loads(json.dumps(payload))
+                    ),
+                )
+
+            self.assertTrue(resumed_progress)
+            self.assertTrue(all(len(payload["reports"]) == 3 for payload in resumed_progress))
+            self.assertTrue(all(payload["reports"][0]["final_conclusion"] == "final-1" for payload in resumed_progress))
+            self.assertEqual([role for role, _ in resumed_sent], ["affirmative", "negative", "moderator"] * 2)
+            self.assertEqual(completed["completed_finding_count"], 3)
+            self.assertEqual([item["finding_status"] for item in completed["reports"]], ["completed"] * 3)
+            self.assertEqual([item["final_conclusion"] for item in completed["reports"]], ["final-1", "final-2", "final-3"])
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:

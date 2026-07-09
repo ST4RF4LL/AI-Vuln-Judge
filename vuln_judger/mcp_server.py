@@ -22,6 +22,7 @@ from .models import RunConfig, SourceLocation, to_jsonable
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
 from .records import RunRecordStore, normalize_run_origin
+from .run_state import FINDING_COMPLETED, completed_finding_count, finding_report_status
 from .sarif import load_report
 from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore, load_project_context
 from .source import SourceIndexer
@@ -1170,12 +1171,15 @@ def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
     counts: Dict[str, int] = {}
     finding_summaries = []
     for report in reports:
-        verdict = str(report.get("verdict") or "UNKNOWN")
-        counts[verdict] = counts.get(verdict, 0) + 1
+        finding_status = finding_report_status(report)
+        if finding_status == FINDING_COMPLETED:
+            verdict = str(report.get("verdict") or "UNKNOWN")
+            counts[verdict] = counts.get(verdict, 0) + 1
         finding_summaries.append(
             {
                 "finding_id": report.get("finding_id"),
                 "rule_id": report.get("rule_id"),
+                "finding_status": finding_status,
                 "verdict": report.get("verdict"),
                 "confidence": report.get("confidence"),
                 "summary": report.get("reasoning_summary"),
@@ -1192,7 +1196,7 @@ def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
         "sarif_path": run.get("sarif_path"),
         "languages": run.get("languages", []),
         "finding_count": run.get("finding_count", len(reports)),
-        "completed_finding_count": run.get("completed_finding_count", len(reports)),
+        "completed_finding_count": run.get("completed_finding_count", completed_finding_count(reports)),
         "current_finding_id": run.get("current_finding_id"),
         "current_finding_index": run.get("current_finding_index"),
         "verdict_counts": counts,

@@ -24,6 +24,14 @@ from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_
 from .logging_config import logger
 from .models import AgentConfig, Finding, RunConfig, SourceLocation, to_jsonable
 from .records import RunRecordStore
+from .run_state import (
+    FINDING_COMPLETED,
+    FINDING_IN_PROGRESS,
+    FINDING_PENDING,
+    completed_finding_count,
+    finding_report_completed,
+    first_incomplete_finding_index,
+)
 from .sarif import ReportPreparationError, load_report
 from .source import SourceIndexer, detect_project_languages
 
@@ -336,32 +344,51 @@ class CodexDrivenRunner:
         check_stop()
 
         findings_path = run_dir / "findings.json"
-        sessions["moderator"].send(_moderator_report_prompt(input_payload, findings_path))
+        reuse_findings = config.created_at is not None and findings_path.exists()
+        if not reuse_findings:
+            findings_path.unlink(missing_ok=True)
+            sessions["moderator"].send(_moderator_report_prompt(input_payload, findings_path))
         findings_data = _wait_json(findings_path, should_stop=should_stop)
         findings = _findings_from_moderator(findings_data, report_path)
+        finding_briefs = _persist_finding_briefs(findings, source_path, run_dir)
+        reports = _reconcile_finding_reports(findings, config.resume_reports)
+        completed_count = completed_finding_count(reports)
+        start_index = first_incomplete_finding_index(reports, len(findings))
         payload["finding_count"] = len(findings)
+        payload["reports"] = reports
+        payload["completed_finding_count"] = completed_count
+        payload["resume_from_finding_index"] = start_index
+        payload["resume_from_finding_id"] = findings[start_index].finding_id if start_index < len(findings) else None
         payload["codex_workflow"]["findings_path"] = str(findings_path)
-        emit("running", diagnostics=[*payload.get("diagnostics", []), f"Moderator 已拆分 {len(findings)} 个待复核 finding。"])
+        split_action = "复用磁盘中的" if reuse_findings else "已拆分并持久化"
+        emit(
+            "running",
+            diagnostics=[
+                *payload.get("diagnostics", []),
+                f"Moderator {split_action} {len(findings)} 个 finding；{completed_count} 个已完成，"
+                f"{len(findings) - completed_count} 个未完成。",
+            ],
+        )
 
-        reports: List[Dict[str, Any]] = list(config.resume_reports or [])
-        start_index = max(int(config.resume_from_finding_index or 0), len(reports))
         for finding_index, finding in enumerate(findings):
             if finding_index < start_index:
                 continue
             check_stop()
+            finding_dir = run_dir / "findings" / _safe_path_part(finding.finding_id)
+            finding_dir.mkdir(parents=True, exist_ok=True)
+            _reset_incomplete_finding_outputs(finding_dir)
+            reports = _replace_finding_report(
+                reports,
+                finding_index,
+                {**_pending_report(finding), "finding_status": FINDING_IN_PROGRESS},
+            )
             payload["current_finding_id"] = finding.finding_id
             payload["current_finding_index"] = finding_index
             payload["resume_from_finding_id"] = finding.finding_id
             payload["resume_from_finding_index"] = finding_index
-            emit("running")
+            emit("running", reports=reports, completed_finding_count=completed_finding_count(reports))
 
-            finding_dir = run_dir / "findings" / _safe_path_part(finding.finding_id)
-            finding_dir.mkdir(parents=True, exist_ok=True)
-            brief_path = finding_dir / "brief.json"
-            brief_path.write_text(
-                json.dumps(_finding_to_prompt_payload(finding, source_path), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            brief_path = finding_briefs[finding.finding_id]
 
             affirmative_dir = finding_dir / "affirmative"
             negative_dir = finding_dir / "negative"
@@ -383,8 +410,12 @@ class CodexDrivenRunner:
                 )
             )
             affirmative_data = _wait_json(affirmative_result, should_stop=should_stop)
-            reports_preview = reports + [_partial_report(finding, affirmative_data, None, None)]
-            emit("running", reports=reports_preview, completed_finding_count=len(reports))
+            reports = _replace_finding_report(
+                reports,
+                finding_index,
+                _partial_report(finding, affirmative_data, None, None),
+            )
+            emit("running", reports=reports, completed_finding_count=completed_finding_count(reports))
 
             negative_result = negative_dir / "result.json"
             sessions["negative"].send(
@@ -399,8 +430,12 @@ class CodexDrivenRunner:
                 )
             )
             negative_data = _wait_json(negative_result, should_stop=should_stop)
-            reports_preview = reports + [_partial_report(finding, affirmative_data, negative_data, None)]
-            emit("running", reports=reports_preview, completed_finding_count=len(reports))
+            reports = _replace_finding_report(
+                reports,
+                finding_index,
+                _partial_report(finding, affirmative_data, negative_data, None),
+            )
+            emit("running", reports=reports, completed_finding_count=completed_finding_count(reports))
 
             final_result = moderator_dir / "final.json"
             sessions["moderator"].send(
@@ -414,20 +449,27 @@ class CodexDrivenRunner:
                 )
             )
             final_data = _wait_json(final_result, should_stop=should_stop)
-            reports.append(_final_report(finding, affirmative_data, negative_data, final_data))
+            reports = _replace_finding_report(
+                reports,
+                finding_index,
+                _final_report(finding, affirmative_data, negative_data, final_data),
+            )
+            completed_count = completed_finding_count(reports)
+            next_index = first_incomplete_finding_index(reports, len(findings))
             emit(
                 "running",
                 reports=reports,
-                completed_finding_count=len(reports),
-                resume_from_finding_index=len(reports),
+                completed_finding_count=completed_count,
+                resume_from_finding_index=next_index,
+                resume_from_finding_id=findings[next_index].finding_id if next_index < len(findings) else None,
             )
 
         payload["reports"] = reports
-        payload["completed_finding_count"] = len(reports)
+        payload["completed_finding_count"] = completed_finding_count(reports)
         payload["current_finding_id"] = None
         payload["current_finding_index"] = None
         payload["resume_from_finding_id"] = None
-        payload["resume_from_finding_index"] = len(reports)
+        payload["resume_from_finding_index"] = len(findings)
         emit("completed")
         return payload
 
@@ -986,6 +1028,8 @@ def _base_payload(
     run_origin: str,
 ) -> Dict[str, Any]:
     session_payload = [to_jsonable(session.info()) for session in sessions.values()]
+    resume_reports = [dict(report) for report in config.resume_reports if isinstance(report, dict)]
+    resume_index = first_incomplete_finding_index(resume_reports, len(resume_reports))
     return {
         "run_id": run_id,
         "status": "running",
@@ -995,17 +1039,19 @@ def _base_payload(
         "source_path": str(config.source_path),
         "sarif_path": str(config.sarif_path),
         "languages": languages,
-        "finding_count": 0,
+        "finding_count": len(resume_reports),
         "project_context_facts": 0,
-        "reports": [],
+        "reports": resume_reports,
         "diagnostics": list(config.resume_diagnostics or []),
         "llm_providers": {"enabled": False, "engine": CODEX_ENGINE},
         "agent_configs": {role: to_jsonable(agent_configs[role]) for role in CODEX_ROLES},
-        "completed_finding_count": len(config.resume_reports or []),
+        "completed_finding_count": completed_finding_count(resume_reports),
         "current_finding_id": None,
         "current_finding_index": None,
-        "resume_from_finding_id": None,
-        "resume_from_finding_index": int(config.resume_from_finding_index or 0),
+        "resume_from_finding_id": (
+            resume_reports[resume_index].get("finding_id") if resume_index < len(resume_reports) else None
+        ),
+        "resume_from_finding_index": resume_index,
         "config": {
             "engine": CODEX_ENGINE,
             "report_path": str(config.sarif_path),
@@ -1037,6 +1083,7 @@ def _final_report(
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
+        "finding_status": FINDING_COMPLETED,
         "verdict": verdict,
         "confidence": round(confidence, 2),
         "reasoning_summary": str(final.get("reasoning_summary") or final.get("summary") or ""),
@@ -1078,6 +1125,7 @@ def _partial_report(
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
+        "finding_status": FINDING_IN_PROGRESS,
         "verdict": position,
         "confidence": _float((negative or affirmative or {}).get("confidence"), 0.3),
         "reasoning_summary": summary,
@@ -1099,6 +1147,73 @@ def _partial_report(
             "moderator": final or {},
         },
     }
+
+
+def _pending_report(finding: Finding) -> Dict[str, Any]:
+    return {
+        "finding_id": finding.finding_id,
+        "rule_id": finding.rule_id,
+        "finding_status": FINDING_PENDING,
+        "verdict": None,
+        "confidence": None,
+        "reasoning_summary": finding.message,
+        "final_conclusion": "",
+        "evidence_chain": _evidence_chain(finding, {}, {}, {}),
+        "debate": [],
+        "disputed_points": [],
+        "protection_assessment": "",
+        "impact_assessment": "",
+        "source_locations": [to_jsonable(item) for item in finding.locations],
+        "recommended_next_steps": [],
+        "evidence_graph": {},
+        "verification_case": _verification_case(finding),
+        "evidence_ledger": [],
+        "scorecard": {},
+        "codex_workflow": {
+            "affirmative": {},
+            "negative": {},
+            "moderator": {},
+        },
+    }
+
+
+def _reconcile_finding_reports(
+    findings: Sequence[Finding],
+    resume_reports: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    previous = {
+        str(report.get("finding_id")): dict(report)
+        for report in resume_reports
+        if isinstance(report, dict) and report.get("finding_id")
+    }
+    reports: List[Dict[str, Any]] = []
+    for finding in findings:
+        existing = previous.get(finding.finding_id)
+        if existing is not None and finding_report_completed(existing):
+            existing["finding_status"] = FINDING_COMPLETED
+            reports.append(existing)
+        else:
+            reports.append(_pending_report(finding))
+    return reports
+
+
+def _replace_finding_report(
+    reports: Sequence[Dict[str, Any]],
+    index: int,
+    report: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    updated = [dict(item) for item in reports]
+    updated[index] = dict(report)
+    return updated
+
+
+def _reset_incomplete_finding_outputs(finding_dir: Path) -> None:
+    for relative_path in (
+        Path("affirmative") / "result.json",
+        Path("negative") / "result.json",
+        Path("moderator") / "final.json",
+    ):
+        (finding_dir / relative_path).unlink(missing_ok=True)
 
 
 def _evidence_chain(
@@ -1179,6 +1294,30 @@ def _debate_turns(affirmative: Dict[str, Any], negative: Dict[str, Any], final: 
             }
         )
     return turns
+
+
+def _persist_finding_briefs(
+    findings: Sequence[Finding],
+    source_path: Path,
+    run_dir: Path,
+) -> Dict[str, Path]:
+    paths: Dict[str, Path] = {}
+    for finding in findings:
+        finding_dir = run_dir / "findings" / _safe_path_part(finding.finding_id)
+        finding_dir.mkdir(parents=True, exist_ok=True)
+        brief_path = finding_dir / "brief.json"
+        brief_path.write_text(
+            json.dumps(
+                _finding_to_prompt_payload(finding, source_path),
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        paths[finding.finding_id] = brief_path
+    return paths
 
 
 def _finding_to_prompt_payload(finding: Finding, source_path: Path) -> Dict[str, Any]:

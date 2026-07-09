@@ -343,6 +343,11 @@ uv run vuln-judger api \
 证据链、博弈过程、防护分析、影响分析、LLM 提供商配置、正反方和主持人默认提供商选择、
 提供商连通性测试、三方 Agent 配置管理，以及 MCP / Skill Source 配置管理。
 
+Codex 三方复核引擎在 Moderator 拆分报告后，会立即把全部 finding 写入运行记录，并在
+`.workspaces/runs/<run-id>/findings/<finding-id>/brief.json` 保存各自的输入材料。前端会将
+尚未裁决的 finding 标记为“未完成”或“处理中”。暂停后恢复时，新 session 会保留已完成结果，
+清理首个未完成 finding 的旧阶段输出，并从该 finding 重新开始。
+
 默认日志按天写入 `.vuln-judger/logs/vuln-judger-YYYY-MM-DD.log`，会记录 API 启动、任务创建、
 后台任务执行、LLM 请求状态、Provider 连通性测试和异常 traceback。日志使用 key=value 文本格式，
 默认保留 31 天，且已被 `.gitignore` 忽略。

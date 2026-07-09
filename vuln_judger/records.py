@@ -7,6 +7,13 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from .models import RunReport, to_jsonable
+from .run_state import (
+    FINDING_COMPLETED,
+    completed_finding_count,
+    finding_report_status,
+    first_incomplete_finding_index,
+    mark_incomplete_findings_pending,
+)
 
 
 class RunRecordStore:
@@ -79,6 +86,8 @@ class RunRecordStore:
 def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
     verdict_counts: Dict[str, int] = {}
     for report in payload.get("reports", []):
+        if finding_report_status(report) != FINDING_COMPLETED:
+            continue
         verdict = report.get("verdict", "UNKNOWN")
         verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
     workflow = payload.get("codex_workflow") if isinstance(payload.get("codex_workflow"), dict) else {}
@@ -95,7 +104,10 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
         "project_context_facts": payload.get("project_context_facts", 0),
         "diagnostic_count": len(payload.get("diagnostics", [])),
         "verdict_counts": verdict_counts,
-        "completed_finding_count": payload.get("completed_finding_count", len(payload.get("reports", []))),
+        "completed_finding_count": payload.get(
+            "completed_finding_count",
+            completed_finding_count(payload.get("reports", [])),
+        ),
         "current_finding_id": payload.get("current_finding_id"),
         "current_finding_index": payload.get("current_finding_index"),
         "resume_from_finding_id": payload.get("resume_from_finding_id"),
@@ -118,19 +130,30 @@ def normalize_run_origin(payload: Dict[str, Any]) -> str:
 
 def _paused_after_restart(payload: Dict[str, Any]) -> Dict[str, Any]:
     updated = dict(payload)
-    reports = list(updated.get("reports") or [])
-    completed_count = _bounded_int(updated.get("completed_finding_count"), default=len(reports), minimum=0, maximum=len(reports))
-    finding_count = _bounded_int(updated.get("finding_count"), default=completed_count, minimum=completed_count, maximum=10**9)
-    resume_index = _bounded_int(
-        updated.get("current_finding_index"),
-        default=_bounded_int(updated.get("resume_from_finding_index"), default=completed_count, minimum=completed_count, maximum=finding_count),
-        minimum=completed_count,
-        maximum=finding_count,
+    reports = mark_incomplete_findings_pending(
+        updated.get("reports") or [],
+        updated.get("completed_finding_count"),
     )
+    completed_count = completed_finding_count(reports)
+    engine = str(updated.get("engine") or (updated.get("config") or {}).get("engine") or "builtin")
+    if engine != "codex":
+        reports = reports[:completed_count]
+    finding_count = _bounded_int(
+        updated.get("finding_count"),
+        default=len(reports),
+        minimum=max(completed_count, len(reports)),
+        maximum=10**9,
+    )
+    resume_index = first_incomplete_finding_index(reports, finding_count)
+    resume_report = reports[resume_index] if resume_index < len(reports) else {}
     updated["status"] = "paused"
-    updated["reports"] = reports[:completed_count]
+    updated["reports"] = reports
     updated["completed_finding_count"] = completed_count
-    updated["resume_from_finding_id"] = updated.get("current_finding_id") or updated.get("resume_from_finding_id")
+    updated["resume_from_finding_id"] = (
+        resume_report.get("finding_id")
+        or updated.get("current_finding_id")
+        or updated.get("resume_from_finding_id")
+    )
     updated["resume_from_finding_index"] = resume_index
     updated["current_finding_id"] = None
     updated["current_finding_index"] = None

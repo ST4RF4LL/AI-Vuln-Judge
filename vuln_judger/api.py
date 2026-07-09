@@ -32,6 +32,13 @@ from .models import AgentConfig, RunConfig, to_jsonable
 from .pipeline import RunStopped, run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderStore
 from .records import RunRecordStore, normalize_run_origin
+from .run_state import (
+    FINDING_COMPLETED,
+    completed_finding_count,
+    finding_report_status,
+    first_incomplete_finding_index,
+    mark_incomplete_findings_pending,
+)
 from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore
 
 
@@ -658,7 +665,10 @@ def _run_detail(run):
         "llm_providers": run.get("llm_providers", {}),
         "agent_configs": run.get("agent_configs", {}),
         "verdict_counts": _verdict_counts(run),
-        "completed_finding_count": run.get("completed_finding_count", len(run.get("reports", []))),
+        "completed_finding_count": run.get(
+            "completed_finding_count",
+            completed_finding_count(run.get("reports", [])),
+        ),
         "current_finding_id": run.get("current_finding_id"),
         "current_finding_index": run.get("current_finding_index"),
         "resume_from_finding_id": run.get("resume_from_finding_id"),
@@ -923,7 +933,10 @@ def _task_from_report_payload(payload: dict, status: str) -> dict:
         "reports": payload.get("reports", []),
         "error": payload.get("error"),
         "config": payload.get("config", {}),
-        "completed_finding_count": payload.get("completed_finding_count", len(payload.get("reports", []))),
+        "completed_finding_count": payload.get(
+            "completed_finding_count",
+            completed_finding_count(payload.get("reports", [])),
+        ),
         "current_finding_id": payload.get("current_finding_id"),
         "current_finding_index": payload.get("current_finding_index"),
         "resume_from_finding_id": payload.get("resume_from_finding_id"),
@@ -1141,18 +1154,24 @@ def _config_task_snapshot(config: RunConfig) -> dict:
 
 def _pause_payload(config: RunConfig, last_payload: Optional[dict], reason: str) -> dict:
     payload = dict(last_payload or _task_from_config(config, config.run_id or _new_run_id(), "paused"))
-    reports = list(payload.get("reports") or [])
-    completed_count = _bounded_int(payload.get("completed_finding_count"), default=len(reports), minimum=0, maximum=len(reports))
-    resume_index = _bounded_int(
-        payload.get("current_finding_index"),
-        default=completed_count,
-        minimum=completed_count,
-        maximum=int(payload.get("finding_count") or completed_count),
+    reports = mark_incomplete_findings_pending(
+        payload.get("reports") or [],
+        payload.get("completed_finding_count"),
     )
-    resume_id = payload.get("current_finding_id") or payload.get("resume_from_finding_id")
+    finding_count = max(int(payload.get("finding_count") or 0), len(reports))
+    completed_count = completed_finding_count(reports)
+    if config.engine != CODEX_ENGINE:
+        reports = reports[:completed_count]
+    resume_index = first_incomplete_finding_index(reports, finding_count)
+    resume_report = reports[resume_index] if resume_index < len(reports) else {}
+    resume_id = (
+        resume_report.get("finding_id")
+        or payload.get("current_finding_id")
+        or payload.get("resume_from_finding_id")
+    )
     payload["status"] = "paused"
     payload["error"] = None
-    payload["reports"] = reports[:completed_count]
+    payload["reports"] = reports
     payload["completed_finding_count"] = completed_count
     payload["current_finding_id"] = None
     payload["current_finding_index"] = None
@@ -1276,11 +1295,9 @@ def _config_from_paused_payload(
     config.created_at = payload.get("created_at")
     config.resume_reports = reports
     config.resume_diagnostics = list(payload.get("diagnostics") or [])
-    config.resume_from_finding_index = _bounded_int(
-        payload.get("resume_from_finding_index"),
-        default=len(reports),
-        minimum=0,
-        maximum=int(payload.get("finding_count") or len(reports)),
+    config.resume_from_finding_index = first_incomplete_finding_index(
+        reports,
+        int(payload.get("finding_count") or len(reports)),
     )
     return config
 
@@ -1300,6 +1317,7 @@ def _finding_summary(report):
     return {
         "finding_id": report.get("finding_id"),
         "rule_id": report.get("rule_id"),
+        "finding_status": finding_report_status(report),
         "verdict": report.get("verdict"),
         "confidence": report.get("confidence"),
         "summary": _finding_report_summary(report),
@@ -1387,6 +1405,8 @@ def _agent_task_metadata(config: RunConfig) -> dict:
 def _verdict_counts(run):
     counts = {}
     for report in run.get("reports", []):
+        if finding_report_status(report) != FINDING_COMPLETED:
+            continue
         verdict = report.get("verdict", "UNKNOWN")
         counts[verdict] = counts.get(verdict, 0) + 1
     return counts
@@ -1422,6 +1442,7 @@ def _export_run_markdown(run: dict) -> str:
                 f"## 发现 {index}: {report.get('rule_id') or report.get('finding_id') or ''}",
                 "",
                 f"- 发现 ID：{report.get('finding_id') or ''}",
+                f"- 研判状态：{finding_report_status(report)}",
                 f"- 结论：{report.get('verdict') or ''}",
                 f"- 置信度：{report.get('confidence')}",
                 "",
@@ -1820,6 +1841,8 @@ def app_html() -> str:
     .chip.status-paused {{ color: #6c4a9f; border-color: #bfa9e8; background: #f6f0ff; }}
     .chip.status-failed {{ color: #9a2f2f; border-color: #e19090; background: #fff1f1; }}
     .chip.status-queued {{ color: #35516e; border-color: #9fb8d2; background: #eef6ff; }}
+    .chip.status-pending {{ color: #6b4f16; border-color: #d8bd76; background: #fff9e8; }}
+    .chip.status-in_progress {{ color: #0d4f6f; border-color: #74bdd8; background: #e8f6fb; }}
     .chip.run-delete {{ cursor: pointer; color: var(--bad); }}
     .chip.run-delete:hover {{ border-color: var(--bad); background: #fff1f0; }}
     .chip.run-stop, .chip.run-pause, .chip.run-resume {{ cursor: pointer; color: var(--accent); }}
@@ -2996,6 +3019,21 @@ def app_html() -> str:
       }};
       return labels[verdict] || verdict || '未知结论';
     }}
+    function findingStatusLabel(status) {{
+      const labels = {{
+        pending: '未完成',
+        in_progress: '处理中',
+        completed: '已完成'
+      }};
+      return labels[status] || status || '未完成';
+    }}
+    function findingStatusChip(finding) {{
+      const status = finding && finding.finding_status ? finding.finding_status : 'completed';
+      if (status === 'completed') {{
+        return `<span class="chip ${{verdictClass(finding.verdict)}}">${{esc(verdictLabel(finding.verdict))}}</span>`;
+      }}
+      return `<span class="${{statusChipClass(status)}}">${{esc(findingStatusLabel(status))}}</span>`;
+    }}
     function roleLabel(role) {{
       const labels = {{
         AFFIRMATIVE: '正方',
@@ -4117,12 +4155,12 @@ def app_html() -> str:
           </div>
           ${{findings.length ? `<div class="findings-table-wrap">
             <table>
-              <thead><tr><th>结论</th><th>规则</th><th>置信度</th><th>摘要</th></tr></thead>
+              <thead><tr><th>状态 / 结论</th><th>规则</th><th>置信度</th><th>摘要</th></tr></thead>
               <tbody>
                 ${{findings.map(item => `<tr class="clickable ${{state.selectedFinding === item.finding_id ? 'active' : ''}}" data-finding-id="${{esc(item.finding_id)}}">
-                  <td><span class="chip ${{verdictClass(item.verdict)}}">${{esc(verdictLabel(item.verdict))}}</span></td>
+                  <td>${{findingStatusChip(item)}}</td>
                   <td>${{esc(item.rule_id)}}<div class="path">${{esc(item.finding_id)}}</div></td>
-                  <td>${{esc(item.confidence)}}</td>
+                  <td>${{item.finding_status === 'completed' ? esc(item.confidence) : '—'}}</td>
                   <td><span class="plain-inline">${{plainInlineText(item.summary)}}</span><div class="path">${{esc((item.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div></td>
                 </tr>`).join('')}}
               </tbody>
@@ -4149,9 +4187,9 @@ def app_html() -> str:
         <button type="button" class="finding-nav-button" data-finding-nav="prev" title="上一个漏洞" ${{index <= 0 ? 'disabled' : ''}}>‹</button>
         <div class="selected-finding-main">
           <div class="chips">
-            <span class="chip ${{verdictClass(finding.verdict)}}">${{esc(verdictLabel(finding.verdict))}}</span>
+            ${{findingStatusChip(finding)}}
             <span class="chip">${{esc(index + 1)}} / ${{esc(total)}}</span>
-            <span class="chip">置信度 ${{esc(finding.confidence)}}</span>
+            ${{finding.finding_status === 'completed' ? `<span class="chip">置信度 ${{esc(finding.confidence)}}</span>` : ''}}
             <span class="chip">${{esc(finding.rule_id)}}</span>
           </div>
           <div><strong>当前漏洞：</strong> <span class="plain-inline">${{plainInlineText(finding.summary || finding.finding_id || '')}}</span></div>
@@ -4832,6 +4870,21 @@ def app_html() -> str:
       const evidence = detail.evidence_chain || [];
       const debate = uniqueDebateTurns(detail.debate || []);
       const conclusion = conclusionWithoutEvidenceGraph(detail.final_conclusion);
+      if (detail.finding_status && detail.finding_status !== 'completed') {{
+        return `
+          ${{renderOriginalReportSection(detail)}}
+          <div class="detail">
+            <h3>发现详情</h3>
+            <div class="detail-body">
+              <div class="chips">
+                ${{findingStatusChip(detail)}}
+                <span class="chip">${{esc(detail.rule_id)}}</span>
+              </div>
+              <div class="muted">该漏洞报告尚未完成三方复核；任务恢复后会从首个未完成项重新处理。</div>
+            </div>
+          </div>
+          ${{renderCodexWorkflowSection(detail)}}`;
+      }}
       return `
         ${{renderOriginalReportSection(detail)}}
         <div class="detail">
