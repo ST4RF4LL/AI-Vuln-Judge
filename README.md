@@ -123,8 +123,11 @@ uv run vuln-judger mcp \
 
 可用工具：
 
-- `judge_report`：对 SARIF/Markdown 报告和源码目录运行完整研判，可保存 run 记录。
-- `one_round_judge`：对单个 finding 使用默认配置进行单轮快速验证，默认保存 run 记录。
+- `judge_report`：对 SARIF/Markdown 报告和源码目录启动完整研判。默认使用重构后的
+  `codex` 三会话引擎并立即返回 `run_id`；使用 `get_run` 轮询运行状态。传
+  `engine: "builtin"` 可继续使用旧的同步内置流程。
+- `stop_run`：停止由当前 MCP Server 启动且仍在运行的异步 Codex 研判。
+- `one_round_judge`：使用内置流程对单个 finding 进行单轮快速验证，默认保存 run 记录。
   默认 `response_mode: compact` 只返回关键结论、调用链/数据流概览、关键缺口和完整报告访问方式，
   以减少 CLI Agent 上下文占用；如不希望 Web 端显示该快速验证记录，可传 `save: false`。
 - `collect_evidence`：只采集某个 finding 的源码、SARIF、Atlas、检索和影响证据，不运行博弈。
@@ -137,6 +140,10 @@ uv run vuln-judger mcp \
 继续读取完整报告。调试时可传 `response_mode: standard` 返回证据摘要和诊断，或传
 `response_mode: full` 返回完整 run/report 内容。
 
+`judge_report` 的 Codex 引擎会启动 Moderator、Affirmative、Negative 三个 tmux/Codex
+会话。任务进度持续写入 `--records-dir`，因此 Codex 引擎要求 `save: true`。通常不要设置
+`wait_for_completion: true`，否则长任务可能触发 MCP 客户端工具超时。
+
 ### Codex 配置
 
 在项目级 `.codex/config.toml` 或全局 `~/.codex/config.toml` 中加入：
@@ -145,6 +152,7 @@ uv run vuln-judger mcp \
 [mcp_servers.vuln-judger]
 type = "stdio"
 command = "uv"
+enabled = true
 args = [
   "--directory",
   "/path/to/vuln_judger",

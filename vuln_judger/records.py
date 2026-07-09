@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from .models import RunReport, to_jsonable
 
@@ -19,9 +20,13 @@ class RunRecordStore:
 
     def save_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         path = self._path(str(payload.get("run_id") or "run-unknown"))
-        tmp_path = path.with_name(path.name + ".tmp")
-        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        tmp_path.replace(path)
+        tmp_path = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            tmp_path.replace(path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
         return payload
 
     def get(self, run_id: str) -> Optional[Dict[str, Any]]:

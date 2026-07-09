@@ -13,7 +13,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from unittest.mock import patch
 
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
@@ -28,6 +28,7 @@ from vuln_judger.api import (
 from vuln_judger.codex_runner import (
     DEFAULT_CODEX_WORKSPACES_DIR,
     CodexDrivenRunner,
+    CodexRunnerStopped,
     CodexTmuxSession,
     _ensure_codex_project_trust,
     _prepare_codex_agent_dirs,
@@ -39,6 +40,7 @@ from vuln_judger.llm import LLMClient
 from vuln_judger.logging_config import DEFAULT_LOG_RETENTION_DAYS, configure_logging, daily_log_path, logger
 from vuln_judger.mcp import MCPStdioClient
 from vuln_judger.mcp_config import MCPServerStore
+from vuln_judger.mcp_server import JudgerMCPServer, JudgerMCPSettings
 from vuln_judger.models import AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, Finding, RunConfig, SourceLocation, Verdict, to_jsonable
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
@@ -49,6 +51,34 @@ from vuln_judger.source import SourceIndexer, detect_project_languages
 
 
 class PipelineTests(unittest.TestCase):
+    def test_run_record_store_supports_concurrent_progress_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunRecordStore(root)
+            start = Event()
+            errors = []
+            errors_lock = Lock()
+
+            def write_progress(worker: int) -> None:
+                start.wait()
+                try:
+                    for sequence in range(30):
+                        store.save_payload({"run_id": "run-concurrent", "worker": worker, "sequence": sequence})
+                except Exception as exc:
+                    with errors_lock:
+                        errors.append(exc)
+
+            threads = [Thread(target=write_progress, args=(worker,)) for worker in range(6)]
+            for thread in threads:
+                thread.start()
+            start.set()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            self.assertEqual(errors, [])
+            self.assertIsNotNone(store.get("run-concurrent"))
+            self.assertEqual(list(root.glob("*.tmp")), [])
+
     def test_project_languages_are_detected_from_source_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2273,6 +2303,7 @@ for raw in sys.stdin.buffer:
                     runner.run(
                         config,
                         store=Store(root / "records"),
+                        run_origin="mcp",
                         progress_callback=lambda payload: captured.append(dict(payload)),
                     )
 
@@ -2280,6 +2311,7 @@ for raw in sys.stdin.buffer:
             self.assertEqual({item["role"] for item in first_with_sessions["codex_sessions"]}, {"moderator", "affirmative", "negative"})
             self.assertIn("Codex-driven session 元数据已创建", "\n".join(first_with_sessions["diagnostics"]))
             self.assertEqual(first_with_sessions["status"], "running")
+            self.assertEqual(first_with_sessions["run_origin"], "mcp")
 
     def test_provider_store_masks_key_and_resolves_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2786,6 +2818,113 @@ for raw in sys.stdin.buffer:
                 llm_server.server_close()
                 llm_thread.join(timeout=5)
 
+    def test_vuln_judger_mcp_server_defaults_to_async_codex_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            captured = {}
+
+            class FakeCodexRunner:
+                def __init__(self, *, records_dir):
+                    captured["records_dir"] = records_dir
+
+                def run(self, config, *, store, run_origin, should_stop=None):
+                    captured["config"] = config
+                    captured["run_origin"] = run_origin
+                    payload = {
+                        "run_id": config.run_id,
+                        "status": "completed",
+                        "run_origin": run_origin,
+                        "engine": "codex",
+                        "created_at": "2026-07-09T00:00:00Z",
+                        "source_path": str(config.source_path),
+                        "sarif_path": str(config.sarif_path),
+                        "finding_count": 0,
+                        "completed_finding_count": 0,
+                        "reports": [],
+                        "diagnostics": [],
+                        "config": {"engine": "codex"},
+                    }
+                    store.save_payload(payload)
+                    return payload
+
+            server = JudgerMCPServer(
+                JudgerMCPSettings(
+                    records_dir=root / "records",
+                    providers_file=root / "providers.json",
+                    mcp_servers_file=root / "mcp.json",
+                    skills_file=root / "skills.json",
+                    agents_dir=root / "agents",
+                )
+            )
+            with patch("vuln_judger.mcp_server.CodexDrivenRunner", FakeCodexRunner):
+                started = server._judge_report(
+                    {
+                        "report_path": str(root / "report.md"),
+                        "source_path": str(root / "source"),
+                    }
+                )
+                deadline = time.monotonic() + 2
+                completed = None
+                while time.monotonic() < deadline:
+                    completed = server.records.get(started["run_id"])
+                    if completed and completed.get("status") == "completed":
+                        break
+                    time.sleep(0.01)
+
+            server.close()
+            self.assertTrue(started["asynchronous"])
+            self.assertEqual(started["engine"], "codex")
+            self.assertEqual(started["poll"]["tool"], "get_run")
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["run_origin"], "mcp")
+            self.assertEqual(captured["config"].engine, "codex")
+            self.assertIsNone(captured["config"].mcp_servers_file)
+            self.assertFalse(captured["config"].enable_llm)
+            self.assertEqual(captured["run_origin"], "mcp")
+
+    def test_vuln_judger_mcp_server_can_stop_async_codex_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            class BlockingCodexRunner:
+                def __init__(self, *, records_dir):
+                    self.records_dir = records_dir
+
+                def run(self, config, *, store, run_origin, should_stop=None):
+                    while should_stop is None or not should_stop():
+                        time.sleep(0.01)
+                    raise CodexRunnerStopped("stopped by test")
+
+            server = JudgerMCPServer(
+                JudgerMCPSettings(
+                    records_dir=root / "records",
+                    providers_file=root / "providers.json",
+                    mcp_servers_file=root / "mcp.json",
+                    skills_file=root / "skills.json",
+                    agents_dir=root / "agents",
+                )
+            )
+            with patch("vuln_judger.mcp_server.CodexDrivenRunner", BlockingCodexRunner):
+                started = server._judge_report(
+                    {
+                        "report_path": str(root / "report.md"),
+                        "source_path": str(root / "source"),
+                    }
+                )
+                stopping = server._stop_run({"run_id": started["run_id"]})
+                deadline = time.monotonic() + 2
+                stopped = None
+                while time.monotonic() < deadline:
+                    stopped = server.records.get(started["run_id"])
+                    if stopped and stopped.get("status") == "stopped":
+                        break
+                    time.sleep(0.01)
+
+            server.close()
+            self.assertTrue(stopping["stop_requested"])
+            self.assertEqual(stopped["status"], "stopped")
+            self.assertEqual(stopped["run_origin"], "mcp")
+
     def test_vuln_judger_mcp_server_tools_run_and_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2814,6 +2953,9 @@ for raw in sys.stdin.buffer:
                 self.assertIn("one_round_judge", tools)
                 self.assertIn("collect_evidence", tools)
                 self.assertIn("export_run_markdown", tools)
+                self.assertIn("stop_run", tools)
+                judge_spec = next(tool for tool in tool_specs if tool.get("name") == "judge_report")
+                self.assertEqual(judge_spec["inputSchema"]["properties"]["engine"]["default"], "codex")
                 tool_schema_text = json.dumps(tool_specs, ensure_ascii=False)
                 self.assertNotIn("agentic_atlas", tool_schema_text)
                 self.assertNotIn("agentic_atlas_direct", tool_schema_text)
@@ -2892,6 +3034,7 @@ for raw in sys.stdin.buffer:
                         {
                             "report_path": str(sarif),
                             "source_path": str(root),
+                            "engine": "builtin",
                             "skills_path": str(skills),
                             "enable_external_tools": False,
                             "save": True,

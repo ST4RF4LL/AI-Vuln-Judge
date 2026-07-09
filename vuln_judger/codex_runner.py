@@ -283,6 +283,7 @@ class CodexDrivenRunner:
         config: RunConfig,
         *,
         store: RunRecordStore,
+        run_origin: str = "web",
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
@@ -300,7 +301,7 @@ class CodexDrivenRunner:
         agent_configs = _codex_agent_configs(config)
         session_dirs = _prepare_codex_agent_dirs(run_dir, agent_configs, source_path)
         sessions = self._sessions(run_id, source_path, run_dir, session_dirs)
-        payload = _base_payload(config, run_id, created_at, languages, run_dir, sessions, agent_configs)
+        payload = _base_payload(config, run_id, created_at, languages, run_dir, sessions, agent_configs, run_origin)
 
         def emit(status: str, **updates: Any) -> None:
             payload.update(updates)
@@ -982,12 +983,13 @@ def _base_payload(
     run_dir: Path,
     sessions: Dict[str, CodexTmuxSession],
     agent_configs: Dict[str, AgentConfig],
+    run_origin: str,
 ) -> Dict[str, Any]:
     session_payload = [to_jsonable(session.info()) for session in sessions.values()]
     return {
         "run_id": run_id,
         "status": "running",
-        "run_origin": "web",
+        "run_origin": run_origin,
         "engine": CODEX_ENGINE,
         "created_at": created_at,
         "source_path": str(config.source_path),

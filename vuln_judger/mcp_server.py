@@ -7,12 +7,14 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event, Lock, Thread
 from typing import Any, Dict, Iterable, List, Optional, Sequence, TextIO, Tuple
 from uuid import uuid4
 
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
 from .analyzers import AnalyzerSettings, AnalyzerSuite
 from .api import DEFAULT_RECORDS_DIR, _export_run_markdown
+from .codex_runner import CODEX_ENGINE, CodexDrivenRunner, CodexRunnerStopped, stop_sessions
 from .debate import DebateOrchestrator
 from .evidence import EvidenceCollector
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE
@@ -21,13 +23,14 @@ from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
 from .records import RunRecordStore, normalize_run_origin
 from .sarif import load_report
-from .skills import DEFAULT_SKILLS_FILE, load_project_context
+from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore, load_project_context
 from .source import SourceIndexer
 
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "vuln-judger-mcp"
 SERVER_VERSION = "0.1.0"
+BUILTIN_ENGINE = "builtin"
 
 
 @dataclass
@@ -37,6 +40,12 @@ class JudgerMCPSettings:
     mcp_servers_file: Path = DEFAULT_MCP_SERVERS_FILE
     skills_file: Path = DEFAULT_SKILLS_FILE
     agents_dir: Path = DEFAULT_AGENTS_DIR
+
+
+@dataclass
+class _ActiveRun:
+    stop_event: Event
+    thread: Thread
 
 
 class JudgerMCPServer:
@@ -51,17 +60,32 @@ class JudgerMCPServer:
         self.stdout = stdout or sys.stdout
         self.records = RunRecordStore(self.settings.records_dir)
         self.agent_store = AgentDirectoryStore(self.settings.agents_dir)
+        self.skill_store = SkillSourceStore(self.settings.skills_file)
+        self._active_runs: Dict[str, _ActiveRun] = {}
+        self._active_runs_lock = Lock()
         self.tools = _tool_specs()
 
     def serve_forever(self) -> None:
-        while True:
-            incoming = _read_message(self.stdin)
-            if incoming is None:
-                return
-            message, framing = incoming
-            response = self._handle_message(message)
-            if response is not None:
-                _write_message(self.stdout, response, framing)
+        try:
+            while True:
+                incoming = _read_message(self.stdin)
+                if incoming is None:
+                    return
+                message, framing = incoming
+                response = self._handle_message(message)
+                if response is not None:
+                    _write_message(self.stdout, response, framing)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        with self._active_runs_lock:
+            active = list(self._active_runs.items())
+        for run_id, task in active:
+            task.stop_event.set()
+            stop_sessions(self.records.get(run_id) or {})
+        for _, task in active:
+            task.thread.join(timeout=1)
 
     def _handle_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         request_id = message.get("id")
@@ -122,42 +146,167 @@ class JudgerMCPServer:
             return self._get_finding(arguments)
         if name == "export_run_markdown":
             return self._export_run_markdown(arguments)
+        if name == "stop_run":
+            return self._stop_run(arguments)
         raise ValueError(f"Unknown tool: {name}")
 
     def _judge_report(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        engine = str(arguments.get("engine") or CODEX_ENGINE).strip().lower()
+        if engine not in {CODEX_ENGINE, BUILTIN_ENGINE}:
+            raise ValueError(f"Unsupported engine: {engine}")
         report_path = _required_path(arguments, "report_path")
         source_path = _required_path(arguments, "source_path")
-        skills_path = _optional_path(arguments.get("skills_path"))
-        run_id = _optional_text(arguments.get("run_id"))
-        enable_llm = bool(arguments.get("enable_llm", False))
+        skills_path = self._skills_path(arguments)
+        run_id = _optional_text(arguments.get("run_id")) or f"run-{uuid4().hex[:12]}"
+        codex_engine = engine == CODEX_ENGINE
         config = RunConfig(
             sarif_path=report_path,
             source_path=source_path,
+            engine=engine,
             skills_path=skills_path,
-            providers_file=_optional_path(arguments.get("providers_file")) or self.settings.providers_file,
-            mcp_servers_file=_optional_path(arguments.get("mcp_servers_file")) or self.settings.mcp_servers_file,
+            providers_file=None if codex_engine else _optional_path(arguments.get("providers_file")) or self.settings.providers_file,
+            mcp_servers_file=None if codex_engine else _optional_path(arguments.get("mcp_servers_file")) or self.settings.mcp_servers_file,
             run_id=run_id,
             max_rounds=int(arguments.get("max_rounds") or 4),
-            auto_index_tools=bool(arguments.get("auto_index_tools", False)),
-            enable_external_tools=bool(arguments.get("enable_external_tools", True)),
-            enable_llm=enable_llm,
-            affirmative_provider_id=_optional_text(arguments.get("affirmative_provider_id")),
-            negative_provider_id=_optional_text(arguments.get("negative_provider_id")),
-            moderator_provider_id=_optional_text(arguments.get("moderator_provider_id")),
+            auto_index_tools=False if codex_engine else bool(arguments.get("auto_index_tools", False)),
+            enable_external_tools=True if codex_engine else bool(arguments.get("enable_external_tools", True)),
+            enable_llm=False if codex_engine else bool(arguments.get("enable_llm", False)),
+            affirmative_provider_id=None if codex_engine else _optional_text(arguments.get("affirmative_provider_id")),
+            negative_provider_id=None if codex_engine else _optional_text(arguments.get("negative_provider_id")),
+            moderator_provider_id=None if codex_engine else _optional_text(arguments.get("moderator_provider_id")),
             affirmative_agent=self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile"))),
             negative_agent=self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile"))),
             moderator_agent=self.agent_store.agent("moderator", _optional_text(arguments.get("moderator_agent_profile"))),
         )
+        if codex_engine:
+            if not bool(arguments.get("save", True)):
+                raise ValueError("save=false is not supported by the codex engine because progress is persisted for polling")
+            if bool(arguments.get("wait_for_completion", False)):
+                try:
+                    payload = self._run_codex_report(config)
+                except Exception as exc:
+                    self._record_codex_failure(config, exc)
+                    raise
+                return self._completed_run_result(payload, include_report=bool(arguments.get("include_report", False)))
+            return self._start_codex_report(config)
+        return self._run_builtin_report(config, arguments)
+
+    def _skills_path(self, arguments: Dict[str, Any]) -> Optional[Path]:
+        skills_path = _optional_path(arguments.get("skills_path"))
+        skill_source_id = _optional_text(arguments.get("skill_source_id"))
+        if skills_path is not None or not skill_source_id:
+            return skills_path
+        source = self.skill_store.get(skill_source_id)
+        if source is None:
+            raise ValueError(f"Unknown skill_source_id: {skill_source_id}")
+        return Path(source.path).expanduser().resolve()
+
+    def _run_builtin_report(self, config: RunConfig, arguments: Dict[str, Any]) -> Dict[str, Any]:
         report = run_judgement(config)
         saved = bool(arguments.get("save", True))
         payload = to_jsonable(report)
         payload["run_origin"] = "mcp"
+        payload["engine"] = BUILTIN_ENGINE
+        payload["config"] = _config_snapshot(config)
         if saved:
             self.records.save_payload(payload)
         result = _run_summary(payload)
         result["saved"] = saved
         result["record_path"] = str(self.records._path(report.run_id)) if saved else None
         if bool(arguments.get("include_report", False)):
+            result["report"] = payload
+        return result
+
+    def _start_codex_report(self, config: RunConfig) -> Dict[str, Any]:
+        run_id = str(config.run_id)
+        queued = _queued_codex_payload(config)
+        stop_event = Event()
+        thread = Thread(
+            target=self._codex_run_worker,
+            args=(config, stop_event),
+            name=f"vuln-judger-mcp-{run_id}",
+            daemon=True,
+        )
+        with self._active_runs_lock:
+            if run_id in self._active_runs:
+                raise ValueError(f"Run is already active: {run_id}")
+            existing = self.records.get(run_id)
+            if existing is not None:
+                raise ValueError(f"Run already exists: {run_id}")
+            self._active_runs[run_id] = _ActiveRun(stop_event=stop_event, thread=thread)
+            self.records.save_payload(queued)
+        thread.start()
+        result = _run_summary(queued)
+        result.update(
+            {
+                "saved": True,
+                "asynchronous": True,
+                "record_path": str(self.records._path(run_id)),
+                "poll": {"tool": "get_run", "arguments": {"run_id": run_id}},
+                "stop": {"tool": "stop_run", "arguments": {"run_id": run_id}},
+            }
+        )
+        return result
+
+    def _codex_run_worker(self, config: RunConfig, stop_event: Event) -> None:
+        try:
+            self._run_codex_report(config, stop_event=stop_event)
+        except Exception as exc:
+            self._record_codex_failure(config, exc, stopped=stop_event.is_set())
+        finally:
+            with self._active_runs_lock:
+                self._active_runs.pop(str(config.run_id), None)
+
+    def _run_codex_report(self, config: RunConfig, stop_event: Optional[Event] = None) -> Dict[str, Any]:
+        runner = CodexDrivenRunner(records_dir=self.records.root)
+        try:
+            payload = runner.run(
+                config,
+                store=self.records,
+                run_origin="mcp",
+                should_stop=stop_event.is_set if stop_event is not None else None,
+            )
+        except CodexRunnerStopped:
+            current = self.records.get(str(config.run_id)) or _queued_codex_payload(config)
+            stop_sessions(current)
+            stopped = dict(current)
+            stopped["status"] = "stopped"
+            stopped["run_origin"] = "mcp"
+            stopped["engine"] = CODEX_ENGINE
+            stopped["error"] = None
+            self.records.save_payload(stopped)
+            return stopped
+        payload["run_origin"] = "mcp"
+        payload["engine"] = CODEX_ENGINE
+        payload["config"] = payload.get("config") or _config_snapshot(config)
+        self.records.save_payload(payload)
+        return payload
+
+    def _record_codex_failure(self, config: RunConfig, exc: Exception, *, stopped: bool = False) -> Dict[str, Any]:
+        run_id = str(config.run_id)
+        current = self.records.get(run_id) or _queued_codex_payload(config)
+        stop_sessions(current)
+        failed = dict(current)
+        failed["status"] = "stopped" if stopped else "failed"
+        failed["error"] = None if stopped else str(exc)
+        diagnostics = list(failed.get("diagnostics") or [])
+        diagnostics.append(str(exc))
+        failed["diagnostics"] = diagnostics
+        failed["run_origin"] = "mcp"
+        failed["engine"] = CODEX_ENGINE
+        self.records.save_payload(failed)
+        return failed
+
+    def _completed_run_result(self, payload: Dict[str, Any], *, include_report: bool) -> Dict[str, Any]:
+        result = _run_summary(payload)
+        result.update(
+            {
+                "saved": True,
+                "asynchronous": False,
+                "record_path": str(self.records._path(str(payload.get("run_id")))),
+            }
+        )
+        if include_report:
             result["report"] = payload
         return result
 
@@ -177,6 +326,7 @@ class JudgerMCPServer:
             "run_id": run_id,
             "status": "completed",
             "run_origin": "mcp",
+            "engine": BUILTIN_ENGINE,
             "created_at": created_at,
             "source_path": str(_required_path(arguments, "source_path")),
             "sarif_path": str(_required_path(arguments, "report_path")),
@@ -191,6 +341,13 @@ class JudgerMCPServer:
                 "affirmative": to_jsonable(self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile")))),
                 "negative": to_jsonable(self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile")))),
                 "moderator": to_jsonable(self.agent_store.agent("moderator", _optional_text(arguments.get("moderator_agent_profile")))),
+            },
+            "config": {
+                "engine": BUILTIN_ENGINE,
+                "report_path": str(_required_path(arguments, "report_path")),
+                "source_path": str(_required_path(arguments, "source_path")),
+                "max_rounds": 1,
+                "enable_external_tools": bool(arguments.get("enable_external_tools", True)),
             },
         }
         saved = bool(arguments.get("save", True))
@@ -213,6 +370,7 @@ class JudgerMCPServer:
             "saved": saved,
             "record_path": record_path,
             "configuration": {
+                "engine": BUILTIN_ENGINE,
                 "max_rounds": 1,
                 "enable_external_tools": bool(arguments.get("enable_external_tools", True)),
                 "auto_index_tools": bool(arguments.get("auto_index_tools", False)),
@@ -323,6 +481,34 @@ class JudgerMCPServer:
         run = self._load_run(arguments)
         return {"run_id": run.get("run_id"), "markdown": _export_run_markdown(run)}
 
+    def _stop_run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        run_id = _required_text(arguments, "run_id")
+        with self._active_runs_lock:
+            active = self._active_runs.get(run_id)
+            if active is not None:
+                active.stop_event.set()
+        run = self.records.get(run_id)
+        if run is None:
+            raise ValueError(f"Run not found: {run_id}")
+        if str(run.get("status") or "") in {"completed", "failed", "stopped"}:
+            result = _run_summary(run)
+            result["stop_requested"] = False
+            result["message"] = f"Run is already {run.get('status')}: {run_id}"
+            return result
+        if active is None:
+            result = _run_summary(run)
+            result["stop_requested"] = False
+            result["message"] = f"Run is not active: {run_id}"
+            return result
+        stop_sessions(run)
+        stopping = dict(run)
+        stopping["status"] = "stopping"
+        stopping["run_origin"] = "mcp"
+        self.records.save_payload(stopping)
+        result = _run_summary(stopping)
+        result["stop_requested"] = True
+        return result
+
     def _load_run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         run_id = _required_text(arguments, "run_id")
         run = self.records.get(run_id)
@@ -362,11 +548,18 @@ def _tool_specs() -> List[Dict[str, Any]]:
     return [
         _tool(
             "judge_report",
-            "Run vuln-judger on a SARIF or Markdown report and optionally save the run record.",
+            "Start a vuln-judger review. The default codex engine runs asynchronously; poll get_run with the returned run_id.",
             {
                 "report_path": {"type": "string", "description": "SARIF/JSON/Markdown report path."},
                 "source_path": {"type": "string", "description": "Source tree root path."},
+                "engine": {
+                    "type": "string",
+                    "enum": [CODEX_ENGINE, BUILTIN_ENGINE],
+                    "default": CODEX_ENGINE,
+                    "description": "codex starts the refactored three-session workflow; builtin keeps the legacy in-process pipeline.",
+                },
                 "skills_path": {"type": "string", "description": "Optional project skills directory."},
+                "skill_source_id": {"type": "string", "description": "Optional configured Skill Source id."},
                 "mcp_servers_file": {"type": "string"},
                 "max_rounds": {"type": "integer", "minimum": 1, "default": 4},
                 "enable_external_tools": {"type": "boolean", "default": True},
@@ -383,7 +576,16 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "affirmative_agent_profile": {"type": "string"},
                 "negative_agent_profile": {"type": "string"},
                 "moderator_agent_profile": {"type": "string"},
-                "save": {"type": "boolean", "default": True},
+                "save": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "The codex engine requires true so asynchronous progress can be polled.",
+                },
+                "wait_for_completion": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Codex only. Prefer false to avoid MCP tool timeouts.",
+                },
                 "include_report": {"type": "boolean", "default": False},
                 "run_id": {"type": "string"},
             },
@@ -391,7 +593,7 @@ def _tool_specs() -> List[Dict[str, Any]]:
         ),
         _tool(
             "one_round_judge",
-            "Quickly validate one finding with default settings, one debate round, evidence collection, and missing-evidence guidance.",
+            "Quickly validate one finding with the legacy builtin engine, one debate round, and missing-evidence guidance.",
             {
                 "report_path": {"type": "string", "description": "SARIF/JSON/Markdown report path."},
                 "source_path": {"type": "string", "description": "Source tree root path."},
@@ -455,6 +657,12 @@ def _tool_specs() -> List[Dict[str, Any]]:
         _tool(
             "export_run_markdown",
             "Export a saved run as Markdown.",
+            {"run_id": {"type": "string"}},
+            ["run_id"],
+        ),
+        _tool(
+            "stop_run",
+            "Request cancellation of an asynchronous codex review started by this MCP server.",
             {"run_id": {"type": "string"}},
             ["run_id"],
         ),
@@ -912,6 +1120,51 @@ def _dedupe_missing(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
+def _config_snapshot(config: RunConfig) -> Dict[str, Any]:
+    return {
+        "engine": config.engine,
+        "report_path": str(config.sarif_path),
+        "source_path": str(config.source_path),
+        "skills_path": str(config.skills_path) if config.skills_path is not None else None,
+        "max_rounds": config.max_rounds,
+        "auto_index_tools": config.auto_index_tools,
+        "enable_external_tools": config.enable_external_tools,
+        "enable_llm": config.enable_llm,
+        "affirmative_provider_id": config.affirmative_provider_id,
+        "negative_provider_id": config.negative_provider_id,
+        "moderator_provider_id": config.moderator_provider_id,
+    }
+
+
+def _queued_codex_payload(config: RunConfig) -> Dict[str, Any]:
+    return {
+        "run_id": config.run_id,
+        "status": "queued",
+        "run_origin": "mcp",
+        "engine": CODEX_ENGINE,
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "source_path": str(config.source_path),
+        "sarif_path": str(config.sarif_path),
+        "languages": [],
+        "finding_count": 0,
+        "project_context_facts": 0,
+        "reports": [],
+        "diagnostics": ["Codex-driven MCP run queued."],
+        "llm_providers": {"enabled": False, "engine": CODEX_ENGINE},
+        "agent_configs": {
+            "affirmative": to_jsonable(config.affirmative_agent) if config.affirmative_agent else None,
+            "negative": to_jsonable(config.negative_agent) if config.negative_agent else None,
+            "moderator": to_jsonable(config.moderator_agent) if config.moderator_agent else None,
+        },
+        "completed_finding_count": 0,
+        "current_finding_id": None,
+        "current_finding_index": None,
+        "resume_from_finding_id": None,
+        "resume_from_finding_index": 0,
+        "config": _config_snapshot(config),
+    }
+
+
 def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
     reports = run.get("reports") or []
     counts: Dict[str, int] = {}
@@ -932,13 +1185,18 @@ def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "run_id": run.get("run_id"),
         "status": run.get("status", "completed"),
+        "engine": run.get("engine") or (run.get("config") or {}).get("engine") or BUILTIN_ENGINE,
         "run_origin": normalize_run_origin(run),
         "created_at": run.get("created_at"),
         "source_path": run.get("source_path"),
         "sarif_path": run.get("sarif_path"),
         "languages": run.get("languages", []),
         "finding_count": run.get("finding_count", len(reports)),
+        "completed_finding_count": run.get("completed_finding_count", len(reports)),
+        "current_finding_id": run.get("current_finding_id"),
+        "current_finding_index": run.get("current_finding_index"),
         "verdict_counts": counts,
         "findings": finding_summaries,
         "diagnostics": run.get("diagnostics", []),
+        "error": run.get("error"),
     }
