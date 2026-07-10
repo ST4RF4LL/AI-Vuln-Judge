@@ -348,6 +348,12 @@ Codex 三方复核引擎在 Moderator 拆分报告后，会立即把全部 findi
 尚未裁决的 finding 标记为“未完成”或“处理中”。暂停后恢复时，新 session 会保留已完成结果，
 清理首个未完成 finding 的旧阶段输出，并从该 finding 重新开始。
 
+启动 Codex 任务时可设置“静默提醒时间”，默认 60 分钟。等待下一阶段 JSON 输出期间，如果
+目标 Codex session 仍有输出或处于执行状态，静默计时器会重新开始；如果上一阶段已经交付而
+下一 Agent 持续静默，系统会发送简短的继续任务提醒。退出的 session 会重启并重新接收完整阶段
+prompt。默认不再用一小时硬超时终止阶段；需要绝对步骤超时时可显式设置
+`VULN_JUDGER_CODEX_STEP_TIMEOUT`（秒）。
+
 默认日志按天写入 `.vuln-judger/logs/vuln-judger-YYYY-MM-DD.log`，会记录 API 启动、任务创建、
 后台任务执行、LLM 请求状态、Provider 连通性测试和异常 traceback。日志使用 key=value 文本格式，
 默认保留 31 天，且已被 `.gitignore` 忽略。
@@ -361,6 +367,7 @@ curl -X POST http://127.0.0.1:8765/runs \
     "report_path": "report.md",
     "source_path": "./target-project",
     "skills_path": "./skills",
+    "silence_reminder_minutes": 60,
     "enable_llm": true,
     "affirmative_provider_id": "openai-main",
     "negative_provider_id": "qwen-fast",

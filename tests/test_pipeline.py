@@ -29,11 +29,14 @@ from vuln_judger.api import (
 )
 from vuln_judger.codex_runner import (
     DEFAULT_CODEX_WORKSPACES_DIR,
+    SILENCE_REMINDER_PROMPT,
     CodexDrivenRunner,
+    CodexRunnerError,
     CodexRunnerStopped,
     CodexTmuxSession,
     _ensure_codex_project_trust,
     _prepare_codex_agent_dirs,
+    _wait_json,
 )
 from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
@@ -43,7 +46,7 @@ from vuln_judger.logging_config import DEFAULT_LOG_RETENTION_DAYS, configure_log
 from vuln_judger.mcp import MCPStdioClient
 from vuln_judger.mcp_config import MCPServerStore
 from vuln_judger.mcp_server import JudgerMCPServer, JudgerMCPSettings
-from vuln_judger.models import AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, Finding, RunConfig, SourceLocation, Verdict, to_jsonable
+from vuln_judger.models import DEFAULT_SILENCE_REMINDER_MINUTES, AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, Finding, RunConfig, SourceLocation, Verdict, to_jsonable
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunRecordStore
@@ -1961,6 +1964,10 @@ for raw in sys.stdin.buffer:
         self.assertIn('class="run-agent-control"', html)
         self.assertIn('id="run-tool-provider-options"', html)
         self.assertIn('id="run-codex-config-note"', html)
+        self.assertIn('id="run-silence-reminder-minutes"', html)
+        self.assertIn('静默提醒时间（分钟）', html)
+        self.assertIn("silence_reminder_minutes: Number(el.runSilenceReminderMinutes.value || 60)", html)
+        self.assertIn("config.silence_reminder_minutes || 60", html)
         self.assertIn('function updateRunEngineVisibility()', html)
         self.assertIn("el.runProviderAgentGrid.hidden = false", html)
         self.assertIn("document.querySelectorAll('.run-provider-control')", html)
@@ -2150,6 +2157,169 @@ for raw in sys.stdin.buffer:
             self.assertIn(["tmux", "send-keys", "-t", session.target, "C-m"], tmux_calls)
             self.assertNotIn(["tmux", "send-keys", "-t", session.target, "Enter"], tmux_calls)
 
+    def test_wait_json_reminds_idle_next_agent_after_previous_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "affirmative.json"
+            output = root / "negative.json"
+            previous.write_text('{"position":"TRUE_POSITIVE"}\n', encoding="utf-8")
+            events = []
+
+            class FakeSession:
+                role = "negative"
+
+                def __init__(self):
+                    self.sent = []
+
+                def is_live(self):
+                    return True
+
+                def capture(self):
+                    return "idle prompt"
+
+                def send(self, text):
+                    self.sent.append(text)
+                    output.write_text('{"position":"FALSE_POSITIVE"}\n', encoding="utf-8")
+
+            session = FakeSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                previous_output_path=previous,
+                stage_prompt="full negative prompt",
+                silence_reminder_seconds=0.03,
+                watchdog_callback=events.append,
+                poll_interval_seconds=0.002,
+                activity_poll_seconds=0.01,
+            )
+
+            self.assertEqual(result["position"], "FALSE_POSITIVE")
+            self.assertEqual(session.sent, [SILENCE_REMINDER_PROMPT])
+            self.assertEqual(events[0]["kind"], "reminder")
+            self.assertEqual(events[0]["role"], "negative")
+
+    def test_wait_json_resets_silence_timer_while_agent_is_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "previous.json"
+            output = root / "result.json"
+            previous.write_text("{}\n", encoding="utf-8")
+
+            class ActiveSession:
+                role = "affirmative"
+
+                def __init__(self):
+                    self.capture_count = 0
+                    self.sent = []
+
+                def is_live(self):
+                    return True
+
+                def capture(self):
+                    self.capture_count += 1
+                    if self.capture_count == 5:
+                        output.write_text('{"summary":"done"}\n', encoding="utf-8")
+                    return f"agent output {self.capture_count}"
+
+                def send(self, text):
+                    self.sent.append(text)
+
+            session = ActiveSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                previous_output_path=previous,
+                stage_prompt="full affirmative prompt",
+                silence_reminder_seconds=0.025,
+                poll_interval_seconds=0.002,
+                activity_poll_seconds=0.007,
+            )
+
+            self.assertEqual(result["summary"], "done")
+            self.assertEqual(session.sent, [])
+
+    def test_wait_json_does_not_remind_when_previous_output_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "previous.json"
+            output = root / "result.json"
+            previous.write_text("{invalid", encoding="utf-8")
+
+            class IdleSession:
+                role = "negative"
+
+                def __init__(self):
+                    self.sent = []
+
+                def is_live(self):
+                    return True
+
+                def capture(self):
+                    return "idle prompt"
+
+                def send(self, text):
+                    self.sent.append(text)
+
+            session = IdleSession()
+            with self.assertRaises(CodexRunnerError):
+                _wait_json(
+                    output,
+                    should_stop=None,
+                    timeout_seconds=0.06,
+                    reminder_session=session,
+                    previous_output_path=previous,
+                    stage_prompt="full negative prompt",
+                    silence_reminder_seconds=0.015,
+                    poll_interval_seconds=0.002,
+                    activity_poll_seconds=0.005,
+                )
+
+            self.assertEqual(session.sent, [])
+
+    def test_wait_json_redelivers_full_prompt_when_session_exited(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "findings.json"
+            events = []
+
+            class ExitedSession:
+                role = "moderator"
+
+                def __init__(self):
+                    self.live = False
+                    self.sent = []
+
+                def is_live(self):
+                    return self.live
+
+                def capture(self):
+                    return "restarted"
+
+                def send(self, text):
+                    self.live = True
+                    self.sent.append(text)
+                    output.write_text('{"findings":[]}\n', encoding="utf-8")
+
+            session = ExitedSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                stage_prompt="full moderator prompt",
+                silence_reminder_seconds=0.02,
+                watchdog_callback=events.append,
+                poll_interval_seconds=0.002,
+                activity_poll_seconds=0.01,
+            )
+
+            self.assertEqual(result, {"findings": []})
+            self.assertEqual(session.sent, ["full moderator prompt"])
+            self.assertEqual(events[0]["kind"], "prompt_redelivered")
+
     def test_codex_project_trust_is_written_for_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2209,6 +2379,29 @@ for raw in sys.stdin.buffer:
             self.assertIsNone(config.negative_agent)
             self.assertIsNone(config.moderator_agent)
 
+    def test_codex_silence_reminder_config_defaults_and_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_payload = {
+                "report_path": str(root / "report.sarif"),
+                "source_path": str(root / "source"),
+                "engine": "codex",
+            }
+
+            default_config = _config_from_payload(base_payload, root / "providers.json")
+            minimum_config = _config_from_payload(
+                {**base_payload, "silence_reminder_minutes": 0},
+                root / "providers.json",
+            )
+            maximum_config = _config_from_payload(
+                {**base_payload, "silence_reminder_minutes": 9999},
+                root / "providers.json",
+            )
+
+            self.assertEqual(default_config.silence_reminder_minutes, DEFAULT_SILENCE_REMINDER_MINUTES)
+            self.assertEqual(minimum_config.silence_reminder_minutes, 1)
+            self.assertEqual(maximum_config.silence_reminder_minutes, 1440)
+
     def test_codex_config_uses_agent_profiles_from_store(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2266,6 +2459,7 @@ for raw in sys.stdin.buffer:
                     "engine": "codex",
                     "report_path": str(root / "report.md"),
                     "source_path": str(root / "source"),
+                    "silence_reminder_minutes": 17,
                 },
             }
 
@@ -2281,6 +2475,7 @@ for raw in sys.stdin.buffer:
             self.assertEqual(len(config.resume_reports), 3)
             self.assertEqual(config.resume_from_finding_index, 1)
             self.assertEqual(config.resume_reports[0]["finding_id"], "finding-1")
+            self.assertEqual(config.silence_reminder_minutes, 17)
 
     def test_codex_agent_profile_files_are_written_per_session(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3081,6 +3276,7 @@ for raw in sys.stdin.buffer:
                     {
                         "report_path": str(root / "report.md"),
                         "source_path": str(root / "source"),
+                        "silence_reminder_minutes": 23,
                     }
                 )
                 deadline = time.monotonic() + 2
@@ -3100,6 +3296,7 @@ for raw in sys.stdin.buffer:
             self.assertEqual(captured["config"].engine, "codex")
             self.assertIsNone(captured["config"].mcp_servers_file)
             self.assertFalse(captured["config"].enable_llm)
+            self.assertEqual(captured["config"].silence_reminder_minutes, 23)
             self.assertEqual(captured["run_origin"], "mcp")
 
     def test_vuln_judger_mcp_server_can_stop_async_codex_run(self):
@@ -3176,6 +3373,10 @@ for raw in sys.stdin.buffer:
                 self.assertIn("stop_run", tools)
                 judge_spec = next(tool for tool in tool_specs if tool.get("name") == "judge_report")
                 self.assertEqual(judge_spec["inputSchema"]["properties"]["engine"]["default"], "codex")
+                self.assertEqual(
+                    judge_spec["inputSchema"]["properties"]["silence_reminder_minutes"]["default"],
+                    DEFAULT_SILENCE_REMINDER_MINUTES,
+                )
                 tool_schema_text = json.dumps(tool_specs, ensure_ascii=False)
                 self.assertNotIn("agentic_atlas", tool_schema_text)
                 self.assertNotIn("agentic_atlas_direct", tool_schema_text)

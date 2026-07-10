@@ -18,7 +18,7 @@ from .codex_runner import CODEX_ENGINE, CodexDrivenRunner, CodexRunnerStopped, s
 from .debate import DebateOrchestrator
 from .evidence import EvidenceCollector
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE
-from .models import RunConfig, SourceLocation, to_jsonable
+from .models import DEFAULT_SILENCE_REMINDER_MINUTES, RunConfig, SourceLocation, to_jsonable
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
 from .records import RunRecordStore, normalize_run_origin
@@ -169,6 +169,12 @@ class JudgerMCPServer:
             mcp_servers_file=None if codex_engine else _optional_path(arguments.get("mcp_servers_file")) or self.settings.mcp_servers_file,
             run_id=run_id,
             max_rounds=int(arguments.get("max_rounds") or 4),
+            silence_reminder_minutes=_bounded_int(
+                arguments.get("silence_reminder_minutes"),
+                default=DEFAULT_SILENCE_REMINDER_MINUTES,
+                minimum=1,
+                maximum=1440,
+            ),
             auto_index_tools=False if codex_engine else bool(arguments.get("auto_index_tools", False)),
             enable_external_tools=True if codex_engine else bool(arguments.get("enable_external_tools", True)),
             enable_llm=False if codex_engine else bool(arguments.get("enable_llm", False)),
@@ -563,6 +569,13 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "skill_source_id": {"type": "string", "description": "Optional configured Skill Source id."},
                 "mcp_servers_file": {"type": "string"},
                 "max_rounds": {"type": "integer", "minimum": 1, "default": 4},
+                "silence_reminder_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1440,
+                    "default": DEFAULT_SILENCE_REMINDER_MINUTES,
+                    "description": "Codex only. Minutes of session silence before checking the handoff and reminding the next agent.",
+                },
                 "enable_external_tools": {"type": "boolean", "default": True},
                 "auto_index_tools": {
                     "type": "boolean",
@@ -737,6 +750,14 @@ def _content_length(headers: Iterable[bytes]) -> int:
         if name.strip().lower() == b"content-length":
             return int(value.strip())
     raise ValueError("Missing Content-Length header")
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = default
+    return min(max(result, minimum), maximum)
 
 
 def _result(request_id: Any, result: Any) -> Dict[str, Any]:
@@ -1128,6 +1149,7 @@ def _config_snapshot(config: RunConfig) -> Dict[str, Any]:
         "source_path": str(config.source_path),
         "skills_path": str(config.skills_path) if config.skills_path is not None else None,
         "max_rounds": config.max_rounds,
+        "silence_reminder_minutes": config.silence_reminder_minutes,
         "auto_index_tools": config.auto_index_tools,
         "enable_external_tools": config.enable_external_tools,
         "enable_llm": config.enable_llm,

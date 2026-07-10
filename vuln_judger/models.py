@@ -6,6 +6,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
+DEFAULT_SILENCE_REMINDER_MINUTES = 60
+
+
 class Verdict(str, Enum):
     TRUE_POSITIVE = "TRUE_POSITIVE"
     FALSE_POSITIVE = "FALSE_POSITIVE"
@@ -202,6 +205,7 @@ class RunConfig:
     run_id: Optional[str] = None
     languages: List[str] = field(default_factory=list)
     max_rounds: int = 4
+    silence_reminder_minutes: int = DEFAULT_SILENCE_REMINDER_MINUTES
     auto_index_tools: bool = False
     enable_external_tools: bool = True
     enable_llm: bool = False

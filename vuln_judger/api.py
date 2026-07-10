@@ -28,7 +28,7 @@ from .evidence_graph import build_evidence_graph, graph_to_markdown
 from .llm import test_provider_connection
 from .logging_config import DEFAULT_LOG_FILE, DEFAULT_LOG_RETENTION_DAYS, configure_logging, logger
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE, MCPServerStore
-from .models import AgentConfig, RunConfig, to_jsonable
+from .models import DEFAULT_SILENCE_REMINDER_MINUTES, AgentConfig, RunConfig, to_jsonable
 from .pipeline import RunStopped, run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderStore
 from .records import RunRecordStore, normalize_run_origin
@@ -635,6 +635,12 @@ def _config_from_payload(
         mcp_servers_file=None if codex_engine else mcp_servers_file,
         run_id=run_id,
         max_rounds=int(payload.get("max_rounds") or 4),
+        silence_reminder_minutes=_bounded_int(
+            payload.get("silence_reminder_minutes"),
+            default=DEFAULT_SILENCE_REMINDER_MINUTES,
+            minimum=1,
+            maximum=1440,
+        ),
         auto_index_tools=False if codex_engine else bool(payload.get("auto_index_tools") or False),
         enable_external_tools=True if codex_engine else bool(payload.get("enable_external_tools", True)),
         enable_llm=False if codex_engine else bool(payload.get("enable_llm", False)),
@@ -1138,6 +1144,7 @@ def _config_task_snapshot(config: RunConfig) -> dict:
         "source_path": str(config.source_path),
         "skills_path": str(config.skills_path) if config.skills_path is not None else None,
         "max_rounds": config.max_rounds,
+        "silence_reminder_minutes": config.silence_reminder_minutes,
         "auto_index_tools": config.auto_index_tools,
         "enable_external_tools": config.enable_external_tools,
         "enable_llm": config.enable_llm,
@@ -2526,6 +2533,7 @@ def app_html() -> str:
               <label class="wide">Skills 路径<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
               <label>执行引擎<select id="run-engine"><option value="codex" selected>Codex 三方复核</option><option value="builtin">内置旧流程</option></select></label>
               <label>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
+              <label class="run-codex-control">静默提醒时间（分钟）<input id="run-silence-reminder-minutes" type="number" min="1" max="1440" value="60"></label>
               <div class="run-agent-grid" id="run-provider-agent-grid">
                 <label class="run-provider-control">正方提供商<select id="run-affirmative-provider"></select></label>
                 <label class="run-agent-control">正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
@@ -2637,6 +2645,7 @@ def app_html() -> str:
       runSkills: document.getElementById('run-skills'),
       runEngine: document.getElementById('run-engine'),
       runMaxRounds: document.getElementById('run-max-rounds'),
+      runSilenceReminderMinutes: document.getElementById('run-silence-reminder-minutes'),
       runProviderAgentGrid: document.getElementById('run-provider-agent-grid'),
       runToolProviderOptions: document.getElementById('run-tool-provider-options'),
       runCodexConfigNote: document.getElementById('run-codex-config-note'),
@@ -3288,6 +3297,7 @@ def app_html() -> str:
       el.runProviderAgentGrid.hidden = false;
       document.querySelectorAll('.run-provider-control').forEach(item => item.hidden = codexMode);
       document.querySelectorAll('.run-agent-control').forEach(item => item.hidden = false);
+      document.querySelectorAll('.run-codex-control').forEach(item => item.hidden = !codexMode);
       el.runToolProviderOptions.hidden = codexMode;
       el.runCodexConfigNote.hidden = !codexMode;
       if (codexMode) {{
@@ -3338,6 +3348,7 @@ def app_html() -> str:
       setSelectValue(el.runNegativeAgentProfile, agentProfile('negative'));
       setSelectValue(el.runModeratorAgentProfile, agentProfile('moderator'));
       el.runMaxRounds.value = String(config.max_rounds || 4);
+      el.runSilenceReminderMinutes.value = String(config.silence_reminder_minutes || 60);
       el.runExternalTools.checked = config.enable_external_tools !== false;
       el.runAutoIndex.checked = Boolean(config.auto_index_tools);
       el.runLlm.checked = Boolean(
@@ -3721,6 +3732,7 @@ def app_html() -> str:
           skill_source_id: el.runSkillSource.value || null,
           skills_path: el.runSkills.value.trim() || null,
           max_rounds: Number(el.runMaxRounds.value || 4),
+          silence_reminder_minutes: Number(el.runSilenceReminderMinutes.value || 60),
           enable_external_tools: codexMode ? true : el.runExternalTools.checked,
           auto_index_tools: codexMode ? false : el.runAutoIndex.checked,
           enable_llm: codexMode ? false : el.runLlm.checked,

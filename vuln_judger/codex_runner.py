@@ -22,7 +22,14 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_NEGATIVE_AGENT
 from .logging_config import logger
-from .models import AgentConfig, Finding, RunConfig, SourceLocation, to_jsonable
+from .models import (
+    DEFAULT_SILENCE_REMINDER_MINUTES,
+    AgentConfig,
+    Finding,
+    RunConfig,
+    SourceLocation,
+    to_jsonable,
+)
 from .records import RunRecordStore
 from .run_state import (
     FINDING_COMPLETED,
@@ -41,6 +48,7 @@ DEFAULT_CODEX_WORKSPACES_DIR = REPO_ROOT / ".workspaces" / "runs"
 CODEX_ENGINE = "codex"
 CODEX_ROLES = ("moderator", "affirmative", "negative")
 CODEX_AGENT_FILE_NAMES = ("AGENTS.md", "AGENT.md")
+SILENCE_REMINDER_PROMPT = "上一个agent已完成输出，请确认并继续任务"
 LOG = logger("codex_runner")
 ROLE_LABELS = {
     "moderator": "Moderator",
@@ -323,6 +331,28 @@ class CodexDrivenRunner:
             if should_stop is not None and should_stop():
                 raise CodexRunnerStopped(f"任务 {run_id} 已中断")
 
+        def watchdog_event(event: Dict[str, Any]) -> None:
+            workflow = dict(payload.get("codex_workflow") or {})
+            watchdog = dict(workflow.get("watchdog") or {})
+            kind = str(event.get("kind") or "")
+            if kind == "reminder":
+                watchdog["reminder_count"] = int(watchdog.get("reminder_count") or 0) + 1
+            elif kind == "prompt_redelivered":
+                watchdog["prompt_redelivery_count"] = int(watchdog.get("prompt_redelivery_count") or 0) + 1
+            watchdog["last_event"] = dict(event)
+            workflow["watchdog"] = watchdog
+            role = str(event.get("role") or "")
+            role_label = ROLE_LABELS.get(role, role)
+            if kind == "reminder":
+                diagnostic = f"{role_label} session 达到静默提醒时间，已发送继续任务提醒。"
+            else:
+                diagnostic = f"{role_label} session 已退出，已重启并重发当前阶段 prompt。"
+            emit(
+                "running",
+                codex_workflow=workflow,
+                diagnostics=[*payload.get("diagnostics", []), diagnostic],
+            )
+
         emit("running", diagnostics=["Codex-driven session 元数据已创建，正在启动三方 Codex TUI。"])
         for session in sessions.values():
             check_stop()
@@ -345,10 +375,18 @@ class CodexDrivenRunner:
 
         findings_path = run_dir / "findings.json"
         reuse_findings = config.created_at is not None and findings_path.exists()
+        moderator_report_prompt = _moderator_report_prompt(input_payload, findings_path)
         if not reuse_findings:
             findings_path.unlink(missing_ok=True)
-            sessions["moderator"].send(_moderator_report_prompt(input_payload, findings_path))
-        findings_data = _wait_json(findings_path, should_stop=should_stop)
+            sessions["moderator"].send(moderator_report_prompt)
+        findings_data = _wait_json(
+            findings_path,
+            should_stop=should_stop,
+            reminder_session=sessions["moderator"],
+            stage_prompt=moderator_report_prompt,
+            silence_reminder_seconds=config.silence_reminder_minutes * 60,
+            watchdog_callback=watchdog_event,
+        )
         findings = _findings_from_moderator(findings_data, report_path)
         finding_briefs = _persist_finding_briefs(findings, source_path, run_dir)
         reports = _reconcile_finding_reports(findings, config.resume_reports)
@@ -369,6 +407,7 @@ class CodexDrivenRunner:
                 f"{len(findings) - completed_count} 个未完成。",
             ],
         )
+        previous_output_path = findings_path
 
         for finding_index, finding in enumerate(findings):
             if finding_index < start_index:
@@ -398,18 +437,26 @@ class CodexDrivenRunner:
             moderator_dir.mkdir(exist_ok=True)
 
             affirmative_result = affirmative_dir / "result.json"
-            sessions["affirmative"].send(
-                _worker_prompt(
-                    role="affirmative",
-                    finding=finding,
-                    source_path=source_path,
-                    brief_path=brief_path,
-                    result_path=affirmative_result,
-                    peer_result_path=None,
-                    round_index=finding_index + 1,
-                )
+            affirmative_prompt = _worker_prompt(
+                role="affirmative",
+                finding=finding,
+                source_path=source_path,
+                brief_path=brief_path,
+                result_path=affirmative_result,
+                peer_result_path=None,
+                round_index=finding_index + 1,
             )
-            affirmative_data = _wait_json(affirmative_result, should_stop=should_stop)
+            sessions["affirmative"].send(affirmative_prompt)
+            affirmative_data = _wait_json(
+                affirmative_result,
+                should_stop=should_stop,
+                reminder_session=sessions["affirmative"],
+                previous_output_path=previous_output_path,
+                stage_prompt=affirmative_prompt,
+                silence_reminder_seconds=config.silence_reminder_minutes * 60,
+                watchdog_callback=watchdog_event,
+            )
+            previous_output_path = affirmative_result
             reports = _replace_finding_report(
                 reports,
                 finding_index,
@@ -418,18 +465,26 @@ class CodexDrivenRunner:
             emit("running", reports=reports, completed_finding_count=completed_finding_count(reports))
 
             negative_result = negative_dir / "result.json"
-            sessions["negative"].send(
-                _worker_prompt(
-                    role="negative",
-                    finding=finding,
-                    source_path=source_path,
-                    brief_path=brief_path,
-                    result_path=negative_result,
-                    peer_result_path=affirmative_result,
-                    round_index=finding_index + 1,
-                )
+            negative_prompt = _worker_prompt(
+                role="negative",
+                finding=finding,
+                source_path=source_path,
+                brief_path=brief_path,
+                result_path=negative_result,
+                peer_result_path=affirmative_result,
+                round_index=finding_index + 1,
             )
-            negative_data = _wait_json(negative_result, should_stop=should_stop)
+            sessions["negative"].send(negative_prompt)
+            negative_data = _wait_json(
+                negative_result,
+                should_stop=should_stop,
+                reminder_session=sessions["negative"],
+                previous_output_path=previous_output_path,
+                stage_prompt=negative_prompt,
+                silence_reminder_seconds=config.silence_reminder_minutes * 60,
+                watchdog_callback=watchdog_event,
+            )
+            previous_output_path = negative_result
             reports = _replace_finding_report(
                 reports,
                 finding_index,
@@ -438,17 +493,25 @@ class CodexDrivenRunner:
             emit("running", reports=reports, completed_finding_count=completed_finding_count(reports))
 
             final_result = moderator_dir / "final.json"
-            sessions["moderator"].send(
-                _moderator_final_prompt(
-                    finding=finding,
-                    source_path=source_path,
-                    brief_path=brief_path,
-                    affirmative_result=affirmative_result,
-                    negative_result=negative_result,
-                    final_path=final_result,
-                )
+            moderator_final_prompt = _moderator_final_prompt(
+                finding=finding,
+                source_path=source_path,
+                brief_path=brief_path,
+                affirmative_result=affirmative_result,
+                negative_result=negative_result,
+                final_path=final_result,
             )
-            final_data = _wait_json(final_result, should_stop=should_stop)
+            sessions["moderator"].send(moderator_final_prompt)
+            final_data = _wait_json(
+                final_result,
+                should_stop=should_stop,
+                reminder_session=sessions["moderator"],
+                previous_output_path=previous_output_path,
+                stage_prompt=moderator_final_prompt,
+                silence_reminder_seconds=config.silence_reminder_minutes * 60,
+                watchdog_callback=watchdog_event,
+            )
+            previous_output_path = final_result
             reports = _replace_finding_report(
                 reports,
                 finding_index,
@@ -826,41 +889,192 @@ def _wait_json(
     path: Path,
     *,
     should_stop: Optional[Callable[[], bool]],
-    timeout_seconds: Optional[int] = None,
+    timeout_seconds: Optional[float] = None,
+    reminder_session: Optional[CodexTmuxSession] = None,
+    previous_output_path: Optional[Path] = None,
+    stage_prompt: Optional[str] = None,
+    silence_reminder_seconds: Optional[float] = None,
+    watchdog_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    poll_interval_seconds: float = 1.0,
+    activity_poll_seconds: float = 30.0,
 ) -> Dict[str, Any]:
-    timeout = timeout_seconds or int(os.environ.get("VULN_JUDGER_CODEX_STEP_TIMEOUT", "3600"))
+    timeout = _step_timeout_seconds(timeout_seconds)
+    silence_interval = max(
+        float(
+            silence_reminder_seconds
+            if silence_reminder_seconds is not None
+            else DEFAULT_SILENCE_REMINDER_MINUTES * 60
+        ),
+        0.0,
+    )
     LOG.info(
         "等待 Codex JSON 输出",
-        extra={"event": "codex.output.wait", "output_path": str(path), "timeout_seconds": timeout},
+        extra={
+            "event": "codex.output.wait",
+            "output_path": str(path),
+            "timeout_seconds": timeout,
+            "silence_reminder_seconds": silence_interval,
+            "role": reminder_session.role if reminder_session is not None else None,
+        },
     )
-    deadline = time.monotonic() + timeout
+    now = time.monotonic()
+    deadline = now + timeout if timeout is not None else None
+    silence_deadline = now + silence_interval if silence_interval > 0 else None
+    next_activity_check = now
+    last_capture: Optional[str] = None
     last_error = ""
-    while time.monotonic() < deadline:
+    while True:
         if should_stop is not None and should_stop():
             raise CodexRunnerStopped("Codex-driven task stopped")
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
+        data, last_error = _read_json_object(path)
+        if data is not None:
+            LOG.info(
+                "Codex JSON 输出就绪",
+                extra={"event": "codex.output.ready", "output_path": str(path)},
+            )
+            return data
+
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            LOG.warning(
+                "等待 Codex JSON 输出超时",
+                extra={
+                    "event": "codex.output.timeout",
+                    "output_path": str(path),
+                    "timeout_seconds": timeout,
+                    "last_error": last_error,
+                },
+            )
+            raise CodexRunnerError(f"等待 Codex 输出超时：{path}；最后错误：{last_error}")
+
+        if reminder_session is not None and silence_deadline is not None:
+            if now >= next_activity_check:
+                capture = reminder_session.capture() if reminder_session.is_live() else ""
+                busy = _session_busy(capture)
+                if last_capture is not None and (capture != last_capture or busy):
+                    silence_deadline = now + silence_interval
+                last_capture = capture
+                next_activity_check = now + max(float(activity_poll_seconds), 0.01)
+
+            if now >= silence_deadline:
+                data, last_error = _read_json_object(path)
+                if data is not None:
                     LOG.info(
                         "Codex JSON 输出就绪",
                         extra={"event": "codex.output.ready", "output_path": str(path)},
                     )
                     return data
-                last_error = "JSON root is not an object"
-            except json.JSONDecodeError as exc:
-                last_error = str(exc)
-        time.sleep(1)
-    LOG.warning(
-        "等待 Codex JSON 输出超时",
+                _handle_silence_deadline(
+                    path=path,
+                    session=reminder_session,
+                    previous_output_path=previous_output_path,
+                    stage_prompt=stage_prompt,
+                    watchdog_callback=watchdog_callback,
+                )
+                now = time.monotonic()
+                silence_deadline = now + silence_interval
+                next_activity_check = now + max(float(activity_poll_seconds), 0.01)
+                last_capture = reminder_session.capture() if reminder_session.is_live() else ""
+
+        time.sleep(max(float(poll_interval_seconds), 0.01))
+
+
+def _handle_silence_deadline(
+    *,
+    path: Path,
+    session: CodexTmuxSession,
+    previous_output_path: Optional[Path],
+    stage_prompt: Optional[str],
+    watchdog_callback: Optional[Callable[[Dict[str, Any]], None]],
+) -> None:
+    current_data, _ = _read_json_object(path)
+    if current_data is not None:
+        return
+    event: Optional[Dict[str, Any]] = None
+    try:
+        if not session.is_live():
+            if stage_prompt:
+                session.send(stage_prompt)
+                event = {
+                    "kind": "prompt_redelivered",
+                    "role": session.role,
+                    "output_path": str(path),
+                    "at": _now(),
+                }
+        else:
+            previous_data, _ = _read_json_object(previous_output_path)
+            capture = session.capture()
+            current_data, _ = _read_json_object(path)
+            if current_data is None and previous_data is not None and not _session_busy(capture):
+                session.send(SILENCE_REMINDER_PROMPT)
+                event = {
+                    "kind": "reminder",
+                    "role": session.role,
+                    "output_path": str(path),
+                    "previous_output_path": str(previous_output_path),
+                    "at": _now(),
+                }
+    except (CodexRunnerError, OSError, subprocess.SubprocessError) as exc:
+        LOG.warning(
+            "Codex 静默看门狗发送失败",
+            extra={
+                "event": "codex.silence_watchdog.send_failed",
+                "role": session.role,
+                "output_path": str(path),
+                "error": str(exc),
+            },
+        )
+        return
+
+    if event is None:
+        LOG.info(
+            "Codex 静默计时器已重置",
+            extra={
+                "event": "codex.silence_watchdog.reset",
+                "role": session.role,
+                "output_path": str(path),
+            },
+        )
+        return
+    LOG.info(
+        "Codex 静默看门狗已处理",
         extra={
-            "event": "codex.output.timeout",
+            "event": f"codex.silence_watchdog.{event['kind']}",
+            "role": session.role,
             "output_path": str(path),
-            "timeout_seconds": timeout,
-            "last_error": last_error,
         },
     )
-    raise CodexRunnerError(f"等待 Codex 输出超时：{path}；最后错误：{last_error}")
+    if watchdog_callback is not None:
+        watchdog_callback(event)
+
+
+def _session_busy(text: str) -> bool:
+    return bool(CODEX_ACTIVE_PROGRESS_RE.search(text) or CODEX_BACKGROUND_RUNNING_RE.search(text))
+
+
+def _read_json_object(path: Optional[Path]) -> tuple[Optional[Dict[str, Any]], str]:
+    if path is None or not path.exists():
+        return None, ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        return None, str(exc)
+    if not isinstance(data, dict):
+        return None, "JSON root is not an object"
+    return data, ""
+
+
+def _step_timeout_seconds(explicit: Optional[float]) -> Optional[float]:
+    value: Any = explicit
+    if value is None:
+        value = os.environ.get("VULN_JUDGER_CODEX_STEP_TIMEOUT")
+    if value in (None, ""):
+        return None
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return None
+    return timeout if timeout > 0 else None
 
 
 def _input_payload(config: RunConfig, report_path: Path, source_path: Path, run_dir: Path) -> Dict[str, Any]:
@@ -1058,6 +1272,7 @@ def _base_payload(
             "source_path": str(config.source_path),
             "skills_path": str(config.skills_path) if config.skills_path else None,
             "max_rounds": config.max_rounds,
+            "silence_reminder_minutes": config.silence_reminder_minutes,
             "enable_external_tools": True,
         },
         "codex_sessions": session_payload,
@@ -1066,6 +1281,11 @@ def _base_payload(
             "run_dir": str(run_dir),
             "sessions": session_payload,
             "schedule": "moderator report processing -> affirmative -> negative -> moderator final",
+            "watchdog": {
+                "silence_reminder_minutes": config.silence_reminder_minutes,
+                "reminder_count": 0,
+                "prompt_redelivery_count": 0,
+            },
         },
     }
 
