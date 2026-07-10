@@ -13,7 +13,9 @@ def finding_report_status(report: Dict[str, Any]) -> str:
     status = str(report.get("finding_status") or "").strip().lower()
     if status in FINDING_STATUSES:
         return status
-    workflow = report.get("codex_workflow") if isinstance(report.get("codex_workflow"), dict) else {}
+    workflow = report.get("cli_workflow") if isinstance(report.get("cli_workflow"), dict) else {}
+    if not workflow and isinstance(report.get("codex_workflow"), dict):
+        workflow = report["codex_workflow"]
     if workflow.get("moderator"):
         return FINDING_COMPLETED
     if workflow.get("affirmative") or workflow.get("negative"):

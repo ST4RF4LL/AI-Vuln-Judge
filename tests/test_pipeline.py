@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
 from vuln_judger.api import (
+    _cli_sessions,
     _codex_terminal_page,
     _config_from_paused_payload,
     _config_from_payload,
@@ -28,6 +29,7 @@ from vuln_judger.api import (
     make_handler,
 )
 from vuln_judger.codex_runner import (
+    OPENCODE_ENGINE,
     DEFAULT_CODEX_WORKSPACES_DIR,
     SILENCE_REMINDER_PROMPT,
     CodexDrivenRunner,
@@ -45,8 +47,16 @@ from vuln_judger.llm import LLMClient
 from vuln_judger.logging_config import DEFAULT_LOG_RETENTION_DAYS, configure_logging, daily_log_path, logger
 from vuln_judger.mcp import MCPStdioClient
 from vuln_judger.mcp_config import MCPServerStore
-from vuln_judger.mcp_server import JudgerMCPServer, JudgerMCPSettings
+from vuln_judger.mcp_server import JudgerMCPServer, JudgerMCPSettings, _tool_specs
 from vuln_judger.models import DEFAULT_SILENCE_REMINDER_MINUTES, AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, Finding, RunConfig, SourceLocation, Verdict, to_jsonable
+from vuln_judger.opencode_runner import (
+    OPENCODE_PERMISSION_CONFIG,
+    OpenCodeCapabilities,
+    OpenCodeDrivenRunner,
+    OpenCodeTmuxSession,
+    ensure_opencode_tui,
+    probe_opencode,
+)
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunRecordStore
@@ -5129,6 +5139,242 @@ def wait_for_run_field(base, run_id, field):
             raise AssertionError(run.get("error"))
         time.sleep(0.1)
     raise AssertionError(f"run did not populate {field}: {run_id}")
+
+
+class OpenCodeRunnerTests(unittest.TestCase):
+    def test_legacy_opencode_session_metadata_targets_tui_window(self):
+        payload = {
+            "engine": "opencode",
+            "cli_sessions": [
+                {
+                    "backend": "opencode",
+                    "role": "moderator",
+                    "session_name": "vj-run-1-moderator",
+                    "target": "vj-run-1-moderator:server",
+                    "window_name": "server",
+                }
+            ],
+        }
+
+        with patch("vuln_judger.api.session_live", side_effect=lambda target: str(target).endswith(":server")):
+            sessions = _cli_sessions(payload)
+
+        self.assertEqual(sessions[0]["target"], "vj-run-1-moderator:tui")
+        self.assertEqual(sessions[0]["window_name"], "tui")
+        self.assertTrue(sessions[0]["live"])
+        self.assertFalse(sessions[0]["terminal_live"])
+
+    def test_opencode_engine_config_is_parsed_as_cli_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = _config_from_payload(
+                {
+                    "engine": "opencode",
+                    "report_path": str(root / "report.sarif"),
+                    "source_path": str(root / "source"),
+                    "llm_model": "openai/gpt-5",
+                },
+                root / "providers.json",
+                agent_store=AgentDirectoryStore(root / "agents"),
+                mcp_servers_file=root / "mcp.json",
+            )
+
+        self.assertEqual(config.engine, OPENCODE_ENGINE)
+        self.assertEqual(config.llm_model, "openai/gpt-5")
+        self.assertIsNone(config.mcp_servers_file)
+        self.assertFalse(config.enable_llm)
+        self.assertIsNotNone(config.affirmative_agent)
+
+    def test_opencode_agent_dirs_include_unattended_permission_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            runner = OpenCodeDrivenRunner(
+                records_dir=root / "records",
+                opencode_runs_dir=root / "runs",
+                opencode_command="opencode",
+            )
+            agents = {
+                "moderator": AgentConfig("Moderator", "裁决。", role="Moderator"),
+                "affirmative": AgentConfig("Affirmative", "验证。", role="Affirmative"),
+                "negative": AgentConfig("Negative", "质疑。", role="Negative"),
+            }
+            role_dirs = runner._prepare_agent_dirs(root / "run-1", agents, source)
+
+            for role_dir in role_dirs.values():
+                config_path = role_dir / ".opencode" / "opencode.json"
+                self.assertTrue(config_path.exists())
+                self.assertEqual(json.loads(config_path.read_text(encoding="utf-8"))["permission"], "allow")
+                self.assertIn("OpenCode Agent", (role_dir / "AGENTS.md").read_text(encoding="utf-8"))
+
+    def test_opencode_probe_detects_installed_permission_flag(self):
+        responses = [
+            subprocess.CompletedProcess(["opencode", "--version"], 0, "1.17.10\n", ""),
+            subprocess.CompletedProcess(
+                ["opencode", "run", "--help"],
+                0,
+                "--attach --dir --format --session --dangerously-skip-permissions",
+                "",
+            ),
+            subprocess.CompletedProcess(
+                ["opencode", "attach", "--help"],
+                0,
+                "--dir --session --mini",
+                "",
+            ),
+        ]
+        with patch("vuln_judger.opencode_runner.subprocess.run", side_effect=responses):
+            capabilities = probe_opencode("opencode")
+
+        self.assertEqual(capabilities.version, "1.17.10")
+        self.assertEqual(capabilities.permission_flag, "--dangerously-skip-permissions")
+
+    def test_opencode_tui_attach_uses_saved_session_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+            def target_live(target):
+                return str(target).endswith(":server")
+
+            with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
+                "vuln_judger.opencode_runner._run_tmux", return_value=completed
+            ) as run_tmux, patch(
+                "vuln_judger.opencode_runner._run_opencode",
+                return_value=subprocess.CompletedProcess(["opencode", "attach", "--help"], 0, "--mini", ""),
+            ):
+                target = ensure_opencode_tui(
+                    {
+                        "session_name": "vj-run-1-moderator",
+                        "cwd": str(cwd),
+                        "server_url": "http://127.0.0.1:4096",
+                        "provider_session_id": "ses-123",
+                    }
+                )
+
+            self.assertEqual(target, "vj-run-1-moderator:tui")
+            launch = run_tmux.call_args.args[0]
+            self.assertIn("new-window", launch)
+            self.assertIn("opencode attach", launch[-1])
+            self.assertIn("--session ses-123", launch[-1])
+            self.assertIn("--mini", launch[-1])
+            self.assertNotIn("opencode run", launch[-1])
+
+    def test_opencode_prompt_uses_run_json_transport_and_explicit_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "role"
+            cwd.mkdir()
+            config_path = cwd / ".opencode" / "opencode.json"
+            config_path.parent.mkdir()
+            config_path.write_text(json.dumps(OPENCODE_PERMISSION_CONFIG), encoding="utf-8")
+            session = OpenCodeTmuxSession(
+                role="moderator",
+                run_id="run-1",
+                cwd=cwd,
+                source_path=root,
+                run_dir=root,
+                command="opencode",
+                capabilities=OpenCodeCapabilities("1.17.10", "--dangerously-skip-permissions"),
+                model="openai/gpt-5",
+            )
+
+            def target_live(target):
+                return str(target).endswith(":server")
+
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+            with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
+                "vuln_judger.opencode_runner._run_tmux", return_value=completed
+            ) as run_tmux:
+                session.send("first prompt")
+                first_event = session._current_event_path
+                self.assertIsNotNone(first_event)
+                first_event.write_text('{"type":"session","sessionID":"ses-123"}\n', encoding="utf-8")
+                session.activity_snapshot()
+                session.send("second prompt")
+
+            launch = run_tmux.call_args_list[-1].args[0]
+            shell = launch[-1]
+            self.assertIn("opencode run", shell)
+            self.assertIn("--attach", shell)
+            self.assertIn("--format json", shell)
+            self.assertIn("--dangerously-skip-permissions", shell)
+            self.assertIn("--session ses-123", shell)
+            self.assertIn("--model openai/gpt-5", shell)
+            self.assertNotIn("paste-buffer", shell)
+            self.assertNotIn("send-keys", shell)
+
+    def test_opencode_nonzero_run_exit_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "role"
+            cwd.mkdir()
+            session = OpenCodeTmuxSession(
+                role="negative",
+                run_id="run-1",
+                cwd=cwd,
+                source_path=root,
+                run_dir=root,
+                command="opencode",
+                capabilities=OpenCodeCapabilities("1.17.10", None),
+            )
+            event_path = cwd / "event.ndjson"
+            exit_path = cwd / "exit.txt"
+            event_path.write_text("authentication failed\n", encoding="utf-8")
+            exit_path.write_text("1\n", encoding="utf-8")
+            session._current_event_path = event_path
+            session._current_exit_path = exit_path
+            with patch("vuln_judger.opencode_runner._tmux_target_live", return_value=False):
+                failure = session.failure_message()
+
+        self.assertIn("退出码 1", failure)
+        self.assertIn("authentication failed", failure)
+
+    def test_opencode_invalid_session_retries_without_session_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "role"
+            cwd.mkdir()
+            session = OpenCodeTmuxSession(
+                role="affirmative",
+                run_id="run-1",
+                cwd=cwd,
+                source_path=root,
+                run_dir=root,
+                command="opencode",
+                capabilities=OpenCodeCapabilities("1.17.10", None),
+            )
+            session.logs_dir.mkdir()
+            prompt_path = session.logs_dir / "prompt-0001.txt"
+            event_path = session.logs_dir / "events-0001.ndjson"
+            exit_path = session.logs_dir / "exit-0001.txt"
+            prompt_path.write_text("resume this stage", encoding="utf-8")
+            event_path.write_text("Session not found: ses-old\n", encoding="utf-8")
+            exit_path.write_text("1\n", encoding="utf-8")
+            session._sequence = 1
+            session._provider_session_id = "ses-old"
+            session._current_prompt_path = prompt_path
+            session._current_event_path = event_path
+            session._current_exit_path = exit_path
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+            with patch("vuln_judger.opencode_runner._tmux_target_live", return_value=False), patch(
+                "vuln_judger.opencode_runner._run_tmux", return_value=completed
+            ) as run_tmux:
+                failure = session.failure_message()
+
+            self.assertIsNone(failure)
+            self.assertIsNone(session._provider_session_id)
+            shell = run_tmux.call_args.args[0][-1]
+            self.assertNotIn("--session ses-old", shell)
+            self.assertEqual(session._current_prompt_path.read_text(encoding="utf-8"), "resume this stage")
+
+    def test_web_and_mcp_surface_opencode_engine(self):
+        html = app_html()
+        self.assertIn('<option value="opencode">OpenCode 三方复核</option>', html)
+        judge_report = next(item for item in _tool_specs() if item["name"] == "judge_report")
+        engines = judge_report["inputSchema"]["properties"]["engine"]["enum"]
+        self.assertIn(OPENCODE_ENGINE, engines)
 
 
 class FakeOpenAIHandler(BaseHTTPRequestHandler):

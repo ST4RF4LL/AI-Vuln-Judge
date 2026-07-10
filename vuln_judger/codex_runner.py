@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
 
 from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_NEGATIVE_AGENT
 from .logging_config import logger
@@ -46,6 +46,8 @@ from .source import SourceIndexer, detect_project_languages
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CODEX_WORKSPACES_DIR = REPO_ROOT / ".workspaces" / "runs"
 CODEX_ENGINE = "codex"
+OPENCODE_ENGINE = "opencode"
+CLI_ENGINES = frozenset({CODEX_ENGINE, OPENCODE_ENGINE})
 CODEX_ROLES = ("moderator", "affirmative", "negative")
 CODEX_AGENT_FILE_NAMES = ("AGENTS.md", "AGENT.md")
 SILENCE_REMINDER_PROMPT = "上一个agent已完成输出，请确认并继续任务"
@@ -79,6 +81,26 @@ class CodexRunnerStopped(RuntimeError):
     pass
 
 
+class CliSession(Protocol):
+    role: str
+
+    def info(self) -> Any: ...
+
+    def start(self) -> None: ...
+
+    def is_live(self) -> bool: ...
+
+    def stop(self) -> None: ...
+
+    def send(self, text: str) -> None: ...
+
+    def capture(self, lines: int = 240) -> str: ...
+
+    def activity_snapshot(self) -> tuple[str, bool]: ...
+
+    def failure_message(self) -> Optional[str]: ...
+
+
 @dataclass
 class CodexSessionInfo:
     role: str
@@ -86,6 +108,8 @@ class CodexSessionInfo:
     window_name: str
     target: str
     cwd: str
+    backend: str = CODEX_ENGINE
+    transport: str = "tmux-tui"
 
 
 class CodexTmuxSession:
@@ -228,6 +252,13 @@ class CodexTmuxSession:
         )
         return result.stdout or ""
 
+    def activity_snapshot(self) -> tuple[str, bool]:
+        capture = self.capture()
+        return capture, _session_busy(capture)
+
+    def failure_message(self) -> Optional[str]:
+        return None
+
     def _accept_trust_prompt(self) -> None:
         deadline = time.monotonic() + 12
         markers = (
@@ -278,21 +309,19 @@ class CodexTmuxSession:
         return False
 
 
-class CodexDrivenRunner:
+class CliDrivenRunner:
+    engine = CODEX_ENGINE
+    cli_name = "Codex"
+    session_description = "Codex TUI"
+
     def __init__(
         self,
         *,
         records_dir: Path,
-        codex_runs_dir: Optional[Path] = None,
-        codex_command: Optional[str] = None,
+        runs_dir: Path,
     ) -> None:
         self.records_dir = records_dir.expanduser().resolve()
-        self.codex_runs_dir = (
-            codex_runs_dir.expanduser().resolve()
-            if codex_runs_dir is not None
-            else Path(os.environ.get("VULN_JUDGER_CODEX_WORKSPACES_DIR", DEFAULT_CODEX_WORKSPACES_DIR)).expanduser().resolve()
-        )
-        self.codex_command = codex_command or os.environ.get("VULN_JUDGER_CODEX_COMMAND") or shutil.which("codex") or "codex"
+        self.runs_dir = runs_dir.expanduser().resolve()
 
     def run(
         self,
@@ -303,24 +332,36 @@ class CodexDrivenRunner:
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
+        self._configure(config)
         run_id = config.run_id or _new_run_id()
         source_path = config.source_path.expanduser().resolve()
         report_path = config.sarif_path.expanduser().resolve()
-        run_dir = self.codex_runs_dir / run_id
+        run_dir = self.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        _ensure_codex_project_trust(run_dir)
+        self._prepare_run_dir(run_dir)
         (run_dir / "input").mkdir(exist_ok=True)
         (run_dir / "findings").mkdir(exist_ok=True)
 
         languages = list(detect_project_languages(source_path).languages)
         created_at = config.created_at or _now()
         agent_configs = _codex_agent_configs(config)
-        session_dirs = _prepare_codex_agent_dirs(run_dir, agent_configs, source_path)
+        session_dirs = self._prepare_agent_dirs(run_dir, agent_configs, source_path)
         sessions = self._sessions(run_id, source_path, run_dir, session_dirs)
-        payload = _base_payload(config, run_id, created_at, languages, run_dir, sessions, agent_configs, run_origin)
+        payload = _base_payload(
+            config,
+            run_id,
+            created_at,
+            languages,
+            run_dir,
+            sessions,
+            agent_configs,
+            run_origin,
+            engine=self.engine,
+        )
 
         def emit(status: str, **updates: Any) -> None:
             payload.update(updates)
+            _refresh_cli_session_payload(payload, sessions, self.engine)
             payload["status"] = status
             payload["updated_at"] = _now()
             store.save_payload(payload)
@@ -332,7 +373,7 @@ class CodexDrivenRunner:
                 raise CodexRunnerStopped(f"任务 {run_id} 已中断")
 
         def watchdog_event(event: Dict[str, Any]) -> None:
-            workflow = dict(payload.get("codex_workflow") or {})
+            workflow = dict(payload.get("cli_workflow") or payload.get("codex_workflow") or {})
             watchdog = dict(workflow.get("watchdog") or {})
             kind = str(event.get("kind") or "")
             if kind == "reminder":
@@ -349,11 +390,14 @@ class CodexDrivenRunner:
                 diagnostic = f"{role_label} session 已退出，已重启并重发当前阶段 prompt。"
             emit(
                 "running",
-                codex_workflow=workflow,
+                cli_workflow=workflow,
                 diagnostics=[*payload.get("diagnostics", []), diagnostic],
             )
 
-        emit("running", diagnostics=["Codex-driven session 元数据已创建，正在启动三方 Codex TUI。"])
+        emit(
+            "running",
+            diagnostics=[f"{self.cli_name}-driven session 元数据已创建，正在启动三方 {self.session_description}。"],
+        )
         for session in sessions.values():
             check_stop()
             session.start()
@@ -361,10 +405,10 @@ class CodexDrivenRunner:
                 "running",
                 diagnostics=[
                     *payload.get("diagnostics", []),
-                    f"{ROLE_LABELS.get(session.role, session.role)} Codex session 已启动。",
+                    f"{ROLE_LABELS.get(session.role, session.role)} {self.cli_name} session 已启动。",
                 ],
             )
-        emit("running", diagnostics=["Codex-driven 任务已启动，等待 Moderator 处理漏洞报告。"])
+        emit("running", diagnostics=[f"{self.cli_name}-driven 任务已启动，等待 Moderator 处理漏洞报告。"])
 
         input_payload = _input_payload(config, report_path, source_path, run_dir)
         (run_dir / "input" / "task.json").write_text(
@@ -397,7 +441,9 @@ class CodexDrivenRunner:
         payload["completed_finding_count"] = completed_count
         payload["resume_from_finding_index"] = start_index
         payload["resume_from_finding_id"] = findings[start_index].finding_id if start_index < len(findings) else None
-        payload["codex_workflow"]["findings_path"] = str(findings_path)
+        payload["cli_workflow"]["findings_path"] = str(findings_path)
+        if self.engine == CODEX_ENGINE:
+            payload["codex_workflow"] = payload["cli_workflow"]
         split_action = "复用磁盘中的" if reuse_findings else "已拆分并持久化"
         emit(
             "running",
@@ -536,13 +582,65 @@ class CodexDrivenRunner:
         emit("completed")
         return payload
 
+    def _prepare_run_dir(self, run_dir: Path) -> None:
+        raise NotImplementedError
+
+    def _configure(self, config: RunConfig) -> None:
+        return None
+
+    def _prepare_agent_dirs(
+        self,
+        run_dir: Path,
+        agent_configs: Dict[str, AgentConfig],
+        source_path: Path,
+    ) -> Dict[str, Path]:
+        raise NotImplementedError
+
     def _sessions(
         self,
         run_id: str,
         source_path: Path,
         run_dir: Path,
         session_dirs: Dict[str, Path],
-    ) -> Dict[str, CodexTmuxSession]:
+    ) -> Dict[str, CliSession]:
+        raise NotImplementedError
+
+
+class CodexDrivenRunner(CliDrivenRunner):
+    def __init__(
+        self,
+        *,
+        records_dir: Path,
+        codex_runs_dir: Optional[Path] = None,
+        codex_command: Optional[str] = None,
+    ) -> None:
+        runs_dir = (
+            codex_runs_dir.expanduser().resolve()
+            if codex_runs_dir is not None
+            else Path(os.environ.get("VULN_JUDGER_CODEX_WORKSPACES_DIR", DEFAULT_CODEX_WORKSPACES_DIR)).expanduser().resolve()
+        )
+        super().__init__(records_dir=records_dir, runs_dir=runs_dir)
+        self.codex_runs_dir = self.runs_dir
+        self.codex_command = codex_command or os.environ.get("VULN_JUDGER_CODEX_COMMAND") or shutil.which("codex") or "codex"
+
+    def _prepare_run_dir(self, run_dir: Path) -> None:
+        _ensure_codex_project_trust(run_dir)
+
+    def _prepare_agent_dirs(
+        self,
+        run_dir: Path,
+        agent_configs: Dict[str, AgentConfig],
+        source_path: Path,
+    ) -> Dict[str, Path]:
+        return _prepare_codex_agent_dirs(run_dir, agent_configs, source_path)
+
+    def _sessions(
+        self,
+        run_id: str,
+        source_path: Path,
+        run_dir: Path,
+        session_dirs: Dict[str, Path],
+    ) -> Dict[str, CliSession]:
         return {
             role: CodexTmuxSession(
                 role=role,
@@ -597,18 +695,35 @@ def _prepare_codex_agent_dirs(
 
 
 def _codex_agent_file_text(*, role: str, agent: AgentConfig, source_path: Path, run_dir: Path) -> str:
+    return _cli_agent_file_text(
+        role=role,
+        agent=agent,
+        source_path=source_path,
+        run_dir=run_dir,
+        cli_name="Codex",
+    )
+
+
+def _cli_agent_file_text(
+    *,
+    role: str,
+    agent: AgentConfig,
+    source_path: Path,
+    run_dir: Path,
+    cli_name: str,
+) -> str:
     role_label = ROLE_LABELS.get(role, role)
     profile = agent.profile_id or agent.name or role_label
     instructions = (agent.instructions or "").strip() or "围绕当前阶段任务进行可复核的漏洞报告复核。"
     return (
-        "# vuln-judger Codex Agent\n\n"
+        f"# vuln-judger {cli_name} Agent\n\n"
         f"- 角色：{role_label}\n"
         f"- Agent 配置档案：{profile}\n"
         f"- 源码根目录：{source_path}\n"
         f"- 共享任务工作目录：{run_dir}\n\n"
         "## 会话约束\n\n"
-        "- 这份 AGENTS.md 是本 Codex session 的持续行为约束；后续每轮 prompt 只描述当前阶段、输入文件和输出 schema。\n"
-        "- 模型、MCP、skills 和 provider 都由 Codex 当前默认配置加载；不要要求 vuln-judger 在 prompt 中动态提供这些配置。\n"
+        f"- 这份 AGENTS.md 是本 {cli_name} session 的持续行为约束；后续每轮 prompt 只描述当前阶段、输入文件和输出 schema。\n"
+        f"- 模型、MCP、skills 和 provider 都由 {cli_name} 当前默认配置加载；不要要求 vuln-judger 在 prompt 中动态提供这些配置。\n"
         "- 如 Atlas MCP 可用，开始代码图谱检索前先确认或打开源码根目录，不要把本 session 工作目录误当成待审源码。\n"
         "- 只写入当前 prompt 指定的 JSON 输出文件，以及共享任务工作目录中的必要临时文件。\n"
         "- 结论必须基于报告、源码、Atlas、rg/grep 或可复核工具输出；区分已证实证据、候选证据和未闭环缺口。\n\n"
@@ -676,17 +791,21 @@ def stop_sessions(payload: Dict[str, Any]) -> None:
 
 
 def _payload_sessions(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    sessions = payload.get("codex_sessions")
+    sessions = payload.get("cli_sessions")
+    if not isinstance(sessions, list):
+        sessions = payload.get("codex_sessions")
     if isinstance(sessions, list):
         return [item for item in sessions if isinstance(item, dict)]
-    workflow = payload.get("codex_workflow") if isinstance(payload.get("codex_workflow"), dict) else {}
+    workflow = payload.get("cli_workflow") if isinstance(payload.get("cli_workflow"), dict) else {}
+    if not workflow and isinstance(payload.get("codex_workflow"), dict):
+        workflow = payload["codex_workflow"]
     sessions = workflow.get("sessions")
     if isinstance(sessions, list):
         return [item for item in sessions if isinstance(item, dict)]
     return []
 
 
-def attach_session_websocket(handler: Any, session_name: str) -> None:
+def attach_session_websocket(handler: Any, session_name: str, *, read_only: bool = False) -> None:
     if not _safe_tmux_ref(session_name):
         handler.send_error(404, "invalid Codex session")
         return
@@ -695,7 +814,7 @@ def attach_session_websocket(handler: Any, session_name: str) -> None:
         return
     if not _websocket_accept(handler):
         return
-    _bridge_tmux_websocket(handler.connection, session_name)
+    _bridge_tmux_websocket(handler.connection, session_name, read_only=read_only)
 
 
 def _websocket_accept(handler: Any) -> bool:
@@ -769,7 +888,7 @@ def _pty_env() -> dict[str, str]:
     return env
 
 
-def _bridge_tmux_websocket(sock: socket.socket, session_name: str) -> None:
+def _bridge_tmux_websocket(sock: socket.socket, session_name: str, *, read_only: bool = False) -> None:
     master_fd, slave_fd = pty.openpty()
     proc: Optional[subprocess.Popen[bytes]] = None
     try:
@@ -809,7 +928,7 @@ def _bridge_tmux_websocket(sock: socket.socket, session_name: str) -> None:
                 if opcode != 1:
                     continue
                 message = json.loads(payload.decode("utf-8"))
-                if message.get("type") == "input":
+                if message.get("type") == "input" and not read_only:
                     raw = str(message.get("data", "")).encode("utf-8")
                     for offset in range(0, len(raw), 1024):
                         os.write(master_fd, raw[offset : offset + 1024])
@@ -890,7 +1009,7 @@ def _wait_json(
     *,
     should_stop: Optional[Callable[[], bool]],
     timeout_seconds: Optional[float] = None,
-    reminder_session: Optional[CodexTmuxSession] = None,
+    reminder_session: Optional[CliSession] = None,
     previous_output_path: Optional[Path] = None,
     stage_prompt: Optional[str] = None,
     silence_reminder_seconds: Optional[float] = None,
@@ -934,6 +1053,12 @@ def _wait_json(
             )
             return data
 
+        if reminder_session is not None:
+            failure_method = getattr(reminder_session, "failure_message", None)
+            failure = failure_method() if callable(failure_method) else None
+            if failure:
+                raise CodexRunnerError(f"CLI session 执行失败：{failure}")
+
         now = time.monotonic()
         if deadline is not None and now >= deadline:
             LOG.warning(
@@ -949,11 +1074,10 @@ def _wait_json(
 
         if reminder_session is not None and silence_deadline is not None:
             if now >= next_activity_check:
-                capture = reminder_session.capture() if reminder_session.is_live() else ""
-                busy = _session_busy(capture)
-                if last_capture is not None and (capture != last_capture or busy):
+                activity, busy = _cli_activity_snapshot(reminder_session) if reminder_session.is_live() else ("", False)
+                if last_capture is not None and (activity != last_capture or busy):
                     silence_deadline = now + silence_interval
-                last_capture = capture
+                last_capture = activity
                 next_activity_check = now + max(float(activity_poll_seconds), 0.01)
 
             if now >= silence_deadline:
@@ -974,7 +1098,7 @@ def _wait_json(
                 now = time.monotonic()
                 silence_deadline = now + silence_interval
                 next_activity_check = now + max(float(activity_poll_seconds), 0.01)
-                last_capture = reminder_session.capture() if reminder_session.is_live() else ""
+                last_capture = _cli_activity_snapshot(reminder_session)[0] if reminder_session.is_live() else ""
 
         time.sleep(max(float(poll_interval_seconds), 0.01))
 
@@ -982,7 +1106,7 @@ def _wait_json(
 def _handle_silence_deadline(
     *,
     path: Path,
-    session: CodexTmuxSession,
+    session: CliSession,
     previous_output_path: Optional[Path],
     stage_prompt: Optional[str],
     watchdog_callback: Optional[Callable[[Dict[str, Any]], None]],
@@ -1003,9 +1127,9 @@ def _handle_silence_deadline(
                 }
         else:
             previous_data, _ = _read_json_object(previous_output_path)
-            capture = session.capture()
+            _, busy = _cli_activity_snapshot(session)
             current_data, _ = _read_json_object(path)
-            if current_data is None and previous_data is not None and not _session_busy(capture):
+            if current_data is None and previous_data is not None and not busy:
                 session.send(SILENCE_REMINDER_PROMPT)
                 event = {
                     "kind": "reminder",
@@ -1052,6 +1176,14 @@ def _session_busy(text: str) -> bool:
     return bool(CODEX_ACTIVE_PROGRESS_RE.search(text) or CODEX_BACKGROUND_RUNNING_RE.search(text))
 
 
+def _cli_activity_snapshot(session: CliSession) -> tuple[str, bool]:
+    snapshot = getattr(session, "activity_snapshot", None)
+    if callable(snapshot):
+        return snapshot()
+    capture = session.capture()
+    return capture, _session_busy(capture)
+
+
 def _read_json_object(path: Optional[Path]) -> tuple[Optional[Dict[str, Any]], str]:
     if path is None or not path.exists():
         return None, ""
@@ -1067,7 +1199,7 @@ def _read_json_object(path: Optional[Path]) -> tuple[Optional[Dict[str, Any]], s
 def _step_timeout_seconds(explicit: Optional[float]) -> Optional[float]:
     value: Any = explicit
     if value is None:
-        value = os.environ.get("VULN_JUDGER_CODEX_STEP_TIMEOUT")
+        value = os.environ.get("VULN_JUDGER_CLI_STEP_TIMEOUT") or os.environ.get("VULN_JUDGER_CODEX_STEP_TIMEOUT")
     if value in (None, ""):
         return None
     try:
@@ -1237,18 +1369,31 @@ def _base_payload(
     created_at: str,
     languages: List[str],
     run_dir: Path,
-    sessions: Dict[str, CodexTmuxSession],
+    sessions: Dict[str, CliSession],
     agent_configs: Dict[str, AgentConfig],
     run_origin: str,
+    *,
+    engine: str,
 ) -> Dict[str, Any]:
     session_payload = [to_jsonable(session.info()) for session in sessions.values()]
     resume_reports = [dict(report) for report in config.resume_reports if isinstance(report, dict)]
     resume_index = first_incomplete_finding_index(resume_reports, len(resume_reports))
-    return {
+    workflow = {
+        "engine": engine,
+        "run_dir": str(run_dir),
+        "sessions": session_payload,
+        "schedule": "moderator report processing -> affirmative -> negative -> moderator final",
+        "watchdog": {
+            "silence_reminder_minutes": config.silence_reminder_minutes,
+            "reminder_count": 0,
+            "prompt_redelivery_count": 0,
+        },
+    }
+    payload = {
         "run_id": run_id,
         "status": "running",
         "run_origin": run_origin,
-        "engine": CODEX_ENGINE,
+        "engine": engine,
         "created_at": created_at,
         "source_path": str(config.source_path),
         "sarif_path": str(config.sarif_path),
@@ -1257,7 +1402,7 @@ def _base_payload(
         "project_context_facts": 0,
         "reports": resume_reports,
         "diagnostics": list(config.resume_diagnostics or []),
-        "llm_providers": {"enabled": False, "engine": CODEX_ENGINE},
+        "llm_providers": {"enabled": False, "engine": engine},
         "agent_configs": {role: to_jsonable(agent_configs[role]) for role in CODEX_ROLES},
         "completed_finding_count": completed_finding_count(resume_reports),
         "current_finding_id": None,
@@ -1267,7 +1412,7 @@ def _base_payload(
         ),
         "resume_from_finding_index": resume_index,
         "config": {
-            "engine": CODEX_ENGINE,
+            "engine": engine,
             "report_path": str(config.sarif_path),
             "source_path": str(config.source_path),
             "skills_path": str(config.skills_path) if config.skills_path else None,
@@ -1275,19 +1420,29 @@ def _base_payload(
             "silence_reminder_minutes": config.silence_reminder_minutes,
             "enable_external_tools": True,
         },
-        "codex_sessions": session_payload,
-        "codex_workflow": {
-            "engine": CODEX_ENGINE,
-            "run_dir": str(run_dir),
-            "sessions": session_payload,
-            "schedule": "moderator report processing -> affirmative -> negative -> moderator final",
-            "watchdog": {
-                "silence_reminder_minutes": config.silence_reminder_minutes,
-                "reminder_count": 0,
-                "prompt_redelivery_count": 0,
-            },
-        },
+        "cli_sessions": session_payload,
+        "cli_workflow": workflow,
     }
+    if engine == CODEX_ENGINE:
+        payload["codex_sessions"] = session_payload
+        payload["codex_workflow"] = workflow
+    return payload
+
+
+def _refresh_cli_session_payload(
+    payload: Dict[str, Any],
+    sessions: Dict[str, CliSession],
+    engine: str,
+) -> None:
+    session_payload = [to_jsonable(session.info()) for session in sessions.values()]
+    workflow = dict(payload.get("cli_workflow") or payload.get("codex_workflow") or {})
+    workflow["engine"] = engine
+    workflow["sessions"] = session_payload
+    payload["cli_sessions"] = session_payload
+    payload["cli_workflow"] = workflow
+    if engine == CODEX_ENGINE:
+        payload["codex_sessions"] = session_payload
+        payload["codex_workflow"] = workflow
 
 
 def _final_report(
@@ -1300,6 +1455,11 @@ def _final_report(
     if verdict not in VERDICTS:
         verdict = "INCONCLUSIVE"
     confidence = _float(final.get("confidence"), 0.5)
+    workflow = {
+        "affirmative": affirmative,
+        "negative": negative,
+        "moderator": final,
+    }
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
@@ -1322,11 +1482,8 @@ def _final_report(
         "verification_case": _verification_case(finding),
         "evidence_ledger": [],
         "scorecard": {},
-        "codex_workflow": {
-            "affirmative": affirmative,
-            "negative": negative,
-            "moderator": final,
-        },
+        "cli_workflow": workflow,
+        "codex_workflow": workflow,
     }
 
 
@@ -1342,6 +1499,11 @@ def _partial_report(
     if position not in VERDICTS:
         position = "INCONCLUSIVE"
     summary = str((negative or affirmative or {}).get("summary") or "Codex worker 正在复核。")
+    workflow = {
+        "affirmative": affirmative or {},
+        "negative": negative or {},
+        "moderator": final or {},
+    }
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
@@ -1361,15 +1523,17 @@ def _partial_report(
         "verification_case": _verification_case(finding),
         "evidence_ledger": [],
         "scorecard": {},
-        "codex_workflow": {
-            "affirmative": affirmative or {},
-            "negative": negative or {},
-            "moderator": final or {},
-        },
+        "cli_workflow": workflow,
+        "codex_workflow": workflow,
     }
 
 
 def _pending_report(finding: Finding) -> Dict[str, Any]:
+    workflow = {
+        "affirmative": {},
+        "negative": {},
+        "moderator": {},
+    }
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
@@ -1389,11 +1553,8 @@ def _pending_report(finding: Finding) -> Dict[str, Any]:
         "verification_case": _verification_case(finding),
         "evidence_ledger": [],
         "scorecard": {},
-        "codex_workflow": {
-            "affirmative": {},
-            "negative": {},
-            "moderator": {},
-        },
+        "cli_workflow": workflow,
+        "codex_workflow": workflow,
     }
 
 

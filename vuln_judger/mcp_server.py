@@ -14,11 +14,12 @@ from uuid import uuid4
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
 from .analyzers import AnalyzerSettings, AnalyzerSuite
 from .api import DEFAULT_RECORDS_DIR, _export_run_markdown
-from .codex_runner import CODEX_ENGINE, CodexDrivenRunner, CodexRunnerStopped, stop_sessions
+from .codex_runner import CLI_ENGINES, CODEX_ENGINE, OPENCODE_ENGINE, CodexDrivenRunner, CodexRunnerStopped, stop_sessions
 from .debate import DebateOrchestrator
 from .evidence import EvidenceCollector
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE
 from .models import DEFAULT_SILENCE_REMINDER_MINUTES, RunConfig, SourceLocation, to_jsonable
+from .opencode_runner import OpenCodeDrivenRunner
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
 from .records import RunRecordStore, normalize_run_origin
@@ -153,20 +154,20 @@ class JudgerMCPServer:
 
     def _judge_report(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         engine = str(arguments.get("engine") or CODEX_ENGINE).strip().lower()
-        if engine not in {CODEX_ENGINE, BUILTIN_ENGINE}:
+        if engine not in {*CLI_ENGINES, BUILTIN_ENGINE}:
             raise ValueError(f"Unsupported engine: {engine}")
         report_path = _required_path(arguments, "report_path")
         source_path = _required_path(arguments, "source_path")
         skills_path = self._skills_path(arguments)
         run_id = _optional_text(arguments.get("run_id")) or f"run-{uuid4().hex[:12]}"
-        codex_engine = engine == CODEX_ENGINE
+        cli_engine = engine in CLI_ENGINES
         config = RunConfig(
             sarif_path=report_path,
             source_path=source_path,
             engine=engine,
             skills_path=skills_path,
-            providers_file=None if codex_engine else _optional_path(arguments.get("providers_file")) or self.settings.providers_file,
-            mcp_servers_file=None if codex_engine else _optional_path(arguments.get("mcp_servers_file")) or self.settings.mcp_servers_file,
+            providers_file=None if cli_engine else _optional_path(arguments.get("providers_file")) or self.settings.providers_file,
+            mcp_servers_file=None if cli_engine else _optional_path(arguments.get("mcp_servers_file")) or self.settings.mcp_servers_file,
             run_id=run_id,
             max_rounds=int(arguments.get("max_rounds") or 4),
             silence_reminder_minutes=_bounded_int(
@@ -175,19 +176,20 @@ class JudgerMCPServer:
                 minimum=1,
                 maximum=1440,
             ),
-            auto_index_tools=False if codex_engine else bool(arguments.get("auto_index_tools", False)),
-            enable_external_tools=True if codex_engine else bool(arguments.get("enable_external_tools", True)),
-            enable_llm=False if codex_engine else bool(arguments.get("enable_llm", False)),
-            affirmative_provider_id=None if codex_engine else _optional_text(arguments.get("affirmative_provider_id")),
-            negative_provider_id=None if codex_engine else _optional_text(arguments.get("negative_provider_id")),
-            moderator_provider_id=None if codex_engine else _optional_text(arguments.get("moderator_provider_id")),
+            auto_index_tools=False if cli_engine else bool(arguments.get("auto_index_tools", False)),
+            enable_external_tools=True if cli_engine else bool(arguments.get("enable_external_tools", True)),
+            enable_llm=False if cli_engine else bool(arguments.get("enable_llm", False)),
+            llm_model=_optional_text(arguments.get("llm_model")) if engine == OPENCODE_ENGINE else None,
+            affirmative_provider_id=None if cli_engine else _optional_text(arguments.get("affirmative_provider_id")),
+            negative_provider_id=None if cli_engine else _optional_text(arguments.get("negative_provider_id")),
+            moderator_provider_id=None if cli_engine else _optional_text(arguments.get("moderator_provider_id")),
             affirmative_agent=self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile"))),
             negative_agent=self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile"))),
             moderator_agent=self.agent_store.agent("moderator", _optional_text(arguments.get("moderator_agent_profile"))),
         )
-        if codex_engine:
+        if cli_engine:
             if not bool(arguments.get("save", True)):
-                raise ValueError("save=false is not supported by the codex engine because progress is persisted for polling")
+                raise ValueError("save=false is not supported by CLI engines because progress is persisted for polling")
             if bool(arguments.get("wait_for_completion", False)):
                 try:
                     payload = self._run_codex_report(config)
@@ -265,7 +267,11 @@ class JudgerMCPServer:
                 self._active_runs.pop(str(config.run_id), None)
 
     def _run_codex_report(self, config: RunConfig, stop_event: Optional[Event] = None) -> Dict[str, Any]:
-        runner = CodexDrivenRunner(records_dir=self.records.root)
+        runner = (
+            OpenCodeDrivenRunner(records_dir=self.records.root)
+            if config.engine == OPENCODE_ENGINE
+            else CodexDrivenRunner(records_dir=self.records.root)
+        )
         try:
             payload = runner.run(
                 config,
@@ -279,12 +285,12 @@ class JudgerMCPServer:
             stopped = dict(current)
             stopped["status"] = "stopped"
             stopped["run_origin"] = "mcp"
-            stopped["engine"] = CODEX_ENGINE
+            stopped["engine"] = config.engine
             stopped["error"] = None
             self.records.save_payload(stopped)
             return stopped
         payload["run_origin"] = "mcp"
-        payload["engine"] = CODEX_ENGINE
+        payload["engine"] = config.engine
         payload["config"] = payload.get("config") or _config_snapshot(config)
         self.records.save_payload(payload)
         return payload
@@ -300,7 +306,7 @@ class JudgerMCPServer:
         diagnostics.append(str(exc))
         failed["diagnostics"] = diagnostics
         failed["run_origin"] = "mcp"
-        failed["engine"] = CODEX_ENGINE
+        failed["engine"] = config.engine
         self.records.save_payload(failed)
         return failed
 
@@ -561,9 +567,9 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "source_path": {"type": "string", "description": "Source tree root path."},
                 "engine": {
                     "type": "string",
-                    "enum": [CODEX_ENGINE, BUILTIN_ENGINE],
+                    "enum": [CODEX_ENGINE, OPENCODE_ENGINE, BUILTIN_ENGINE],
                     "default": CODEX_ENGINE,
-                    "description": "codex starts the refactored three-session workflow; builtin keeps the legacy in-process pipeline.",
+                    "description": "codex or opencode starts the three-session CLI workflow; builtin keeps the legacy in-process pipeline.",
                 },
                 "skills_path": {"type": "string", "description": "Optional project skills directory."},
                 "skill_source_id": {"type": "string", "description": "Optional configured Skill Source id."},
@@ -574,7 +580,7 @@ def _tool_specs() -> List[Dict[str, Any]]:
                     "minimum": 1,
                     "maximum": 1440,
                     "default": DEFAULT_SILENCE_REMINDER_MINUTES,
-                    "description": "Codex only. Minutes of session silence before checking the handoff and reminding the next agent.",
+                    "description": "CLI engines only. Minutes of session silence before checking the handoff and reminding the next agent.",
                 },
                 "enable_external_tools": {"type": "boolean", "default": True},
                 "auto_index_tools": {
@@ -583,6 +589,7 @@ def _tool_specs() -> List[Dict[str, Any]]:
                     "description": "Optionally prewarm a persistent Atlas cache; Atlas MCP v1.5+ can run scoped Focus queries without a prebuilt index.",
                 },
                 "enable_llm": {"type": "boolean", "default": False},
+                "llm_model": {"type": "string", "description": "Optional provider/model override for OpenCode."},
                 "providers_file": {"type": "string"},
                 "affirmative_provider_id": {"type": "string"},
                 "negative_provider_id": {"type": "string"},
@@ -1153,6 +1160,7 @@ def _config_snapshot(config: RunConfig) -> Dict[str, Any]:
         "auto_index_tools": config.auto_index_tools,
         "enable_external_tools": config.enable_external_tools,
         "enable_llm": config.enable_llm,
+        "llm_model": config.llm_model,
         "affirmative_provider_id": config.affirmative_provider_id,
         "negative_provider_id": config.negative_provider_id,
         "moderator_provider_id": config.moderator_provider_id,
@@ -1160,11 +1168,12 @@ def _config_snapshot(config: RunConfig) -> Dict[str, Any]:
 
 
 def _queued_codex_payload(config: RunConfig) -> Dict[str, Any]:
+    cli_name = "OpenCode" if config.engine == OPENCODE_ENGINE else "Codex"
     return {
         "run_id": config.run_id,
         "status": "queued",
         "run_origin": "mcp",
-        "engine": CODEX_ENGINE,
+        "engine": config.engine,
         "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "source_path": str(config.source_path),
         "sarif_path": str(config.sarif_path),
@@ -1172,8 +1181,8 @@ def _queued_codex_payload(config: RunConfig) -> Dict[str, Any]:
         "finding_count": 0,
         "project_context_facts": 0,
         "reports": [],
-        "diagnostics": ["Codex-driven MCP run queued."],
-        "llm_providers": {"enabled": False, "engine": CODEX_ENGINE},
+        "diagnostics": [f"{cli_name}-driven MCP run queued."],
+        "llm_providers": {"enabled": False, "engine": config.engine},
         "agent_configs": {
             "affirmative": to_jsonable(config.affirmative_agent) if config.affirmative_agent else None,
             "negative": to_jsonable(config.negative_agent) if config.negative_agent else None,

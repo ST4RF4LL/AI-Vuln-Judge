@@ -90,7 +90,10 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
         verdict = report.get("verdict", "UNKNOWN")
         verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
-    workflow = payload.get("codex_workflow") if isinstance(payload.get("codex_workflow"), dict) else {}
+    workflow = payload.get("cli_workflow") if isinstance(payload.get("cli_workflow"), dict) else {}
+    if not workflow and isinstance(payload.get("codex_workflow"), dict):
+        workflow = payload["codex_workflow"]
+    sessions = payload.get("cli_sessions") or payload.get("codex_sessions") or workflow.get("sessions") or []
     return {
         "run_id": payload.get("run_id"),
         "status": payload.get("status", "completed"),
@@ -112,7 +115,8 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
         "current_finding_index": payload.get("current_finding_index"),
         "resume_from_finding_id": payload.get("resume_from_finding_id"),
         "resume_from_finding_index": payload.get("resume_from_finding_index"),
-        "codex_sessions": payload.get("codex_sessions") or workflow.get("sessions") or [],
+        "cli_sessions": sessions,
+        "codex_sessions": (payload.get("codex_sessions") or sessions) if payload.get("engine") == "codex" else [],
     }
 
 

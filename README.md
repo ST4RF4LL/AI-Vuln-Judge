@@ -125,8 +125,8 @@ uv run vuln-judger mcp \
 
 - `judge_report`：对 SARIF/Markdown 报告和源码目录启动完整研判。默认使用重构后的
   `codex` 三会话引擎并立即返回 `run_id`；使用 `get_run` 轮询运行状态。传
-  `engine: "builtin"` 可继续使用旧的同步内置流程。
-- `stop_run`：停止由当前 MCP Server 启动且仍在运行的异步 Codex 研判。
+  `engine: "opencode"` 可改用 OpenCode，传 `engine: "builtin"` 可继续使用旧的同步内置流程。
+- `stop_run`：停止由当前 MCP Server 启动且仍在运行的异步 CLI 研判。
 - `one_round_judge`：使用内置流程对单个 finding 进行单轮快速验证，默认保存 run 记录。
   默认 `response_mode: compact` 只返回关键结论、调用链/数据流概览、关键缺口和完整报告访问方式，
   以减少 CLI Agent 上下文占用；如不希望 Web 端显示该快速验证记录，可传 `save: false`。
@@ -140,9 +140,29 @@ uv run vuln-judger mcp \
 继续读取完整报告。调试时可传 `response_mode: standard` 返回证据摘要和诊断，或传
 `response_mode: full` 返回完整 run/report 内容。
 
-`judge_report` 的 Codex 引擎会启动 Moderator、Affirmative、Negative 三个 tmux/Codex
-会话。任务进度持续写入 `--records-dir`，因此 Codex 引擎要求 `save: true`。通常不要设置
+`judge_report` 的 Codex/OpenCode 引擎会启动 Moderator、Affirmative、Negative 三个独立
+CLI session。任务进度持续写入 `--records-dir`，因此 CLI 引擎要求 `save: true`。通常不要设置
 `wait_for_completion: true`，否则长任务可能触发 MCP 客户端工具超时。
+
+### OpenCode 驱动引擎
+
+选择 `engine: "opencode"` 时，每个角色会启动一个仅监听 `127.0.0.1` 的
+`opencode serve`，阶段 prompt 通过 `opencode run --attach --format json` 发送。系统从
+JSON 事件中保存明确的 OpenCode session ID，后续阶段使用 `--session` 续接，不依赖 TUI
+按键、焦点或粘贴行为。Web 端的 CLI Session 终端使用同一 session 的
+`opencode attach --mini` 窗口，因此可以捕获并交互查看历史输出；该 TUI 不承担自动任务投递。
+
+每个角色目录都会生成 `.opencode/opencode.json`，并通过 `OPENCODE_CONFIG` 和
+`OPENCODE_CONFIG_CONTENT` 显式注入 `{"permission":"allow"}`。这不会修改源码仓库或用户
+全局配置。启动时还会探测 `--auto` / `--dangerously-skip-permissions` 等当前版本实际提供的
+参数；缺少 `--attach`、`--dir`、`--format`、`--session` 或可捕获的 `--mini` TUI 时会直接失败。
+
+可选环境变量：
+
+- `VULN_JUDGER_OPENCODE_COMMAND`：OpenCode 可执行文件，默认从 `PATH` 查找。
+- `VULN_JUDGER_OPENCODE_MODEL`：默认 `provider/model`；Web/MCP 单次任务的 `llm_model` 优先。
+- `VULN_JUDGER_OPENCODE_WORKSPACES_DIR`：OpenCode 任务工作目录。
+- `VULN_JUDGER_OPENCODE_READY_TIMEOUT`：等待本地 server 就绪的秒数，默认 30。
 
 ### Codex 配置
 
@@ -343,16 +363,16 @@ uv run vuln-judger api \
 证据链、博弈过程、防护分析、影响分析、LLM 提供商配置、正反方和主持人默认提供商选择、
 提供商连通性测试、三方 Agent 配置管理，以及 MCP / Skill Source 配置管理。
 
-Codex 三方复核引擎在 Moderator 拆分报告后，会立即把全部 finding 写入运行记录，并在
+Codex/OpenCode 三方复核引擎在 Moderator 拆分报告后，会立即把全部 finding 写入运行记录，并在
 `.workspaces/runs/<run-id>/findings/<finding-id>/brief.json` 保存各自的输入材料。前端会将
 尚未裁决的 finding 标记为“未完成”或“处理中”。暂停后恢复时，新 session 会保留已完成结果，
 清理首个未完成 finding 的旧阶段输出，并从该 finding 重新开始。
 
-启动 Codex 任务时可设置“静默提醒时间”，默认 60 分钟。等待下一阶段 JSON 输出期间，如果
-目标 Codex session 仍有输出或处于执行状态，静默计时器会重新开始；如果上一阶段已经交付而
+启动 CLI 任务时可设置“静默提醒时间”，默认 60 分钟。等待下一阶段 JSON 输出期间，如果
+目标 session 仍有输出或处于执行状态，静默计时器会重新开始；如果上一阶段已经交付而
 下一 Agent 持续静默，系统会发送简短的继续任务提醒。退出的 session 会重启并重新接收完整阶段
 prompt。默认不再用一小时硬超时终止阶段；需要绝对步骤超时时可显式设置
-`VULN_JUDGER_CODEX_STEP_TIMEOUT`（秒）。
+`VULN_JUDGER_CLI_STEP_TIMEOUT`（秒）；旧的 `VULN_JUDGER_CODEX_STEP_TIMEOUT` 仍兼容。
 
 默认日志按天写入 `.vuln-judger/logs/vuln-judger-YYYY-MM-DD.log`，会记录 API 启动、任务创建、
 后台任务执行、LLM 请求状态、Provider 连通性测试和异常 traceback。日志使用 key=value 文本格式，

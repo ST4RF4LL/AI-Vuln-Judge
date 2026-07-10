@@ -14,7 +14,9 @@ from uuid import uuid4
 
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
 from .codex_runner import (
+    CLI_ENGINES,
     CODEX_ENGINE,
+    OPENCODE_ENGINE,
     CodexDrivenRunner,
     CodexRunnerError,
     CodexRunnerStopped,
@@ -29,6 +31,7 @@ from .llm import test_provider_connection
 from .logging_config import DEFAULT_LOG_FILE, DEFAULT_LOG_RETENTION_DAYS, configure_logging, logger
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE, MCPServerStore
 from .models import DEFAULT_SILENCE_REMINDER_MINUTES, AgentConfig, RunConfig, to_jsonable
+from .opencode_runner import OpenCodeDrivenRunner, ensure_opencode_tui
 from .pipeline import RunStopped, run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderStore
 from .records import RunRecordStore, normalize_run_origin
@@ -231,26 +234,26 @@ def make_handler(
                         )
                         self._json(result)
                     return
-                if len(parts) == 4 and parts[0] == "runs" and parts[2] == "codex-sessions" and parts[3] == "stop":
-                    result = _stop_codex_sessions(store, tasks, tasks_lock, parts[1])
+                if len(parts) == 4 and parts[0] == "runs" and parts[2] in {"cli-sessions", "codex-sessions"} and parts[3] == "stop":
+                    result = _stop_cli_sessions(store, tasks, tasks_lock, parts[1])
                     if result is None:
                         self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
                     else:
                         LOG.info(
-                            "收到关闭 Codex sessions 请求",
+                            "收到关闭 CLI sessions 请求",
                             extra={
-                                "event": "codex.sessions.stop",
+                                "event": "cli.sessions.stop",
                                 "run_id": parts[1],
                                 "stopped": result.get("stopped"),
                             },
                         )
                         self._json(result)
                     return
-                if len(parts) == 5 and parts[0] == "runs" and parts[2] == "codex-sessions" and parts[4] == "input":
+                if len(parts) == 5 and parts[0] == "runs" and parts[2] in {"cli-sessions", "codex-sessions"} and parts[4] == "input":
                     payload = self._read_json()
                     result = _send_codex_session_input(store, tasks, tasks_lock, parts[1], parts[3], str(payload.get("message") or ""))
                     if result is None:
-                        self._json({"error": "Codex session 未找到"}, HTTPStatus.NOT_FOUND)
+                        self._json({"error": "CLI session 未找到"}, HTTPStatus.NOT_FOUND)
                     else:
                         self._json(result)
                     return
@@ -430,14 +433,22 @@ def make_handler(
                 task = _get_task(tasks, tasks_lock, parts[1])
                 active_task = task if task is not None and task.get("status") != "completed" else None
                 terminal_payload = active_task if active_task is not None else run if run is not None else task
-                if len(parts) == 5 and parts[2] == "codex-sessions" and parts[4] in {"terminal-ui", "ws"}:
+                if len(parts) == 5 and parts[2] in {"cli-sessions", "codex-sessions"} and parts[4] in {"terminal-ui", "ws"}:
                     if terminal_payload is None:
                         self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
                         return
                     session = _codex_session_for_role(terminal_payload, parts[3])
                     if session is None:
-                        self._json({"error": "Codex session 未找到"}, HTTPStatus.NOT_FOUND)
+                        self._json({"error": "CLI session 未找到"}, HTTPStatus.NOT_FOUND)
                         return
+                    session = dict(session)
+                    if str(session.get("backend") or terminal_payload.get("engine") or "") == OPENCODE_ENGINE:
+                        try:
+                            session["target"] = ensure_opencode_tui(session)
+                        except CodexRunnerError as exc:
+                            self._json({"error": str(exc)}, HTTPStatus.CONFLICT)
+                            return
+                        session["window_name"] = "tui"
                     target = str(session.get("target") or session.get("session_name") or "")
                     if parts[4] == "terminal-ui":
                         self._html(_codex_terminal_page(parts[1], parts[3], session))
@@ -471,11 +482,11 @@ def make_handler(
                                 return
                         self._json({"error": "发现尚未生成或未找到"}, HTTPStatus.NOT_FOUND)
                         return
-                    if len(parts) == 3 and parts[2] == "codex-sessions":
-                        self._json(_codex_sessions(active_task))
+                    if len(parts) == 3 and parts[2] in {"cli-sessions", "codex-sessions"}:
+                        self._json(_cli_sessions(active_task))
                         return
-                    if len(parts) == 5 and parts[2] == "codex-sessions" and parts[4] == "terminal":
-                        self._json(_codex_session_terminal(active_task, parts[3]))
+                    if len(parts) == 5 and parts[2] in {"cli-sessions", "codex-sessions"} and parts[4] == "terminal":
+                        self._json(_cli_session_terminal(active_task, parts[3]))
                         return
                 if run is None:
                     if task is None:
@@ -499,11 +510,11 @@ def make_handler(
                 if len(parts) == 2:
                     self._json(_run_detail(run))
                     return
-                if len(parts) == 3 and parts[2] == "codex-sessions":
-                    self._json(_codex_sessions(run))
+                if len(parts) == 3 and parts[2] in {"cli-sessions", "codex-sessions"}:
+                    self._json(_cli_sessions(run))
                     return
-                if len(parts) == 5 and parts[2] == "codex-sessions" and parts[4] == "terminal":
-                    self._json(_codex_session_terminal(run, parts[3]))
+                if len(parts) == 5 and parts[2] in {"cli-sessions", "codex-sessions"} and parts[4] == "terminal":
+                    self._json(_cli_session_terminal(run, parts[3]))
                     return
                 if len(parts) == 3 and parts[2] == "findings":
                     self._json([_finding_summary(report) for report in run.get("reports", [])])
@@ -606,11 +617,13 @@ def _config_from_payload(
     if not report_path:
         raise ValueError("report_path 或 sarif_path 不能为空")
     engine = str(payload.get("engine") or "builtin").strip().lower() or "builtin"
-    codex_engine = engine == CODEX_ENGINE
+    if engine not in {*CLI_ENGINES, "builtin"}:
+        raise ValueError(f"不支持的执行引擎：{engine}")
+    cli_engine = engine in CLI_ENGINES
     affirmative_agent = None
     negative_agent = None
     moderator_agent = None
-    if codex_engine:
+    if cli_engine:
         if agent_store is not None:
             affirmative_agent = agent_store.agent("affirmative", payload.get("affirmative_agent_profile"))
             negative_agent = agent_store.agent("negative", payload.get("negative_agent_profile"))
@@ -632,7 +645,7 @@ def _config_from_payload(
         engine=engine,
         skills_path=skills_path,
         providers_file=providers_file,
-        mcp_servers_file=None if codex_engine else mcp_servers_file,
+        mcp_servers_file=None if cli_engine else mcp_servers_file,
         run_id=run_id,
         max_rounds=int(payload.get("max_rounds") or 4),
         silence_reminder_minutes=_bounded_int(
@@ -641,14 +654,14 @@ def _config_from_payload(
             minimum=1,
             maximum=1440,
         ),
-        auto_index_tools=False if codex_engine else bool(payload.get("auto_index_tools") or False),
-        enable_external_tools=True if codex_engine else bool(payload.get("enable_external_tools", True)),
-        enable_llm=False if codex_engine else bool(payload.get("enable_llm", False)),
-        llm_model=None if codex_engine else payload.get("llm_model"),
-        llm_endpoint=None if codex_engine else payload.get("llm_endpoint"),
-        affirmative_provider_id=None if codex_engine else payload.get("affirmative_provider_id"),
-        negative_provider_id=None if codex_engine else payload.get("negative_provider_id"),
-        moderator_provider_id=None if codex_engine else payload.get("moderator_provider_id"),
+        auto_index_tools=False if cli_engine else bool(payload.get("auto_index_tools") or False),
+        enable_external_tools=True if cli_engine else bool(payload.get("enable_external_tools", True)),
+        enable_llm=False if cli_engine else bool(payload.get("enable_llm", False)),
+        llm_model=payload.get("llm_model") if engine == OPENCODE_ENGINE else (None if cli_engine else payload.get("llm_model")),
+        llm_endpoint=None if cli_engine else payload.get("llm_endpoint"),
+        affirmative_provider_id=None if cli_engine else payload.get("affirmative_provider_id"),
+        negative_provider_id=None if cli_engine else payload.get("negative_provider_id"),
+        moderator_provider_id=None if cli_engine else payload.get("moderator_provider_id"),
         affirmative_agent=affirmative_agent,
         negative_agent=negative_agent,
         moderator_agent=moderator_agent,
@@ -656,6 +669,8 @@ def _config_from_payload(
 
 
 def _run_detail(run):
+    cli_sessions = _cli_sessions(run)
+    cli_workflow = run.get("cli_workflow") or run.get("codex_workflow") or {}
     return {
         "run_id": run.get("run_id"),
         "status": run.get("status", "completed"),
@@ -680,6 +695,8 @@ def _run_detail(run):
         "resume_from_finding_id": run.get("resume_from_finding_id"),
         "resume_from_finding_index": run.get("resume_from_finding_index"),
         "config": run.get("config", {}),
+        "cli_sessions": cli_sessions,
+        "cli_workflow": cli_workflow,
         "codex_sessions": _codex_sessions(run),
         "codex_workflow": run.get("codex_workflow", {}),
     }
@@ -757,7 +774,7 @@ def _run_task(
     stop_event: Event,
     pause_event: Event,
 ) -> None:
-    if config.engine == CODEX_ENGINE:
+    if config.engine in CLI_ENGINES:
         _run_codex_task(config, store, tasks, stop_events, pause_events, tasks_lock, stop_event, pause_event)
         return
     last_payload = None
@@ -839,15 +856,16 @@ def _run_codex_task(
     stop_event: Event,
     pause_event: Event,
 ) -> None:
+    cli_name = "OpenCode" if config.engine == OPENCODE_ENGINE else "Codex"
     last_payload = None
     try:
-        LOG.info("Codex-driven 后台任务开始 run_id=%s report=%s source=%s", config.run_id, config.sarif_path, config.source_path)
+        LOG.info("%s-driven 后台任务开始 run_id=%s report=%s source=%s", cli_name, config.run_id, config.sarif_path, config.source_path)
 
         def on_progress(progress_payload):
             nonlocal last_payload
             payload = dict(progress_payload)
             payload["run_origin"] = RUN_ORIGIN_WEB
-            payload["engine"] = CODEX_ENGINE
+            payload["engine"] = config.engine
             payload["config"] = payload.get("config") or _config_task_snapshot(config)
             status = payload.get("status") or "running"
             if status == "running":
@@ -858,13 +876,18 @@ def _run_codex_task(
                 tasks[payload["run_id"]] = _task_from_report_payload(payload, status)
             store.save_payload(payload)
             LOG.info(
-                "Codex-driven 任务进度 run_id=%s status=%s reports=%s",
+                "%s-driven 任务进度 run_id=%s status=%s reports=%s",
+                cli_name,
                 payload["run_id"],
                 status,
                 len(payload.get("reports", [])),
             )
 
-        runner = CodexDrivenRunner(records_dir=store.root)
+        runner = (
+            OpenCodeDrivenRunner(records_dir=store.root)
+            if config.engine == OPENCODE_ENGINE
+            else CodexDrivenRunner(records_dir=store.root)
+        )
         payload = runner.run(
             config,
             store=store,
@@ -872,23 +895,23 @@ def _run_codex_task(
             should_stop=lambda: stop_event.is_set() or pause_event.is_set(),
         )
         payload["run_origin"] = RUN_ORIGIN_WEB
-        payload["engine"] = CODEX_ENGINE
+        payload["engine"] = config.engine
         payload["config"] = payload.get("config") or _config_task_snapshot(config)
         store.save_payload(payload)
         with tasks_lock:
             tasks[payload["run_id"]] = _task_from_report_payload(payload, "completed")
-        LOG.info("Codex-driven 后台任务完成 run_id=%s findings=%s", payload.get("run_id"), payload.get("finding_count"))
+        LOG.info("%s-driven 后台任务完成 run_id=%s findings=%s", cli_name, payload.get("run_id"), payload.get("finding_count"))
     except CodexRunnerStopped as exc:
         stop_sessions(last_payload or {})
         if pause_event.is_set() and not stop_event.is_set():
-            LOG.info("Codex-driven 后台任务已暂停 run_id=%s", config.run_id)
+            LOG.info("%s-driven 后台任务已暂停 run_id=%s", cli_name, config.run_id)
             stopped_payload = _pause_payload(config, last_payload, str(exc))
             status = "paused"
         else:
-            LOG.info("Codex-driven 后台任务已停止 run_id=%s", config.run_id)
+            LOG.info("%s-driven 后台任务已停止 run_id=%s", cli_name, config.run_id)
             stopped_payload = dict(last_payload or _task_from_config(config, config.run_id or _new_run_id(), "stopped"))
             stopped_payload["status"] = "stopped"
-            stopped_payload["engine"] = CODEX_ENGINE
+            stopped_payload["engine"] = config.engine
             stopped_payload["error"] = None
             diagnostics = list(stopped_payload.get("diagnostics", []))
             diagnostics.append(str(exc))
@@ -899,13 +922,13 @@ def _run_codex_task(
         with tasks_lock:
             tasks[stopped_payload["run_id"]] = _task_from_report_payload(stopped_payload, status)
     except Exception as exc:
-        LOG.exception("Codex-driven 后台任务失败 run_id=%s", config.run_id)
+        LOG.exception("%s-driven 后台任务失败 run_id=%s", cli_name, config.run_id)
         stop_sessions(last_payload or {})
         with tasks_lock:
             existing = tasks.get(config.run_id or "")
             failed = dict(existing or last_payload or _task_from_config(config, config.run_id or _new_run_id(), "failed"))
             failed["status"] = "failed"
-            failed["engine"] = CODEX_ENGINE
+            failed["engine"] = config.engine
             failed["error"] = str(exc)
             diagnostics = list(failed.get("diagnostics") or [])
             diagnostics.append(str(exc))
@@ -947,15 +970,21 @@ def _task_from_report_payload(payload: dict, status: str) -> dict:
         "current_finding_index": payload.get("current_finding_index"),
         "resume_from_finding_id": payload.get("resume_from_finding_id"),
         "resume_from_finding_index": payload.get("resume_from_finding_index"),
+        "cli_sessions": _cli_sessions(payload),
+        "cli_workflow": payload.get("cli_workflow") or payload.get("codex_workflow") or {},
         "codex_sessions": _codex_sessions(payload),
         "codex_workflow": payload.get("codex_workflow", {}),
     }
 
 
-def _codex_sessions(payload: dict) -> list[dict]:
+def _cli_sessions(payload: dict) -> list[dict]:
     if not isinstance(payload, dict):
         return []
-    raw = payload.get("codex_sessions")
+    raw = payload.get("cli_sessions")
+    if raw is None:
+        raw = payload.get("codex_sessions")
+    if raw is None and isinstance(payload.get("cli_workflow"), dict):
+        raw = payload["cli_workflow"].get("sessions")
     if raw is None and isinstance(payload.get("codex_workflow"), dict):
         raw = payload["codex_workflow"].get("sessions")
     result = []
@@ -964,14 +993,32 @@ def _codex_sessions(payload: dict) -> list[dict]:
             continue
         session = dict(item)
         target = str(session.get("target") or session.get("session_name") or "")
-        session["live"] = session_live(target) if target else False
+        backend = str(session.get("backend") or payload.get("engine") or "")
+        if backend == OPENCODE_ENGINE:
+            target = f"{session.get('session_name')}:tui"
+            server_target = str(session.get("server_target") or f"{session.get('session_name')}:server")
+            session["target"] = target
+            session["window_name"] = "tui"
+            session["server_target"] = server_target
+            session["live"] = session_live(server_target)
+            session["terminal_live"] = session_live(target)
+        else:
+            terminal_live = session_live(target) if target else False
+            session["live"] = terminal_live
+            session["terminal_live"] = terminal_live
         result.append(session)
     return result
 
 
+def _codex_sessions(payload: dict) -> list[dict]:
+    if str((payload or {}).get("engine") or "") not in {"", CODEX_ENGINE}:
+        return []
+    return _cli_sessions(payload)
+
+
 def _codex_session_for_role(payload: dict, role: str) -> Optional[dict]:
     role = str(role or "").strip().lower()
-    for session in _codex_sessions(payload):
+    for session in _cli_sessions(payload):
         if str(session.get("role") or "").lower() == role:
             return session
     return None
@@ -984,6 +1031,22 @@ def _codex_session_terminal(payload: dict, role: str) -> dict:
     target = str(session.get("target") or session.get("session_name") or "")
     return {
         "role": session.get("role"),
+        "session_name": session.get("session_name"),
+        "window_name": session.get("window_name"),
+        "target": target,
+        "live": session_live(target),
+        "output": capture_session(target),
+    }
+
+
+def _cli_session_terminal(payload: dict, role: str) -> dict:
+    session = _codex_session_for_role(payload, role)
+    if session is None:
+        return {"error": "CLI session 未找到", "role": role, "live": False, "output": ""}
+    target = str(session.get("target") or session.get("session_name") or "")
+    return {
+        "role": session.get("role"),
+        "backend": session.get("backend") or payload.get("engine"),
         "session_name": session.get("session_name"),
         "window_name": session.get("window_name"),
         "target": target,
@@ -1016,16 +1079,37 @@ def _stop_codex_sessions(
     }
 
 
+def _stop_cli_sessions(
+    store: RunRecordStore,
+    tasks: dict,
+    tasks_lock: Lock,
+    run_id: str,
+) -> Optional[dict]:
+    with tasks_lock:
+        payload = dict(tasks.get(run_id) or {})
+    if not payload:
+        payload = dict(store.get(run_id) or {})
+    if not payload:
+        return None
+    before = _cli_sessions(payload)
+    stopped = sum(1 for session in before if session.get("live"))
+    stop_sessions(payload)
+    return {"ok": True, "run_id": run_id, "stopped": stopped, "sessions": _cli_sessions(payload)}
+
+
 def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
     target = str(session.get("target") or session.get("session_name") or "")
     label = {"moderator": "Moderator", "affirmative": "正方", "negative": "反方"}.get(role, role)
-    websocket_path = f"/runs/{run_id}/codex-sessions/{role}/ws"
+    backend = str(session.get("backend") or CODEX_ENGINE)
+    cli_label = "OpenCode TUI" if backend == OPENCODE_ENGINE else "Codex TUI"
+    route = "cli-sessions" if backend == OPENCODE_ENGINE else "codex-sessions"
+    websocket_path = f"/runs/{run_id}/{route}/{role}/ws"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{escape(label)} · Codex TUI</title>
+  <title>{escape(label)} · {escape(cli_label)}</title>
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
   <style>
     html, body {{ height: 100%; margin: 0; background: #0d1117; color: #c9d1d9; }}
@@ -1041,10 +1125,10 @@ def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
 <body>
   <header>
     <div>
-      <h1>{escape(label)} Codex TUI</h1>
+      <h1>{escape(label)} {escape(cli_label)}</h1>
       <div class="meta">{escape(run_id)} · {escape(target)}</div>
     </div>
-    <div class="meta">tmux attach · raw TUI</div>
+    <div class="meta">{escape("tmux attach · raw TUI" if backend == CODEX_ENGINE else "tmux attach · OpenCode TUI")}</div>
   </header>
   <div id="terminal"></div>
   <script src="/static/vendor/xterm/xterm.js"></script>
@@ -1059,7 +1143,7 @@ def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
       return `${{protocol}}//${{window.location.host}}${{path}}`;
     }}
     if (!TerminalCtor || !FitAddonCtor) {{
-      terminalNode.innerHTML = '<div class="error">xterm.js 未加载，无法打开 Codex TUI。</div>';
+      terminalNode.innerHTML = '<div class="error">xterm.js 未加载，无法打开 CLI session。</div>';
     }} else {{
       const term = new TerminalCtor({{
         cursorBlink: true,
@@ -1130,6 +1214,12 @@ def _send_codex_session_input(
     target = str(session.get("target") or session.get("session_name") or "")
     if not target:
         return None
+    if str(session.get("backend") or payload.get("engine") or CODEX_ENGINE) == OPENCODE_ENGINE:
+        return {
+            "ok": False,
+            "role": role,
+            "error": "OpenCode 自动控制使用非交互 run transport，server 终端不接受 prompt 注入",
+        }
     try:
         send_session_input(target, message)
     except (CodexRunnerError, subprocess.CalledProcessError) as exc:
@@ -1167,7 +1257,7 @@ def _pause_payload(config: RunConfig, last_payload: Optional[dict], reason: str)
     )
     finding_count = max(int(payload.get("finding_count") or 0), len(reports))
     completed_count = completed_finding_count(reports)
-    if config.engine != CODEX_ENGINE:
+    if config.engine not in CLI_ENGINES:
         reports = reports[:completed_count]
     resume_index = first_incomplete_finding_index(reports, finding_count)
     resume_report = reports[resume_index] if resume_index < len(reports) else {}
@@ -1321,6 +1411,7 @@ def _safe_payload(payload) -> dict:
 
 
 def _finding_summary(report):
+    delivery = _codex_delivery_summary(report)
     return {
         "finding_id": report.get("finding_id"),
         "rule_id": report.get("rule_id"),
@@ -1332,12 +1423,15 @@ def _finding_summary(report):
         "source_locations": report.get("source_locations", []),
         "evidence_count": len(report.get("evidence_chain", [])),
         "debate_turn_count": len(report.get("debate", [])),
-        "codex_delivery": _codex_delivery_summary(report),
+        "cli_delivery": delivery,
+        "codex_delivery": delivery,
     }
 
 
 def _codex_delivery_summary(report: dict) -> dict:
-    workflow = report.get("codex_workflow") if isinstance(report.get("codex_workflow"), dict) else {}
+    workflow = report.get("cli_workflow") if isinstance(report.get("cli_workflow"), dict) else {}
+    if not workflow and isinstance(report.get("codex_workflow"), dict):
+        workflow = report["codex_workflow"]
     return {
         "affirmative": bool(workflow.get("affirmative")),
         "negative": bool(workflow.get("negative")),
@@ -2531,9 +2625,10 @@ def app_html() -> str:
               <label class="wide">源码路径<input id="run-source" placeholder="fixtures/demo_sarif/source"></label>
               <label>Skill Source<select id="run-skill-source"></select></label>
               <label class="wide">Skills 路径<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
-              <label>执行引擎<select id="run-engine"><option value="codex" selected>Codex 三方复核</option><option value="builtin">内置旧流程</option></select></label>
+              <label>执行引擎<select id="run-engine"><option value="codex" selected>Codex 三方复核</option><option value="opencode">OpenCode 三方复核</option><option value="builtin">内置旧流程</option></select></label>
               <label>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
               <label class="run-codex-control">静默提醒时间（分钟）<input id="run-silence-reminder-minutes" type="number" min="1" max="1440" value="60"></label>
+              <label class="run-opencode-control" hidden>OpenCode 模型<input id="run-opencode-model" placeholder="provider/model（留空使用 OpenCode 默认配置）"></label>
               <div class="run-agent-grid" id="run-provider-agent-grid">
                 <label class="run-provider-control">正方提供商<select id="run-affirmative-provider"></select></label>
                 <label class="run-agent-control">正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
@@ -2548,7 +2643,7 @@ def app_html() -> str:
               <label><input id="run-auto-index" type="checkbox"> 预热 Atlas 持久缓存</label>
               <label><input id="run-llm" type="checkbox"> 使用 LLM 博弈</label>
             </div>
-            <div class="muted" id="run-codex-config-note" hidden>Codex 三方复核使用项目 .codex/config.toml 中的模型、MCP 与环境变量默认配置。</div>
+            <div class="muted" id="run-codex-config-note" hidden></div>
             <div class="toolbar">
               <button id="start-run" type="button">启动任务</button>
             </div>
@@ -2646,6 +2741,7 @@ def app_html() -> str:
       runEngine: document.getElementById('run-engine'),
       runMaxRounds: document.getElementById('run-max-rounds'),
       runSilenceReminderMinutes: document.getElementById('run-silence-reminder-minutes'),
+      runOpenCodeModel: document.getElementById('run-opencode-model'),
       runProviderAgentGrid: document.getElementById('run-provider-agent-grid'),
       runToolProviderOptions: document.getElementById('run-tool-provider-options'),
       runCodexConfigNote: document.getElementById('run-codex-config-note'),
@@ -3288,19 +3384,28 @@ def app_html() -> str:
       select.value = normalized;
     }}
 
-    function isCodexRunEngine() {{
-      return (el.runEngine.value || 'codex') === 'codex';
+    function isCliRunEngine() {{
+      return ['codex', 'opencode'].includes(el.runEngine.value || 'codex');
+    }}
+
+    function isOpenCodeRunEngine() {{
+      return (el.runEngine.value || 'codex') === 'opencode';
     }}
 
     function updateRunEngineVisibility() {{
-      const codexMode = isCodexRunEngine();
+      const cliMode = isCliRunEngine();
+      const openCodeMode = isOpenCodeRunEngine();
       el.runProviderAgentGrid.hidden = false;
-      document.querySelectorAll('.run-provider-control').forEach(item => item.hidden = codexMode);
+      document.querySelectorAll('.run-provider-control').forEach(item => item.hidden = cliMode);
       document.querySelectorAll('.run-agent-control').forEach(item => item.hidden = false);
-      document.querySelectorAll('.run-codex-control').forEach(item => item.hidden = !codexMode);
-      el.runToolProviderOptions.hidden = codexMode;
-      el.runCodexConfigNote.hidden = !codexMode;
-      if (codexMode) {{
+      document.querySelectorAll('.run-codex-control').forEach(item => item.hidden = !cliMode);
+      document.querySelectorAll('.run-opencode-control').forEach(item => item.hidden = !openCodeMode);
+      el.runToolProviderOptions.hidden = cliMode;
+      el.runCodexConfigNote.hidden = !cliMode;
+      el.runCodexConfigNote.textContent = openCodeMode
+        ? 'OpenCode 使用本机 provider、MCP 与认证配置；任务角色目录会注入 permission=allow。'
+        : 'Codex 三方复核使用项目 .codex/config.toml 中的模型、MCP 与环境变量默认配置。';
+      if (cliMode) {{
         el.runLlm.checked = false;
         el.runAutoIndex.checked = false;
         el.runExternalTools.checked = true;
@@ -3340,6 +3445,7 @@ def app_html() -> str:
       el.runSource.value = config.source_path || run.source_path || '';
       el.runSkills.value = config.skills_path || '';
       el.runEngine.value = config.engine || run.engine || 'codex';
+      el.runOpenCodeModel.value = config.llm_model || '';
       setSelectValue(el.runSkillSource, config.skill_source_id || '');
       setSelectValue(el.runAffirmativeProvider, config.affirmative_provider_id || '');
       setSelectValue(el.runNegativeProvider, config.negative_provider_id || '');
@@ -3646,7 +3752,7 @@ def app_html() -> str:
     }}
 
     function enableRunLlmForSelectedProviders() {{
-      if (isCodexRunEngine()) return;
+      if (isCliRunEngine()) return;
       if (el.runAffirmativeProvider.value || el.runNegativeProvider.value || el.runModeratorProvider.value) {{
         el.runLlm.checked = true;
       }}
@@ -3724,7 +3830,8 @@ def app_html() -> str:
 
     async function startRun() {{
       try {{
-        const codexMode = isCodexRunEngine();
+        const cliMode = isCliRunEngine();
+        const openCodeMode = isOpenCodeRunEngine();
         const payload = {{
           report_path: el.runSarif.value.trim(),
           source_path: el.runSource.value.trim(),
@@ -3733,12 +3840,13 @@ def app_html() -> str:
           skills_path: el.runSkills.value.trim() || null,
           max_rounds: Number(el.runMaxRounds.value || 4),
           silence_reminder_minutes: Number(el.runSilenceReminderMinutes.value || 60),
-          enable_external_tools: codexMode ? true : el.runExternalTools.checked,
-          auto_index_tools: codexMode ? false : el.runAutoIndex.checked,
-          enable_llm: codexMode ? false : el.runLlm.checked,
-          affirmative_provider_id: codexMode ? null : (el.runAffirmativeProvider.value || null),
-          negative_provider_id: codexMode ? null : (el.runNegativeProvider.value || null),
-          moderator_provider_id: codexMode ? null : (el.runModeratorProvider.value || null),
+          llm_model: openCodeMode ? (el.runOpenCodeModel.value.trim() || null) : null,
+          enable_external_tools: cliMode ? true : el.runExternalTools.checked,
+          auto_index_tools: cliMode ? false : el.runAutoIndex.checked,
+          enable_llm: cliMode ? false : el.runLlm.checked,
+          affirmative_provider_id: cliMode ? null : (el.runAffirmativeProvider.value || null),
+          negative_provider_id: cliMode ? null : (el.runNegativeProvider.value || null),
+          moderator_provider_id: cliMode ? null : (el.runModeratorProvider.value || null),
           affirmative_agent_profile: el.runAffirmativeAgentProfile.value || null,
           negative_agent_profile: el.runNegativeAgentProfile.value || null,
           moderator_agent_profile: el.runModeratorAgentProfile.value || null
@@ -3990,7 +4098,12 @@ def app_html() -> str:
           button.disabled = true;
           button.textContent = '关闭中...';
         }}
-        await fetchJson(`/runs/${{encodeURIComponent(runId)}}/codex-sessions/stop`, jsonPost({{}}));
+        const run = state.runs.find(item => item.run_id === runId) || {{}};
+        const legacyCodexStopPath = `/runs/${{encodeURIComponent(runId)}}/codex-sessions/stop`;
+        const stopPath = run.engine === 'opencode'
+          ? `/runs/${{encodeURIComponent(runId)}}/cli-sessions/stop`
+          : legacyCodexStopPath;
+        await fetchJson(stopPath, jsonPost({{}}));
         closeCodexTerminal();
         await loadRuns();
         if (state.selectedRun === runId) {{
@@ -4097,8 +4210,8 @@ def app_html() -> str:
       const agents = run.agent_configs || {{}};
       const origin = runOriginLabel(run);
       const engine = run.engine || (run.config && run.config.engine) || 'builtin';
-      const codexEngine = engine === 'codex';
-      const codexActiveAgentHtml = codexEngine ? renderCodexActiveAgent(run, findings, status) : '';
+      const cliEngine = ['codex', 'opencode'].includes(engine);
+      const codexActiveAgentHtml = cliEngine ? renderCodexActiveAgent(run, findings, status) : '';
       const legacyRuntimeHtml = `
           <div><strong>正方 LLM：</strong> ${{esc(providerLabel(providers.affirmative, providers.enabled))}}</div>
           <div><strong>反方 LLM：</strong> ${{esc(providerLabel(providers.negative, providers.enabled))}}</div>
@@ -4107,8 +4220,12 @@ def app_html() -> str:
           <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
           <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
           ${{agentInstructions(agents) ? `<pre>${{esc(agentInstructions(agents))}}</pre>` : ''}}`;
-      const codexRuntimeHtml = `
-          <div><strong>Codex 配置：</strong> 使用项目 <span class="path">.codex/config.toml</span> 中的模型、MCP 与环境变量默认配置。</div>
+      const cliRuntimeHtml = `
+          <div><strong>${{engine === 'opencode' ? 'OpenCode' : 'Codex'}} 配置：</strong> ${{
+            engine === 'opencode'
+              ? '使用本机 provider/MCP 配置和任务角色目录中的 permission=allow。'
+              : '使用项目 .codex/config.toml 中的模型、MCP 与环境变量默认配置。'
+          }}</div>
           <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
           <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
           <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>`;
@@ -4150,7 +4267,7 @@ def app_html() -> str:
           ${{currentHint ? `<div><strong>当前状态：</strong> ${{esc(currentHint)}}</div>` : ''}}
           ${{codexActiveAgentHtml}}
           ${{resumeHint ? `<div><strong>恢复点：</strong> ${{esc(resumeHint)}}</div>` : ''}}
-          ${{codexEngine ? codexRuntimeHtml : legacyRuntimeHtml}}
+          ${{cliEngine ? cliRuntimeHtml : legacyRuntimeHtml}}
           ${{run.error ? `<div class="error">${{esc(run.error)}}</div>` : `<div class="muted">${{esc(runningMessage)}}</div>`}}
           ${{run.diagnostics && run.diagnostics.length ? `<pre>${{esc(run.diagnostics.join('\\n'))}}</pre>` : ''}}
         </div>
@@ -4256,20 +4373,22 @@ def app_html() -> str:
 
     function engineLabel(engine) {{
       if (engine === 'codex') return 'Codex 三方复核';
+      if (engine === 'opencode') return 'OpenCode 三方复核';
       return '内置旧流程';
     }}
 
     function renderCodexSessionButtons(run) {{
-      const sessions = Array.isArray(run.codex_sessions) ? run.codex_sessions : [];
+      const sessions = Array.isArray(run.cli_sessions) ? run.cli_sessions : (Array.isArray(run.codex_sessions) ? run.codex_sessions : []);
       if (!sessions.length) return '';
       const labels = {{ moderator: 'Moderator 终端', affirmative: '正方终端', negative: '反方终端' }};
       const liveCount = sessions.filter(session => session.live).length;
-      return `<div><strong>Codex Sessions：</strong><div class="codex-session-buttons">
-        ${{sessions.map(session => `<button type="button" title="在当前页面打开原始 Codex TUI" data-run-id="${{esc(run.run_id)}}" data-codex-terminal-role="${{esc(session.role || '')}}">
-          ${{esc(labels[session.role] || session.role || 'Codex')}}${{session.live ? ' · live' : ''}}
+      const backend = run.engine === 'opencode' ? 'OpenCode' : 'Codex';
+      return `<div><strong>CLI Sessions：</strong><div class="codex-session-buttons">
+        ${{sessions.map(session => `<button type="button" title="${{backend === 'Codex' ? '在当前页面打开原始 Codex TUI' : '在当前页面打开 OpenCode TUI'}}" data-run-id="${{esc(run.run_id)}}" data-codex-terminal-role="${{esc(session.role || '')}}" data-cli-backend="${{esc(session.backend || run.engine || '')}}">
+          ${{esc(labels[session.role] || session.role || backend)}}${{session.live ? ' · live' : ''}}
         </button>`).join('')}}
-        <button type="button" class="danger-button" title="关闭当前任务的全部 Codex tmux session" data-run-id="${{esc(run.run_id)}}" data-codex-stop-sessions="true" ${{liveCount ? '' : 'disabled'}}>
-          关闭全部 Codex Sessions${{liveCount ? ` · ${{liveCount}} live` : ''}}
+        <button type="button" class="danger-button" title="${{backend === 'Codex' ? '关闭当前任务的全部 Codex tmux session' : '关闭当前任务的全部 OpenCode tmux session'}}" data-run-id="${{esc(run.run_id)}}" data-codex-stop-sessions="true" ${{liveCount ? '' : 'disabled'}}>
+          ${{backend === 'Codex' ? '关闭全部 Codex Sessions' : '关闭全部 OpenCode Sessions'}}${{liveCount ? ` · ${{liveCount}} live` : ''}}
         </button>
       </div></div>`;
     }}
@@ -4307,7 +4426,9 @@ def app_html() -> str:
         }}
         return {{ agent: 'Moderator', stage: '等待任务收尾。', active: true }};
       }}
-      const delivery = current.codex_delivery && typeof current.codex_delivery === 'object' ? current.codex_delivery : {{}};
+      const delivery = current.cli_delivery && typeof current.cli_delivery === 'object'
+        ? current.cli_delivery
+        : (current.codex_delivery && typeof current.codex_delivery === 'object' ? current.codex_delivery : {{}});
       const findingText = `Finding：${{currentId}}`;
       if (!delivery.affirmative) {{
         return {{ agent: '正方', stage: `${{findingText}}，正方验证阶段，等待正方 result.json。`, active: true }};
@@ -4344,9 +4465,11 @@ def app_html() -> str:
 
     async function openCodexTerminal(runId, role) {{
       if (!runId || !role) return;
-      const url = `/runs/${{encodeURIComponent(runId)}}/codex-sessions/${{encodeURIComponent(role)}}/terminal-ui`;
+      const url = `/runs/${{encodeURIComponent(runId)}}/cli-sessions/${{encodeURIComponent(role)}}/terminal-ui`;
       const labels = {{ moderator: 'Moderator', affirmative: '正方', negative: '反方' }};
-      el.codexTerminalFrameTitle.textContent = `${{labels[role] || role}} Codex TUI`;
+      const run = state.runs.find(item => item.run_id === runId) || {{}};
+      const backend = run.engine === 'opencode' ? 'OpenCode TUI' : 'Codex TUI';
+      el.codexTerminalFrameTitle.textContent = `${{labels[role] || role}} ${{backend}}`;
       el.codexTerminalFrameMeta.textContent = `${{runId}} · ${{role}}`;
       el.codexTerminalFrame.src = url;
       el.codexTerminalFrameModal.classList.add('open');
@@ -4796,14 +4919,16 @@ def app_html() -> str:
     }}
 
     function renderCodexWorkflowSection(detail) {{
-      const workflow = detail.codex_workflow && typeof detail.codex_workflow === 'object' ? detail.codex_workflow : null;
+      const workflow = detail.cli_workflow && typeof detail.cli_workflow === 'object'
+        ? detail.cli_workflow
+        : (detail.codex_workflow && typeof detail.codex_workflow === 'object' ? detail.codex_workflow : null);
       if (!workflow) return '';
       const moderator = workflow.moderator && typeof workflow.moderator === 'object' ? workflow.moderator : {{}};
       const affirmative = workflow.affirmative && typeof workflow.affirmative === 'object' ? workflow.affirmative : {{}};
       const negative = workflow.negative && typeof workflow.negative === 'object' ? workflow.negative : {{}};
       const moderatorText = moderator.final_conclusion || moderator.reasoning_summary || detail.final_conclusion || detail.reasoning_summary || '';
       return `<div class="detail">
-        <h3>Codex 三方复核</h3>
+        <h3>CLI 三方复核</h3>
         <div class="detail-body">
           <div>
             <strong>Moderator 总结：</strong>
