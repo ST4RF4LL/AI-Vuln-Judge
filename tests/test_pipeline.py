@@ -3243,12 +3243,12 @@ for raw in sys.stdin.buffer:
                 llm_server.server_close()
                 llm_thread.join(timeout=5)
 
-    def test_vuln_judger_mcp_server_defaults_to_async_codex_engine(self):
+    def test_vuln_judger_mcp_server_defaults_to_async_opencode_engine(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             captured = {}
 
-            class FakeCodexRunner:
+            class FakeOpenCodeRunner:
                 def __init__(self, *, records_dir):
                     captured["records_dir"] = records_dir
 
@@ -3259,7 +3259,7 @@ for raw in sys.stdin.buffer:
                         "run_id": config.run_id,
                         "status": "completed",
                         "run_origin": run_origin,
-                        "engine": "codex",
+                        "engine": "opencode",
                         "created_at": "2026-07-09T00:00:00Z",
                         "source_path": str(config.source_path),
                         "sarif_path": str(config.sarif_path),
@@ -3267,7 +3267,7 @@ for raw in sys.stdin.buffer:
                         "completed_finding_count": 0,
                         "reports": [],
                         "diagnostics": [],
-                        "config": {"engine": "codex"},
+                        "config": {"engine": "opencode"},
                     }
                     store.save_payload(payload)
                     return payload
@@ -3281,7 +3281,7 @@ for raw in sys.stdin.buffer:
                     agents_dir=root / "agents",
                 )
             )
-            with patch("vuln_judger.mcp_server.CodexDrivenRunner", FakeCodexRunner):
+            with patch("vuln_judger.mcp_server.OpenCodeDrivenRunner", FakeOpenCodeRunner):
                 started = server._judge_report(
                     {
                         "report_path": str(root / "report.md"),
@@ -3299,11 +3299,11 @@ for raw in sys.stdin.buffer:
 
             server.close()
             self.assertTrue(started["asynchronous"])
-            self.assertEqual(started["engine"], "codex")
+            self.assertEqual(started["engine"], "opencode")
             self.assertEqual(started["poll"]["tool"], "get_run")
             self.assertEqual(completed["status"], "completed")
             self.assertEqual(completed["run_origin"], "mcp")
-            self.assertEqual(captured["config"].engine, "codex")
+            self.assertEqual(captured["config"].engine, "opencode")
             self.assertIsNone(captured["config"].mcp_servers_file)
             self.assertFalse(captured["config"].enable_llm)
             self.assertEqual(captured["config"].silence_reminder_minutes, 23)
@@ -3336,6 +3336,7 @@ for raw in sys.stdin.buffer:
                     {
                         "report_path": str(root / "report.md"),
                         "source_path": str(root / "source"),
+                        "engine": "codex",
                     }
                 )
                 stopping = server._stop_run({"run_id": started["run_id"]})
@@ -3382,7 +3383,7 @@ for raw in sys.stdin.buffer:
                 self.assertIn("export_run_markdown", tools)
                 self.assertIn("stop_run", tools)
                 judge_spec = next(tool for tool in tool_specs if tool.get("name") == "judge_report")
-                self.assertEqual(judge_spec["inputSchema"]["properties"]["engine"]["default"], "codex")
+                self.assertEqual(judge_spec["inputSchema"]["properties"]["engine"]["default"], "opencode")
                 self.assertEqual(
                     judge_spec["inputSchema"]["properties"]["silence_reminder_minutes"]["default"],
                     DEFAULT_SILENCE_REMINDER_MINUTES,

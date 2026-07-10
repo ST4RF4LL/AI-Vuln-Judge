@@ -153,7 +153,7 @@ class JudgerMCPServer:
         raise ValueError(f"Unknown tool: {name}")
 
     def _judge_report(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        engine = str(arguments.get("engine") or CODEX_ENGINE).strip().lower()
+        engine = str(arguments.get("engine") or OPENCODE_ENGINE).strip().lower()
         if engine not in {*CLI_ENGINES, BUILTIN_ENGINE}:
             raise ValueError(f"Unsupported engine: {engine}")
         report_path = _required_path(arguments, "report_path")
@@ -561,14 +561,14 @@ def _tool_specs() -> List[Dict[str, Any]]:
     return [
         _tool(
             "judge_report",
-            "Start a vuln-judger review. The default codex engine runs asynchronously; poll get_run with the returned run_id.",
+            "Start a vuln-judger review. The default opencode engine runs asynchronously; poll get_run with the returned run_id.",
             {
                 "report_path": {"type": "string", "description": "SARIF/JSON/Markdown report path."},
                 "source_path": {"type": "string", "description": "Source tree root path."},
                 "engine": {
                     "type": "string",
                     "enum": [CODEX_ENGINE, OPENCODE_ENGINE, BUILTIN_ENGINE],
-                    "default": CODEX_ENGINE,
+                    "default": OPENCODE_ENGINE,
                     "description": "codex or opencode starts the three-session CLI workflow; builtin keeps the legacy in-process pipeline.",
                 },
                 "skills_path": {"type": "string", "description": "Optional project skills directory."},
@@ -600,12 +600,12 @@ def _tool_specs() -> List[Dict[str, Any]]:
                 "save": {
                     "type": "boolean",
                     "default": True,
-                    "description": "The codex engine requires true so asynchronous progress can be polled.",
+                    "description": "CLI engines require true so asynchronous progress can be polled.",
                 },
                 "wait_for_completion": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Codex only. Prefer false to avoid MCP tool timeouts.",
+                    "description": "CLI engines only. Prefer false to avoid MCP tool timeouts.",
                 },
                 "include_report": {"type": "boolean", "default": False},
                 "run_id": {"type": "string"},
@@ -683,7 +683,7 @@ def _tool_specs() -> List[Dict[str, Any]]:
         ),
         _tool(
             "stop_run",
-            "Request cancellation of an asynchronous codex review started by this MCP server.",
+            "Request cancellation of an asynchronous CLI review started by this MCP server.",
             {"run_id": {"type": "string"}},
             ["run_id"],
         ),
