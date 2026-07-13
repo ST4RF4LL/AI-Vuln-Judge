@@ -8,6 +8,7 @@ import socket
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
@@ -123,6 +124,8 @@ class OpenCodeTmuxSession:
     def start(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         if self.is_live() and _server_healthy(self.server_url):
+            self._ensure_provider_session(validate=True)
+            self._save_state()
             self._ensure_tui()
             return
         if _tmux_target_live(self.session_name):
@@ -164,6 +167,7 @@ class OpenCodeTmuxSession:
             self.stop()
             detail = _tail_text(self.server_log, 30)
             raise CodexRunnerError(f"OpenCode server 未就绪：{self.server_url}; {detail}")
+        self._ensure_provider_session(validate=True)
         self._save_state()
         self._ensure_tui()
         LOG.info(
@@ -188,6 +192,8 @@ class OpenCodeTmuxSession:
             raise CodexRunnerError("OpenCode prompt 不能为空")
         if not self.is_live():
             self.start()
+        self._ensure_provider_session()
+        self._ensure_tui()
         if _tmux_target_live(self.run_target):
             raise CodexRunnerError(f"OpenCode session 正在执行任务：{self.role}")
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -306,6 +312,7 @@ class OpenCodeTmuxSession:
                 self._current_prompt_path = None
                 self._current_event_path = None
                 self._current_exit_path = None
+                self._ensure_provider_session()
                 self._save_state()
                 self._launch_prompt(prompt)
                 return None
@@ -368,6 +375,16 @@ class OpenCodeTmuxSession:
                 self._save_state()
                 self._ensure_tui()
                 return
+
+    def _ensure_provider_session(self, *, validate: bool = False) -> None:
+        if self._provider_session_id and (
+            not validate or _opencode_session_exists(self.server_url, self._provider_session_id)
+        ):
+            return
+        self._provider_session_id = _create_opencode_session(
+            self.server_url,
+            title=f"vuln-judger {self.run_id} {self.role}",
+        )
 
     def _ensure_tui(self) -> None:
         if not self._provider_session_id or not _tmux_target_live(self.server_target):
@@ -581,7 +598,6 @@ def _ensure_opencode_tui_window(
     ]
     if mini:
         args.append("--mini")
-    invocation = _shell_command(args)
     _run_tmux(
         [
             "tmux",
@@ -593,12 +609,11 @@ def _ensure_opencode_tui_window(
             "tui",
             "-c",
             str(cwd),
-            "sh",
-            "-lc",
-            invocation,
+            *args,
         ],
         timeout=15,
     )
+    _wait_for_opencode_tui(target)
     return target
 
 
@@ -608,6 +623,24 @@ def _shell_command(args: list[str]) -> str:
 
 def _tmux_target_live(target: str) -> bool:
     return _run_tmux(["tmux", "list-panes", "-t", target], timeout=5, check=False).returncode == 0
+
+
+def _wait_for_opencode_tui(target: str) -> None:
+    timeout = float(os.environ.get("VULN_JUDGER_OPENCODE_TUI_READY_TIMEOUT", "10"))
+    deadline = time.monotonic() + max(timeout, 0.1)
+    detail = ""
+    while time.monotonic() < deadline:
+        result = _run_tmux(
+            ["tmux", "capture-pane", "-p", "-t", target],
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0 and (result.stdout or "").strip():
+            return
+        detail = (result.stderr or result.stdout or "").strip()
+        time.sleep(0.1)
+    suffix = f"；{detail}" if detail else ""
+    raise CodexRunnerError(f"OpenCode TUI 未在超时内生成可捕获画面：{target}{suffix}")
 
 
 def _free_local_port() -> int:
@@ -631,6 +664,39 @@ def _server_healthy(url: str) -> bool:
             return 200 <= response.status < 300
     except (OSError, urllib.error.URLError):
         return False
+
+
+def _opencode_session_exists(url: str, session_id: str) -> bool:
+    encoded_id = urllib.parse.quote(session_id, safe="")
+    try:
+        with urllib.request.urlopen(f"{url}/session/{encoded_id}", timeout=3) as response:
+            return 200 <= response.status < 300
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False
+        raise CodexRunnerError(f"OpenCode session 校验失败：HTTP {exc.code}") from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise CodexRunnerError(f"OpenCode session 校验失败：{exc}") from exc
+
+
+def _create_opencode_session(url: str, *, title: str) -> str:
+    request = urllib.request.Request(
+        f"{url}/session",
+        data=json.dumps({"title": title}, ensure_ascii=False).encode("utf-8"),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise CodexRunnerError(f"OpenCode session 创建失败：HTTP {exc.code}") from exc
+    except (OSError, urllib.error.URLError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CodexRunnerError(f"OpenCode session 创建失败：{exc}") from exc
+    session_id = _text(payload.get("id")) if isinstance(payload, dict) else None
+    if not session_id:
+        raise CodexRunnerError("OpenCode session 创建失败：响应缺少 id")
+    return session_id
 
 
 def _find_session_id(value: Any) -> Optional[str]:

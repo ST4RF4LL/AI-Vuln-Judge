@@ -5242,6 +5242,8 @@ class OpenCodeRunnerTests(unittest.TestCase):
             with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
                 "vuln_judger.opencode_runner._run_tmux", return_value=completed
             ) as run_tmux, patch(
+                "vuln_judger.opencode_runner._wait_for_opencode_tui"
+            ) as wait_tui, patch(
                 "vuln_judger.opencode_runner._run_opencode",
                 return_value=subprocess.CompletedProcess(["opencode", "attach", "--help"], 0, "--mini", ""),
             ):
@@ -5257,10 +5259,52 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertEqual(target, "vj-run-1-moderator:tui")
             launch = run_tmux.call_args.args[0]
             self.assertIn("new-window", launch)
-            self.assertIn("opencode attach", launch[-1])
-            self.assertIn("--session ses-123", launch[-1])
-            self.assertIn("--mini", launch[-1])
-            self.assertNotIn("opencode run", launch[-1])
+            self.assertTrue(any(Path(str(item)).name == "opencode" for item in launch))
+            self.assertIn("attach", launch)
+            self.assertIn("--session", launch)
+            self.assertIn("ses-123", launch)
+            self.assertIn("--mini", launch)
+            self.assertNotIn("run", launch)
+            wait_tui.assert_called_once_with("vj-run-1-moderator:tui")
+
+    def test_opencode_start_creates_provider_session_before_tui(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "role"
+            cwd.mkdir()
+            session = OpenCodeTmuxSession(
+                role="moderator",
+                run_id="run-1",
+                cwd=cwd,
+                source_path=root,
+                run_dir=root,
+                command="opencode",
+                capabilities=OpenCodeCapabilities("1.17.10", None),
+            )
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+            def target_live(target):
+                return str(target).endswith(":server")
+
+            with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
+                "vuln_judger.opencode_runner._server_healthy", return_value=True
+            ), patch(
+                "vuln_judger.opencode_runner._create_opencode_session", return_value="ses-created"
+            ) as create_session, patch(
+                "vuln_judger.opencode_runner._wait_for_opencode_tui"
+            ), patch(
+                "vuln_judger.opencode_runner._run_tmux", return_value=completed
+            ) as run_tmux:
+                session.start()
+
+            self.assertEqual(session.info().provider_session_id, "ses-created")
+            create_session.assert_called_once_with(
+                session.server_url,
+                title="vuln-judger run-1 moderator",
+            )
+            tui_launch = run_tmux.call_args.args[0]
+            self.assertIn("attach", tui_launch)
+            self.assertIn("ses-created", tui_launch)
 
     def test_opencode_prompt_uses_run_json_transport_and_explicit_session(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5286,6 +5330,10 @@ class OpenCodeRunnerTests(unittest.TestCase):
 
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
             with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
+                "vuln_judger.opencode_runner._create_opencode_session", return_value="ses-123"
+            ), patch(
+                "vuln_judger.opencode_runner._wait_for_opencode_tui"
+            ), patch(
                 "vuln_judger.opencode_runner._run_tmux", return_value=completed
             ) as run_tmux:
                 session.send("first prompt")
@@ -5360,14 +5408,17 @@ class OpenCodeRunnerTests(unittest.TestCase):
             session._current_exit_path = exit_path
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
             with patch("vuln_judger.opencode_runner._tmux_target_live", return_value=False), patch(
+                "vuln_judger.opencode_runner._create_opencode_session", return_value="ses-new"
+            ), patch(
                 "vuln_judger.opencode_runner._run_tmux", return_value=completed
             ) as run_tmux:
                 failure = session.failure_message()
 
             self.assertIsNone(failure)
-            self.assertIsNone(session._provider_session_id)
+            self.assertEqual(session._provider_session_id, "ses-new")
             shell = run_tmux.call_args.args[0][-1]
             self.assertNotIn("--session ses-old", shell)
+            self.assertIn("--session ses-new", shell)
             self.assertEqual(session._current_prompt_path.read_text(encoding="utf-8"), "resume this stage")
 
     def test_web_and_mcp_surface_opencode_engine(self):

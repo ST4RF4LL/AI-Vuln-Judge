@@ -147,9 +147,9 @@ CLI session。任务进度持续写入 `--records-dir`，因此 CLI 引擎要求
 ### OpenCode 驱动引擎
 
 选择 `engine: "opencode"` 时，每个角色会启动一个仅监听 `127.0.0.1` 的
-`opencode serve`，阶段 prompt 通过 `opencode run --attach --format json` 发送。系统从
-JSON 事件中保存明确的 OpenCode session ID，后续阶段使用 `--session` 续接，不依赖 TUI
-按键、焦点或粘贴行为。Web 端的 CLI Session 终端使用同一 session 的
+`opencode serve`，通过本地 HTTP API 预先创建明确的 OpenCode session，再用
+`opencode run --attach --format json --session` 发送阶段 prompt，不依赖 TUI 按键、焦点或
+粘贴行为。JSON 事件中的 session ID 仍作为旧记录兼容兜底。Web 端的 CLI Session 终端使用同一 session 的
 `opencode attach --mini` 窗口，因此可以捕获并交互查看历史输出；该 TUI 不承担自动任务投递。
 
 每个角色目录都会生成 `.opencode/opencode.json`，并通过 `OPENCODE_CONFIG` 和
@@ -163,6 +163,7 @@ JSON 事件中保存明确的 OpenCode session ID，后续阶段使用 `--sessio
 - `VULN_JUDGER_OPENCODE_MODEL`：默认 `provider/model`；Web/MCP 单次任务的 `llm_model` 优先。
 - `VULN_JUDGER_OPENCODE_WORKSPACES_DIR`：OpenCode 任务工作目录。
 - `VULN_JUDGER_OPENCODE_READY_TIMEOUT`：等待本地 server 就绪的秒数，默认 30。
+- `VULN_JUDGER_OPENCODE_TUI_READY_TIMEOUT`：等待 TUI 生成可捕获画面的秒数，默认 10。
 
 ### Codex 配置
 
