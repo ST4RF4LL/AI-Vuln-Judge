@@ -39,8 +39,8 @@ from .run_state import (
     finding_report_completed,
     first_incomplete_finding_index,
 )
-from .sarif import ReportPreparationError, load_report
-from .source import SourceIndexer, detect_project_languages
+from .sarif import parse_sarif, sarif_grouping_is_ambiguous, validate_sarif_report
+from .source import SourceIndexer
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +50,7 @@ OPENCODE_ENGINE = "opencode"
 CLI_ENGINES = frozenset({CODEX_ENGINE, OPENCODE_ENGINE})
 CODEX_ROLES = ("moderator", "affirmative", "negative")
 CODEX_AGENT_FILE_NAMES = ("AGENTS.md", "AGENT.md")
+LOCAL_SARIF_FINDINGS_ORIGIN = "local_sarif"
 SILENCE_REMINDER_PROMPT = "上一个agent已完成输出，请确认并继续任务"
 LOG = logger("codex_runner")
 ROLE_LABELS = {
@@ -342,7 +343,8 @@ class CliDrivenRunner:
         (run_dir / "input").mkdir(exist_ok=True)
         (run_dir / "findings").mkdir(exist_ok=True)
 
-        languages = list(detect_project_languages(source_path).languages)
+        source_indexer = SourceIndexer(source_path)
+        languages = list(source_indexer.languages)
         created_at = config.created_at or _now()
         agent_configs = _codex_agent_configs(config)
         session_dirs = self._prepare_agent_dirs(run_dir, agent_configs, source_path)
@@ -408,9 +410,20 @@ class CliDrivenRunner:
                     f"{ROLE_LABELS.get(session.role, session.role)} {self.cli_name} session 已启动。",
                 ],
             )
-        emit("running", diagnostics=[f"{self.cli_name}-driven 任务已启动，等待 Moderator 处理漏洞报告。"])
+        emit("running", diagnostics=[f"{self.cli_name}-driven 任务已启动，正在准备漏洞报告。"])
 
-        input_payload = _input_payload(config, report_path, source_path, run_dir)
+        report_text, local_findings, parse_error, moderation_reason = _parse_report_locally(report_path)
+        input_payload = _input_payload(
+            config,
+            report_path,
+            source_path,
+            run_dir,
+            source_indexer,
+            report_text=report_text,
+            parsed_findings=local_findings,
+            parse_error=parse_error,
+            moderation_reason=moderation_reason,
+        )
         (run_dir / "input" / "task.json").write_text(
             json.dumps(input_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
@@ -420,19 +433,30 @@ class CliDrivenRunner:
         findings_path = run_dir / "findings.json"
         reuse_findings = config.created_at is not None and findings_path.exists()
         moderator_report_prompt = _moderator_report_prompt(input_payload, findings_path)
-        if not reuse_findings:
+        if reuse_findings:
+            findings_data = _wait_json(
+                findings_path,
+                should_stop=should_stop,
+                reminder_session=sessions["moderator"],
+                stage_prompt=moderator_report_prompt,
+                silence_reminder_seconds=config.silence_reminder_minutes * 60,
+                watchdog_callback=watchdog_event,
+            )
+        elif moderation_reason is None:
+            findings_data = _persist_local_sarif_findings(findings_path, local_findings)
+        else:
             findings_path.unlink(missing_ok=True)
             sessions["moderator"].send(moderator_report_prompt)
-        findings_data = _wait_json(
-            findings_path,
-            should_stop=should_stop,
-            reminder_session=sessions["moderator"],
-            stage_prompt=moderator_report_prompt,
-            silence_reminder_seconds=config.silence_reminder_minutes * 60,
-            watchdog_callback=watchdog_event,
-        )
-        findings = _findings_from_moderator(findings_data, report_path)
-        finding_briefs = _persist_finding_briefs(findings, source_path, run_dir)
+            findings_data = _wait_json(
+                findings_path,
+                should_stop=should_stop,
+                reminder_session=sessions["moderator"],
+                stage_prompt=moderator_report_prompt,
+                silence_reminder_seconds=config.silence_reminder_minutes * 60,
+                watchdog_callback=watchdog_event,
+            )
+        findings = _findings_from_persisted(findings_data, report_path)
+        finding_briefs = _persist_finding_briefs(findings, source_indexer, run_dir)
         reports = _reconcile_finding_reports(findings, config.resume_reports)
         completed_count = completed_finding_count(reports)
         start_index = first_incomplete_finding_index(reports, len(findings))
@@ -442,14 +466,20 @@ class CliDrivenRunner:
         payload["resume_from_finding_index"] = start_index
         payload["resume_from_finding_id"] = findings[start_index].finding_id if start_index < len(findings) else None
         payload["cli_workflow"]["findings_path"] = str(findings_path)
+        preparation_origin = str(findings_data.get("origin") or "moderator")
+        payload["cli_workflow"]["report_preparation_origin"] = preparation_origin
         if self.engine == CODEX_ENGINE:
             payload["codex_workflow"] = payload["cli_workflow"]
-        split_action = "复用磁盘中的" if reuse_findings else "已拆分并持久化"
+        if preparation_origin == LOCAL_SARIF_FINDINGS_ORIGIN:
+            preparation_message = "复用磁盘中的本地 SARIF 解析结果" if reuse_findings else "已直接复用本地 SARIF 解析结果"
+        else:
+            split_action = "复用磁盘中的" if reuse_findings else "已拆分并持久化"
+            preparation_message = f"Moderator {split_action} finding"
         emit(
             "running",
             diagnostics=[
                 *payload.get("diagnostics", []),
-                f"Moderator {split_action} {len(findings)} 个 finding；{completed_count} 个已完成，"
+                f"{preparation_message}，共 {len(findings)} 个 finding；{completed_count} 个已完成，"
                 f"{len(findings) - completed_count} 个未完成。",
             ],
         )
@@ -1209,14 +1239,35 @@ def _step_timeout_seconds(explicit: Optional[float]) -> Optional[float]:
     return timeout if timeout > 0 else None
 
 
-def _input_payload(config: RunConfig, report_path: Path, source_path: Path, run_dir: Path) -> Dict[str, Any]:
+def _parse_report_locally(report_path: Path) -> tuple[str, List[Finding], str, Optional[str]]:
     report_text = report_path.read_text(encoding="utf-8", errors="replace")
-    parsed_findings: List[Dict[str, Any]] = []
-    parse_error = ""
+    if report_path.suffix.lower() in {".md", ".markdown"}:
+        return report_text, [], "", "markdown"
     try:
-        parsed_findings = [_finding_to_prompt_payload(item, source_path) for item in load_report(report_path)]
-    except (ReportPreparationError, json.JSONDecodeError, OSError, ValueError) as exc:
-        parse_error = str(exc)
+        data = json.loads(report_text)
+    except json.JSONDecodeError as exc:
+        return report_text, [], str(exc), "parse_failed"
+    issues = validate_sarif_report(data)
+    if issues:
+        return report_text, [], "；".join(issues), "parse_failed"
+    findings = parse_sarif(data)
+    if sarif_grouping_is_ambiguous(data, findings):
+        return report_text, findings, "", "grouping_ambiguous"
+    return report_text, findings, "", None
+
+
+def _input_payload(
+    config: RunConfig,
+    report_path: Path,
+    source_path: Path,
+    run_dir: Path,
+    source_indexer: SourceIndexer,
+    *,
+    report_text: str,
+    parsed_findings: Sequence[Finding],
+    parse_error: str,
+    moderation_reason: Optional[str],
+) -> Dict[str, Any]:
     return {
         "run_id": config.run_id,
         "report_path": str(report_path),
@@ -1224,8 +1275,9 @@ def _input_payload(config: RunConfig, report_path: Path, source_path: Path, run_
         "skills_path": str(config.skills_path) if config.skills_path else None,
         "run_dir": str(run_dir),
         "max_rounds": config.max_rounds,
-        "parsed_findings": parsed_findings,
+        "parsed_findings": [_finding_to_prompt_payload(item, source_indexer) for item in parsed_findings],
         "parse_error": parse_error,
+        "moderation_reason": moderation_reason,
         "report_excerpt": report_text[:60000],
         "report_truncated": len(report_text) > 60000,
     }
@@ -1330,6 +1382,49 @@ def _moderator_final_prompt(
         "  \"recommended_next_steps\": [\"...\"]\n"
         "}\n\n"
         "只依据已有结果和可复核源码证据裁决，不新增没有证据支持的漏洞事实。"
+    )
+
+
+def _persist_local_sarif_findings(path: Path, findings: Sequence[Finding]) -> Dict[str, Any]:
+    data = {
+        "origin": LOCAL_SARIF_FINDINGS_ORIGIN,
+        "findings": [to_jsonable(finding) for finding in findings],
+    }
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, path)
+    return data
+
+
+def _findings_from_persisted(data: Dict[str, Any], report_path: Path) -> List[Finding]:
+    if data.get("origin") != LOCAL_SARIF_FINDINGS_ORIGIN:
+        return _findings_from_moderator(data, report_path)
+    raw = data.get("findings")
+    if not isinstance(raw, list) or not raw:
+        raise CodexRunnerError("本地 SARIF findings.json 缺少 findings 数组")
+    findings = [_finding_from_local_payload(item) for item in raw if isinstance(item, dict)]
+    if not findings:
+        raise CodexRunnerError("本地 SARIF findings.json 未包含有效 finding")
+    return findings
+
+
+def _finding_from_local_payload(item: Dict[str, Any]) -> Finding:
+    return Finding(
+        finding_id=str(item.get("finding_id") or "finding"),
+        rule_id=str(item.get("rule_id") or "unknown-rule"),
+        message=str(item.get("message") or ""),
+        level=str(item.get("level") or "unknown"),
+        locations=[_location_from_dict(location) for location in item.get("locations") or [] if isinstance(location, dict)],
+        code_flows=[
+            [_location_from_dict(location) for location in flow if isinstance(location, dict)]
+            for flow in item.get("code_flows") or []
+            if isinstance(flow, list)
+        ],
+        properties=dict(item.get("properties") or {}) if isinstance(item.get("properties"), dict) else {},
+        raw=dict(item.get("raw") or {}) if isinstance(item.get("raw"), dict) else {},
     )
 
 
@@ -1679,7 +1774,7 @@ def _debate_turns(affirmative: Dict[str, Any], negative: Dict[str, Any], final: 
 
 def _persist_finding_briefs(
     findings: Sequence[Finding],
-    source_path: Path,
+    source_indexer: SourceIndexer,
     run_dir: Path,
 ) -> Dict[str, Path]:
     paths: Dict[str, Path] = {}
@@ -1689,7 +1784,7 @@ def _persist_finding_briefs(
         brief_path = finding_dir / "brief.json"
         brief_path.write_text(
             json.dumps(
-                _finding_to_prompt_payload(finding, source_path),
+                _finding_to_prompt_payload(finding, source_indexer),
                 ensure_ascii=False,
                 indent=2,
                 sort_keys=True,
@@ -1701,11 +1796,10 @@ def _persist_finding_briefs(
     return paths
 
 
-def _finding_to_prompt_payload(finding: Finding, source_path: Path) -> Dict[str, Any]:
-    indexer = SourceIndexer(source_path)
+def _finding_to_prompt_payload(finding: Finding, source_indexer: SourceIndexer) -> Dict[str, Any]:
     contexts = []
     for location in finding.locations[:8]:
-        resolved = indexer.resolve_location(location)
+        resolved = source_indexer.resolve_location(location)
         contexts.append(
             {
                 "reported": location.display(),

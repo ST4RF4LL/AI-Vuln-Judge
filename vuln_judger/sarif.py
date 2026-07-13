@@ -76,6 +76,7 @@ def prepare_report_for_processing(
     moderator_client: Optional[LLMClient] = None,
     moderator_agent: Optional[AgentConfig] = None,
     source_path: Optional[Path] = None,
+    source_indexer: Optional[SourceIndexer] = None,
 ) -> PreparedReport:
     """Prepare a report without modifying the original file."""
     report_path = path.expanduser().resolve()
@@ -100,12 +101,12 @@ def prepare_report_for_processing(
             temporary_paths=temp_paths,
         )
 
+    report_text = report_path.read_text(encoding="utf-8", errors="replace")
     try:
-        data = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+        data = json.loads(report_text)
     except json.JSONDecodeError:
-        text = report_path.read_text(encoding="utf-8", errors="replace")
         findings, temp_paths, markdown_diagnostics = moderator_prepare_markdown_report(
-            text,
+            report_text,
             source_name=str(report_path),
             moderator_client=moderator_client,
             moderator_agent=moderator_agent,
@@ -125,9 +126,28 @@ def prepare_report_for_processing(
     issues = validate_sarif_report(reviewed)
     diagnostics.append(_validation_diagnostic(issues))
     if issues:
-        raise ReportPreparationError("SARIF 格式验证失败：" + "；".join(issues))
+        if moderator_client is None:
+            raise ReportPreparationError("SARIF 格式验证失败：" + "；".join(issues))
+        findings, temp_paths, parse_diagnostics = moderator_prepare_markdown_report(
+            report_text,
+            source_name=str(report_path),
+            moderator_client=moderator_client,
+            moderator_agent=moderator_agent,
+        )
+        diagnostics.extend(parse_diagnostics)
+        diagnostics.append(f"Moderator 已将解析失败的 SARIF 整理为 {len(findings)} 个持久单漏洞 Markdown 报告")
+        return PreparedReport(
+            report_path,
+            temp_paths[0] if temp_paths else report_path,
+            diagnostics,
+            temporary=bool(temp_paths),
+            findings=findings,
+            temporary_paths=temp_paths,
+        )
     diagnostics.extend(f"Moderator 修复 SARIF 读取异常：{item}" for item in repairs)
-    if moderator_client is not None and source_path is not None:
+    source_findings = parse_sarif(reviewed)
+    grouping_ambiguous = sarif_grouping_is_ambiguous(reviewed, source_findings)
+    if moderator_client is not None and source_path is not None and grouping_ambiguous:
         try:
             findings, temp_paths, sarif_diagnostics = moderator_prepare_sarif_report(
                 reviewed,
@@ -135,6 +155,7 @@ def prepare_report_for_processing(
                 source_path,
                 moderator_client=moderator_client,
                 moderator_agent=moderator_agent,
+                source_indexer=source_indexer,
             )
         except ReportPreparationError as exc:
             diagnostics.append(f"Moderator SARIF 预处理失败，回退原始 SARIF：{exc}")
@@ -149,15 +170,17 @@ def prepare_report_for_processing(
                 findings=findings,
                 temporary_paths=temp_paths,
             )
+    elif not grouping_ambiguous:
+        diagnostics.append("合法 SARIF 已在本地解析，直接按原始 results 处理")
     elif moderator_client is None:
-        diagnostics.append("Moderator LLM 未启用，SARIF 报告按原始 results 处理")
+        diagnostics.append("SARIF 分组存在歧义，但 Moderator LLM 未启用，按原始 results 处理")
     elif source_path is None:
-        diagnostics.append("未提供源码路径，SARIF 报告按原始 results 处理")
+        diagnostics.append("SARIF 分组存在歧义，但未提供源码路径，按原始 results 处理")
     if repairs:
         temp_path = _write_temp_sarif(reviewed, report_path)
         diagnostics.append(f"Moderator 已将修复后的 SARIF 写入临时文件：{temp_path}")
-        return PreparedReport(report_path, temp_path, diagnostics, temporary=True)
-    return PreparedReport(report_path, report_path, diagnostics, temporary=False)
+        return PreparedReport(report_path, temp_path, diagnostics, temporary=True, findings=source_findings)
+    return PreparedReport(report_path, report_path, diagnostics, temporary=False, findings=source_findings)
 
 
 def moderator_prepare_markdown_report(
@@ -388,6 +411,7 @@ def moderator_prepare_sarif_report(
     source_path: Path,
     moderator_client: LLMClient,
     moderator_agent: Optional[AgentConfig] = None,
+    source_indexer: Optional[SourceIndexer] = None,
 ) -> tuple[List[Finding], List[Path], List[str]]:
     diagnostics: List[str] = []
     source_findings = parse_sarif(sarif_data)
@@ -400,6 +424,7 @@ def moderator_prepare_sarif_report(
         source_path=source_path,
         moderator_client=moderator_client,
         moderator_agent=moderator_agent,
+        source_indexer=source_indexer,
         diagnostics=diagnostics,
     )
     findings, temp_paths = _write_moderated_sarif_findings(reports, source_findings, report_path)
@@ -414,9 +439,17 @@ def _moderator_sarif_reports_with_retries(
     source_path: Path,
     moderator_client: LLMClient,
     moderator_agent: Optional[AgentConfig],
+    source_indexer: Optional[SourceIndexer],
     diagnostics: List[str],
 ) -> List[ModeratedSarifReport]:
-    system, user = _sarif_moderation_prompt(sarif_data, source_findings, report_path, source_path, moderator_agent)
+    system, user = _sarif_moderation_prompt(
+        sarif_data,
+        source_findings,
+        report_path,
+        source_path,
+        moderator_agent,
+        source_indexer=source_indexer,
+    )
     attempts = SARIF_MODERATION_RETRIES + 1
     last_error = "unknown error"
     for attempt in range(1, attempts + 1):
@@ -449,6 +482,8 @@ def _sarif_moderation_prompt(
     report_path: Path,
     source_path: Path,
     moderator_agent: Optional[AgentConfig],
+    *,
+    source_indexer: Optional[SourceIndexer] = None,
 ) -> tuple[str, str]:
     agent = moderator_agent or DEFAULT_MODERATOR_AGENT
     agent_instructions = (agent.instructions or "").strip()
@@ -465,7 +500,7 @@ def _sarif_moderation_prompt(
         "source_report": str(report_path),
         "source_root": str(source_path.expanduser().resolve()),
         "sarif_tool": _sarif_tool_name(sarif_data),
-        "results": _sarif_results_for_moderator(source_findings, source_path),
+        "results": _sarif_results_for_moderator(source_findings, source_path, source_indexer=source_indexer),
     }
     user = (
         "请读取下面 SARIF 结果和源码上下文，拆分/合并为独立漏洞报告。\n"
@@ -491,8 +526,13 @@ def _sarif_tool_name(sarif_data: Dict[str, Any]) -> str:
     return str(driver.get("name") or "")
 
 
-def _sarif_results_for_moderator(source_findings: Sequence[Finding], source_path: Path) -> List[Dict[str, Any]]:
-    indexer = SourceIndexer(source_path)
+def _sarif_results_for_moderator(
+    source_findings: Sequence[Finding],
+    source_path: Path,
+    *,
+    source_indexer: Optional[SourceIndexer] = None,
+) -> List[Dict[str, Any]]:
+    indexer = source_indexer or SourceIndexer(source_path)
     results: List[Dict[str, Any]] = []
     for result_index, finding in enumerate(source_findings):
         results.append(
@@ -821,6 +861,55 @@ def parse_sarif(data: Dict[str, Any]) -> List[Finding]:
     return findings
 
 
+def sarif_grouping_is_ambiguous(
+    data: Dict[str, Any],
+    findings: Optional[Sequence[Finding]] = None,
+) -> bool:
+    """Return whether SARIF results carry evidence that a 1:1 finding mapping is unsafe."""
+    raw_results = [
+        result
+        for run in data.get("runs", [])
+        if isinstance(run, dict)
+        for result in run.get("results", [])
+        if isinstance(result, dict)
+    ]
+    parsed_findings = list(findings) if findings is not None else parse_sarif(data)
+    if not raw_results or len(raw_results) != len(parsed_findings):
+        return True
+
+    seen_signatures = set()
+    for finding in parsed_findings:
+        signature = (
+            finding.rule_id,
+            finding.message,
+            tuple(location.display() for location in finding.locations),
+            tuple(tuple(location.display() for location in flow) for flow in finding.code_flows),
+        )
+        if signature in seen_signatures:
+            return True
+        seen_signatures.add(signature)
+
+    seen_markers = set()
+    for result in raw_results:
+        markers = []
+        correlation_guid = str(result.get("correlationGuid") or "").strip()
+        if correlation_guid:
+            markers.append(("correlationGuid", correlation_guid))
+        for field in ("fingerprints", "partialFingerprints"):
+            values = result.get(field)
+            if not isinstance(values, dict):
+                continue
+            markers.extend(
+                (field, str(name), str(value))
+                for name, value in values.items()
+                if str(value).strip()
+            )
+        if any(marker in seen_markers for marker in markers):
+            return True
+        seen_markers.update(markers)
+    return False
+
+
 def _rules_by_id(run: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     by_id: Dict[str, Dict[str, Any]] = {}
     for extension in run.get("tool", {}).get("extensions", []):
@@ -834,7 +923,7 @@ def _rules_by_id(run: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 
 def _message_text(message: Optional[Dict[str, Any]]) -> str:
-    if not message:
+    if not isinstance(message, dict):
         return ""
     return str(message.get("text") or message.get("markdown") or "")
 

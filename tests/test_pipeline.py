@@ -544,15 +544,56 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("faiss/IndexFastScan.cpp", finding.raw["markdown"])
             self.assertIn("faiss/impl/index_read.cpp", prepared.effective_path.read_text(encoding="utf-8"))
 
-    def test_sarif_report_is_moderated_with_source_into_markdown_findings(self):
+    def test_valid_sarif_reuses_local_parse_without_moderator(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sarif, _skills = write_python_fixture(root)
+            moderator = FakeLLM("unused")
+
+            prepared = prepare_report_for_processing(sarif, moderator_client=moderator, source_path=root)
+
+            self.assertFalse(prepared.temporary)
+            self.assertEqual(len(prepared.findings or []), 1)
+            self.assertEqual(prepared.findings[0].rule_id, "python-command-injection")
+            self.assertEqual(moderator.calls, [])
+            self.assertTrue(any("直接按原始 results 处理" in item for item in prepared.diagnostics))
+
+    def test_structurally_invalid_sarif_uses_moderator_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif = root / "invalid.sarif"
+            sarif.write_text('{"version":"2.1.0","runs":[]}', encoding="utf-8")
+            response = {
+                "reports": [
+                    {
+                        "title": "恢复后的漏洞报告",
+                        "markdown": "# 恢复后的漏洞报告\n\n- 原 SARIF 结构不完整，保留原文供后续核验。",
+                    }
+                ]
+            }
+            moderator = FakeLLM(json.dumps(response, ensure_ascii=False))
+
+            prepared = prepare_report_for_processing(sarif, moderator_client=moderator, source_path=root)
+
+            self.assertEqual(len(moderator.calls), 1)
+            self.assertEqual(len(prepared.findings or []), 1)
+            self.assertTrue(prepared.temporary)
+            self.assertTrue(any("解析失败的 SARIF" in item for item in prepared.diagnostics))
+
+    def test_ambiguous_sarif_report_is_moderated_with_source_into_markdown_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            sarif_data = json.loads(sarif.read_text(encoding="utf-8"))
+            first_result = sarif_data["runs"][0]["results"][0]
+            first_result["partialFingerprints"] = {"primaryLocationLineHash": "shared-fingerprint"}
+            sarif_data["runs"][0]["results"].append(json.loads(json.dumps(first_result)))
+            sarif.write_text(json.dumps(sarif_data), encoding="utf-8")
             response = {
                 "reports": [
                     {
                         "title": "命令注入独立报告",
-                        "result_indices": [0],
+                        "result_indices": [0, 1],
                         "markdown": "\n".join(
                             [
                                 "# 命令注入独立报告",
@@ -575,12 +616,12 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(prepared.effective_path.parent, tmp_dir.resolve())
             self.assertEqual(len(prepared.findings or []), 1)
             finding = prepared.findings[0]
-            self.assertEqual(finding.rule_id, "python-command-injection")
+            self.assertEqual(finding.rule_id, "moderated-sarif-finding-1")
             self.assertEqual(finding.message, "命令注入独立报告")
             self.assertEqual(finding.locations[0].display(), "app.py:5:5")
             self.assertEqual(finding.code_flows[0][0].display(), "app.py:4:11")
             self.assertEqual(finding.properties["source_report_format"], "sarif")
-            self.assertEqual(finding.properties["sarif_result_indices"], [0])
+            self.assertEqual(finding.properties["sarif_result_indices"], [0, 1])
             self.assertIn("request.args['cmd']", finding.raw["markdown"])
             self.assertEqual(prepared.effective_path.read_text(encoding="utf-8"), finding.raw["markdown"])
             self.assertIn("os.system(cmd)", moderator.calls[0][1])
@@ -591,11 +632,16 @@ class PipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sarif, _skills = write_python_fixture(root)
+            sarif_data = json.loads(sarif.read_text(encoding="utf-8"))
+            first_result = sarif_data["runs"][0]["results"][0]
+            first_result["partialFingerprints"] = {"primaryLocationLineHash": "shared-fingerprint"}
+            sarif_data["runs"][0]["results"].append(json.loads(json.dumps(first_result)))
+            sarif.write_text(json.dumps(sarif_data), encoding="utf-8")
             moderator = SequenceLLM(["不是 JSON", "仍然不是 JSON", "bad"])
 
             prepared = prepare_report_for_processing(sarif, moderator_client=moderator, source_path=root)
 
-            self.assertIsNone(prepared.findings)
+            self.assertEqual(len(prepared.findings or []), 2)
             self.assertFalse(prepared.temporary)
             self.assertEqual(len(moderator.calls), 3)
             self.assertTrue(any("Moderator SARIF 预处理失败，回退原始 SARIF" in item for item in prepared.diagnostics))
@@ -1971,16 +2017,19 @@ for raw in sys.stdin.buffer:
         self.assertIn("fetchJson('/skill-sources')", html)
         self.assertIn('id="run-provider-agent-grid"', html)
         self.assertIn('class="run-provider-control"', html)
+        self.assertIn('class="run-provider-control" hidden', html)
         self.assertIn('class="run-agent-control"', html)
+        self.assertIn('class="run-builtin-control" hidden>最大回合数', html)
         self.assertIn('id="run-tool-provider-options"', html)
         self.assertIn('id="run-codex-config-note"', html)
         self.assertIn('id="run-silence-reminder-minutes"', html)
         self.assertIn('静默提醒时间（分钟）', html)
-        self.assertIn("silence_reminder_minutes: Number(el.runSilenceReminderMinutes.value || 60)", html)
-        self.assertIn("config.silence_reminder_minutes || 60", html)
+        self.assertIn("silence_reminder_minutes: Number(el.runSilenceReminderMinutes.value || 30)", html)
+        self.assertIn("config.silence_reminder_minutes || 30", html)
         self.assertIn('function updateRunEngineVisibility()', html)
         self.assertIn("el.runProviderAgentGrid.hidden = false", html)
         self.assertIn("document.querySelectorAll('.run-provider-control')", html)
+        self.assertIn("document.querySelectorAll('.run-builtin-control').forEach(item => item.hidden = cliMode)", html)
         self.assertIn("affirmative_agent_profile: el.runAffirmativeAgentProfile.value || null", html)
         self.assertNotIn("affirmative_agent_profile: codexMode ? null", html)
         self.assertNotIn("el.runProviderAgentGrid.hidden = codexMode", html)
@@ -2408,6 +2457,7 @@ for raw in sys.stdin.buffer:
                 root / "providers.json",
             )
 
+            self.assertEqual(DEFAULT_SILENCE_REMINDER_MINUTES, 30)
             self.assertEqual(default_config.silence_reminder_minutes, DEFAULT_SILENCE_REMINDER_MINUTES)
             self.assertEqual(minimum_config.silence_reminder_minutes, 1)
             self.assertEqual(maximum_config.silence_reminder_minutes, 1440)
@@ -2568,6 +2618,97 @@ for raw in sys.stdin.buffer:
             self.assertIn("Codex-driven session 元数据已创建", "\n".join(first_with_sessions["diagnostics"]))
             self.assertEqual(first_with_sessions["status"], "running")
             self.assertEqual(first_with_sessions["run_origin"], "mcp")
+
+    def test_codex_runner_reuses_valid_sarif_and_one_run_level_source_indexer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sarif, _skills = write_python_fixture(root)
+            sarif_data = json.loads(sarif.read_text(encoding="utf-8"))
+            first_result = sarif_data["runs"][0]["results"][0]
+            first_result["properties"] = {"fixture_marker": "preserved"}
+            second_result = json.loads(json.dumps(first_result))
+            second_result["ruleId"] = "python-secondary-check"
+            second_result["message"] = {"text": "第二个独立发现"}
+            second_result["locations"][0]["physicalLocation"]["region"]["startLine"] = 4
+            sarif_data["runs"][0]["results"].append(second_result)
+            sarif.write_text(json.dumps(sarif_data), encoding="utf-8")
+            records = RunRecordStore(root / "records")
+            sent = []
+
+            class FakeSession:
+                def __init__(self, role):
+                    self.role = role
+
+                def info(self):
+                    return {
+                        "role": self.role,
+                        "session_name": f"vj-run-local-sarif-{self.role}",
+                        "target": f"vj-run-local-sarif-{self.role}:codex",
+                    }
+
+                def start(self):
+                    return None
+
+                def send(self, prompt):
+                    sent.append((self.role, prompt))
+
+            sessions = {role: FakeSession(role) for role in ("moderator", "affirmative", "negative")}
+            stage_results = iter(
+                [
+                    {"position": "TRUE_POSITIVE", "confidence": 0.8, "summary": "affirmative"},
+                    {"position": "FALSE_POSITIVE", "confidence": 0.6, "summary": "negative"},
+                    {
+                        "verdict": "INCONCLUSIVE",
+                        "confidence": 0.5,
+                        "reasoning_summary": "final-1",
+                        "final_conclusion": "final-1",
+                    },
+                    {"position": "TRUE_POSITIVE", "confidence": 0.8, "summary": "affirmative"},
+                    {"position": "FALSE_POSITIVE", "confidence": 0.6, "summary": "negative"},
+                    {
+                        "verdict": "INCONCLUSIVE",
+                        "confidence": 0.5,
+                        "reasoning_summary": "final-2",
+                        "final_conclusion": "final-2",
+                    },
+                ]
+            )
+            runner = CodexDrivenRunner(
+                records_dir=records.root,
+                codex_runs_dir=root / ".workspaces" / "runs",
+                codex_command="codex",
+            )
+            config = RunConfig(
+                sarif_path=sarif,
+                source_path=root,
+                engine="codex",
+                run_id="run-local-sarif",
+            )
+
+            with patch("vuln_judger.codex_runner._ensure_codex_project_trust"), patch.object(
+                runner,
+                "_sessions",
+                return_value=sessions,
+            ), patch("vuln_judger.codex_runner._wait_json", side_effect=lambda *_args, **_kwargs: next(stage_results)), patch(
+                "vuln_judger.codex_runner.SourceIndexer",
+                wraps=SourceIndexer,
+            ) as indexer_factory:
+                completed = runner.run(config, store=records)
+
+            self.assertEqual(indexer_factory.call_count, 1)
+            self.assertEqual([role for role, _prompt in sent], ["affirmative", "negative", "moderator"] * 2)
+            self.assertFalse(any("当前阶段：报告拆分" in prompt for _role, prompt in sent))
+            self.assertEqual(completed["finding_count"], 2)
+            self.assertEqual(completed["cli_workflow"]["report_preparation_origin"], "local_sarif")
+            findings_path = root / ".workspaces" / "runs" / "run-local-sarif" / "findings.json"
+            persisted = json.loads(findings_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["origin"], "local_sarif")
+            self.assertEqual(persisted["findings"][0]["properties"]["fixture_marker"], "preserved")
+            brief_paths = sorted((findings_path.parent / "findings").glob("*/brief.json"))
+            self.assertEqual(len(brief_paths), 2)
+            briefs = [json.loads(path.read_text(encoding="utf-8")) for path in brief_paths]
+            self.assertTrue(any(brief["properties"].get("fixture_marker") == "preserved" for brief in briefs))
+            self.assertTrue(all(brief["raw"].get("message") for brief in briefs))
 
     def test_codex_runner_persists_all_findings_and_resumes_from_first_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
-DEFAULT_SILENCE_REMINDER_MINUTES = 60
+DEFAULT_SILENCE_REMINDER_MINUTES = 30
 
 
 class Verdict(str, Enum):

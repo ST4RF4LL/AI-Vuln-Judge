@@ -364,12 +364,13 @@ uv run vuln-judger api \
 证据链、博弈过程、防护分析、影响分析、LLM 提供商配置、正反方和主持人默认提供商选择、
 提供商连通性测试、三方 Agent 配置管理，以及 MCP / Skill Source 配置管理。
 
-Codex/OpenCode 三方复核引擎在 Moderator 拆分报告后，会立即把全部 finding 写入运行记录，并在
+Codex/OpenCode 三方复核引擎会直接复用合法、无分组歧义的 SARIF results；Markdown、解析失败或
+分组存在歧义时才调用 Moderator 拆分。报告准备完成后会立即把全部 finding 写入运行记录，并在
 `.workspaces/runs/<run-id>/findings/<finding-id>/brief.json` 保存各自的输入材料。前端会将
 尚未裁决的 finding 标记为“未完成”或“处理中”。暂停后恢复时，新 session 会保留已完成结果，
 清理首个未完成 finding 的旧阶段输出，并从该 finding 重新开始。
 
-启动 CLI 任务时可设置“静默提醒时间”，默认 60 分钟。等待下一阶段 JSON 输出期间，如果
+启动 CLI 任务时可设置“静默提醒时间”，默认 30 分钟。等待下一阶段 JSON 输出期间，如果
 目标 session 仍有输出或处于执行状态，静默计时器会重新开始；如果上一阶段已经交付而
 下一 Agent 持续静默，系统会发送简短的继续任务提醒。退出的 session 会重启并重新接收完整阶段
 prompt。默认不再用一小时硬超时终止阶段；需要绝对步骤超时时可显式设置
@@ -388,7 +389,7 @@ curl -X POST http://127.0.0.1:8765/runs \
     "report_path": "report.md",
     "source_path": "./target-project",
     "skills_path": "./skills",
-    "silence_reminder_minutes": 60,
+    "silence_reminder_minutes": 30,
     "enable_llm": true,
     "affirmative_provider_id": "openai-main",
     "negative_provider_id": "qwen-fast",

@@ -2626,15 +2626,15 @@ def app_html() -> str:
               <label>Skill Source<select id="run-skill-source"></select></label>
               <label class="wide">Skills 路径<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
               <label>执行引擎<select id="run-engine"><option value="codex" selected>Codex 三方复核</option><option value="opencode">OpenCode 三方复核</option><option value="builtin">内置旧流程</option></select></label>
-              <label>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
-              <label class="run-codex-control">静默提醒时间（分钟）<input id="run-silence-reminder-minutes" type="number" min="1" max="1440" value="60"></label>
+              <label class="run-builtin-control" hidden>最大回合数<input id="run-max-rounds" type="number" min="1" value="4"></label>
+              <label class="run-codex-control">静默提醒时间（分钟）<input id="run-silence-reminder-minutes" type="number" min="1" max="1440" value="{DEFAULT_SILENCE_REMINDER_MINUTES}"></label>
               <label class="run-opencode-control" hidden>OpenCode 模型<input id="run-opencode-model" placeholder="provider/model（留空使用 OpenCode 默认配置）"></label>
               <div class="run-agent-grid" id="run-provider-agent-grid">
-                <label class="run-provider-control">正方提供商<select id="run-affirmative-provider"></select></label>
+                <label class="run-provider-control" hidden>正方提供商<select id="run-affirmative-provider"></select></label>
                 <label class="run-agent-control">正方 Agent 配置档案<select id="run-affirmative-agent-profile"></select></label>
-                <label class="run-provider-control">反方提供商<select id="run-negative-provider"></select></label>
+                <label class="run-provider-control" hidden>反方提供商<select id="run-negative-provider"></select></label>
                 <label class="run-agent-control">反方 Agent 配置档案<select id="run-negative-agent-profile"></select></label>
-                <label class="run-provider-control">主持人提供商<select id="run-moderator-provider"></select></label>
+                <label class="run-provider-control" hidden>主持人提供商<select id="run-moderator-provider"></select></label>
                 <label class="run-agent-control">主持人 Agent 配置档案<select id="run-moderator-agent-profile"></select></label>
               </div>
             </div>
@@ -3398,6 +3398,7 @@ def app_html() -> str:
       el.runProviderAgentGrid.hidden = false;
       document.querySelectorAll('.run-provider-control').forEach(item => item.hidden = cliMode);
       document.querySelectorAll('.run-agent-control').forEach(item => item.hidden = false);
+      document.querySelectorAll('.run-builtin-control').forEach(item => item.hidden = cliMode);
       document.querySelectorAll('.run-codex-control').forEach(item => item.hidden = !cliMode);
       document.querySelectorAll('.run-opencode-control').forEach(item => item.hidden = !openCodeMode);
       el.runToolProviderOptions.hidden = cliMode;
@@ -3454,7 +3455,7 @@ def app_html() -> str:
       setSelectValue(el.runNegativeAgentProfile, agentProfile('negative'));
       setSelectValue(el.runModeratorAgentProfile, agentProfile('moderator'));
       el.runMaxRounds.value = String(config.max_rounds || 4);
-      el.runSilenceReminderMinutes.value = String(config.silence_reminder_minutes || 60);
+      el.runSilenceReminderMinutes.value = String(config.silence_reminder_minutes || {DEFAULT_SILENCE_REMINDER_MINUTES});
       el.runExternalTools.checked = config.enable_external_tools !== false;
       el.runAutoIndex.checked = Boolean(config.auto_index_tools);
       el.runLlm.checked = Boolean(
@@ -3839,7 +3840,7 @@ def app_html() -> str:
           skill_source_id: el.runSkillSource.value || null,
           skills_path: el.runSkills.value.trim() || null,
           max_rounds: Number(el.runMaxRounds.value || 4),
-          silence_reminder_minutes: Number(el.runSilenceReminderMinutes.value || 60),
+          silence_reminder_minutes: Number(el.runSilenceReminderMinutes.value || {DEFAULT_SILENCE_REMINDER_MINUTES}),
           llm_model: openCodeMode ? (el.runOpenCodeModel.value.trim() || null) : null,
           enable_external_tools: cliMode ? true : el.runExternalTools.checked,
           auto_index_tools: cliMode ? false : el.runAutoIndex.checked,
