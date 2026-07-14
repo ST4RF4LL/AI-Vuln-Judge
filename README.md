@@ -156,9 +156,9 @@ provider session。输出携带 `finding_id`、`role` 和 `attempt_id`，调度�
 
 选择 `engine: "opencode"` 时，每个角色会启动一个仅监听 `127.0.0.1` 的
 `opencode serve`，通过本地 HTTP API 为每个阶段创建新的 OpenCode session，并直接调用
-durable prompt API，以 `resume: true` 明确调度 agent loop。阶段 prompt 在落盘和提交前统一规范为
-Linux LF；任务投递不再启动 `opencode run` 子进程，从而避开 WSL 的 detached tmux 中
-`opencode run` 已接收 prompt、却未可靠启动响应的问题。
+`prompt_async` 接口启动 agent loop。阶段 prompt 在落盘和提交前统一规范为 Linux LF；任务投递
+不再启动 `opencode run` 子进程，也不混用 v2 durable prompt 与 legacy session 状态，从而避开
+WSL 的 detached tmux 中 `opencode run` 已接收 prompt、却未可靠启动响应的问题。
 Web 端的 CLI Session 终端使用当前阶段 session 的 `opencode attach --mini` pane；切换阶段时
 会原位重启 pane，因此已打开的 WebSocket 不会误切到 server 窗口，并且可直接查看输出和输入消息。
 

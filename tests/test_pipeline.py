@@ -6073,24 +6073,9 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 length = int(self.headers.get("content-length") or 0)
                 received["path"] = self.path
                 received["body"] = json.loads(self.rfile.read(length).decode("utf-8"))
-                raw = json.dumps(
-                    {
-                        "data": {
-                            "admittedSeq": 1,
-                            "id": "msg-user-1",
-                            "sessionID": "ses/with space",
-                            "prompt": {"text": "line one\nline two\nline three"},
-                            "delivery": "queue",
-                            "timeCreated": 1,
-                            "promotedSeq": 1,
-                        }
-                    }
-                ).encode("utf-8")
-                self.send_response(HTTPStatus.OK)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(raw)))
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("content-length", "0")
                 self.end_headers()
-                self.wfile.write(raw)
 
             def do_GET(self):  # noqa: N802
                 received["get_paths"].append(self.path)
@@ -6124,27 +6109,39 @@ class OpenCodeRunnerTests(unittest.TestCase):
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            response = send_prompt(
-                server_url=f"http://127.0.0.1:{server.server_port}",
-                session_id="ses/with space",
-                directory="/mnt/c/source tree",
-                payload={"parts": [{"type": "text", "text": "line one\r\nline two\rline three"}]},
-                timeout=5,
-            )
+            with patch(
+                "vuln_judger.opencode_prompt_client._new_message_id",
+                return_value="msg-user-1",
+            ):
+                response = send_prompt(
+                    server_url=f"http://127.0.0.1:{server.server_port}",
+                    session_id="ses/with space",
+                    directory="/mnt/c/source tree",
+                    payload={
+                        "model": {"providerID": "openai", "modelID": "gpt-5"},
+                        "parts": [{"type": "text", "text": "line one\r\nline two\rline three"}],
+                    },
+                    timeout=5,
+                )
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
 
-        self.assertEqual(response["admission"]["id"], "msg-user-1")
+        self.assertEqual(response["messageID"], "msg-user-1")
         self.assertEqual(response["assistant"]["info"]["id"], "msg-assistant-1")
-        self.assertEqual(received["path"], "/api/session/ses%2Fwith%20space/prompt")
+        self.assertTrue(
+            received["path"].startswith(
+                "/session/ses%2Fwith%20space/prompt_async?"
+            )
+        )
+        self.assertIn("directory=%2Fmnt%2Fc%2Fsource+tree", received["path"])
         self.assertEqual(
             received["body"],
             {
-                "prompt": {"text": "line one\nline two\nline three"},
-                "delivery": "queue",
-                "resume": True,
+                "model": {"providerID": "openai", "modelID": "gpt-5"},
+                "parts": [{"type": "text", "text": "line one\nline two\nline three"}],
+                "messageID": "msg-user-1",
             },
         )
         self.assertTrue(
@@ -6155,28 +6152,14 @@ class OpenCodeRunnerTests(unittest.TestCase):
             )
         )
 
-    def test_opencode_prompt_client_fails_when_admitted_agent_loop_stays_idle(self):
+    def test_opencode_prompt_client_fails_when_async_session_stays_idle(self):
         class IdlePromptHandler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("content-length") or 0)
                 self.rfile.read(length)
-                raw = json.dumps(
-                    {
-                        "data": {
-                            "admittedSeq": 1,
-                            "id": "msg-idle",
-                            "sessionID": "ses-idle",
-                            "prompt": {"text": "review finding"},
-                            "delivery": "queue",
-                            "timeCreated": 1,
-                        }
-                    }
-                ).encode("utf-8")
-                self.send_response(HTTPStatus.OK)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(raw)))
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("content-length", "0")
                 self.end_headers()
-                self.wfile.write(raw)
 
             def do_GET(self):  # noqa: N802
                 payload = {} if self.path.startswith("/session/status?") else []
@@ -6194,7 +6177,10 @@ class OpenCodeRunnerTests(unittest.TestCase):
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with patch.dict(
+            with patch(
+                "vuln_judger.opencode_prompt_client._new_message_id",
+                return_value="msg-idle",
+            ), patch.dict(
                 os.environ,
                 {
                     "VULN_JUDGER_OPENCODE_AGENT_START_TIMEOUT": "0.1",
@@ -6202,7 +6188,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 },
             ), self.assertRaisesRegex(
                 RuntimeError,
-                "accepted prompt msg-idle but agent loop did not start",
+                "accepted prompt msg-idle via prompt_async but remained idle",
             ):
                 send_prompt(
                     server_url=f"http://127.0.0.1:{server.server_port}",
@@ -6210,6 +6196,55 @@ class OpenCodeRunnerTests(unittest.TestCase):
                     directory="/mnt/c/source",
                     payload={"parts": [{"type": "text", "text": "review finding"}]},
                     timeout=5,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_opencode_prompt_client_does_not_treat_busy_session_as_not_started(self):
+        class BusyPromptHandler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("content-length") or 0)
+                self.rfile.read(length)
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("content-length", "0")
+                self.end_headers()
+
+            def do_GET(self):  # noqa: N802
+                payload = {"ses-busy": {"type": "busy"}} if self.path.startswith(
+                    "/session/status?"
+                ) else []
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), BusyPromptHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch(
+                "vuln_judger.opencode_prompt_client._new_message_id",
+                return_value="msg-busy",
+            ), patch.dict(
+                os.environ,
+                {
+                    "VULN_JUDGER_OPENCODE_AGENT_START_TIMEOUT": "0.1",
+                    "VULN_JUDGER_OPENCODE_POLL_INTERVAL": "0.01",
+                },
+            ), self.assertRaisesRegex(RuntimeError, "prompt timed out"):
+                send_prompt(
+                    server_url=f"http://127.0.0.1:{server.server_port}",
+                    session_id="ses-busy",
+                    directory="/mnt/c/source",
+                    payload={"parts": [{"type": "text", "text": "review finding"}]},
+                    timeout=0.25,
                 )
         finally:
             server.shutdown()

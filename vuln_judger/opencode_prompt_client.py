@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,30 +21,24 @@ def send_prompt(
     payload: Dict[str, Any],
     timeout: Optional[float],
 ) -> Any:
-    """Durably admit a prompt, resume the agent loop, and wait for its assistant turn."""
+    """Start one legacy OpenCode session turn and wait for its assistant response."""
 
-    prompt_text = _normalize_newlines(_payload_text(payload))
     encoded_session = urllib.parse.quote(session_id, safe="")
     base_url = server_url.rstrip("/")
     deadline = time.monotonic() + timeout if timeout is not None else None
-    admission = _request_json(
-        f"{base_url}/api/session/{encoded_session}/prompt",
+    query = urllib.parse.urlencode({"directory": directory})
+    message_id = _new_message_id()
+    prompt_payload = _normalized_payload(payload)
+    prompt_payload["messageID"] = message_id
+    _request_json(
+        f"{base_url}/session/{encoded_session}/prompt_async?{query}",
         method="POST",
-        payload={
-            "prompt": {"text": prompt_text},
-            "delivery": "queue",
-            "resume": True,
-        },
+        payload=prompt_payload,
         timeout=_request_timeout(deadline, session_id),
         session_id=session_id,
-        operation="prompt admission",
+        operation="prompt_async",
     )
-    admitted = admission.get("data") if isinstance(admission, dict) else None
-    message_id = admitted.get("id") if isinstance(admitted, dict) else None
-    if not isinstance(message_id, str) or not message_id:
-        raise RuntimeError(f"OpenCode session {session_id} prompt admission response is missing id")
 
-    query = urllib.parse.urlencode({"directory": directory})
     messages_url = f"{base_url}/session/{encoded_session}/message?{query}"
     status_url = f"{base_url}/session/status?{query}"
     start_deadline = time.monotonic() + _agent_start_timeout()
@@ -72,7 +67,7 @@ def send_prompt(
                 or bool(info.get("finish"))
             )
             if completed:
-                return {"admission": admitted, "assistant": assistant}
+                return {"messageID": message_id, "assistant": assistant}
 
         statuses = _request_json(
             status_url,
@@ -91,8 +86,8 @@ def send_prompt(
         now = time.monotonic()
         if not started and now >= start_deadline:
             raise RuntimeError(
-                f"OpenCode session {session_id} accepted prompt {message_id} but agent loop did not start; "
-                "prompt newlines were normalized to LF"
+                f"OpenCode session {session_id} accepted prompt {message_id} via prompt_async but remained idle; "
+                f"configured model={_model_label(prompt_payload)}; prompt newlines were normalized to LF"
             )
         if started and idle_since is not None and now - idle_since >= 5:
             detail = "without creating an assistant response" if assistant is None else "before the assistant completed"
@@ -182,8 +177,38 @@ def _payload_text(payload: Dict[str, Any]) -> str:
     return "\n".join(texts)
 
 
+def _normalized_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    parts = payload.get("parts")
+    if not isinstance(parts, list):
+        raise RuntimeError("OpenCode prompt request is missing parts")
+    normalized_parts: List[Dict[str, Any]] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            raise RuntimeError("OpenCode prompt request contains an invalid part")
+        normalized = dict(part)
+        if normalized.get("type") == "text" and normalized.get("text") is not None:
+            normalized["text"] = _normalize_newlines(str(normalized["text"]))
+        normalized_parts.append(normalized)
+    result = dict(payload)
+    result["parts"] = normalized_parts
+    return result
+
+
 def _normalize_newlines(value: str) -> str:
     return str(value).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _new_message_id() -> str:
+    return f"msg_vj_{uuid.uuid4().hex}"
+
+
+def _model_label(payload: Dict[str, Any]) -> str:
+    model = payload.get("model")
+    if not isinstance(model, dict):
+        return "session-default"
+    provider_id = str(model.get("providerID") or "").strip()
+    model_id = str(model.get("modelID") or "").strip()
+    return f"{provider_id}/{model_id}" if provider_id and model_id else "invalid"
 
 
 def _agent_start_timeout() -> float:
