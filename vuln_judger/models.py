@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 DEFAULT_SILENCE_REMINDER_MINUTES = 30
+REPORT_FINDINGS_SCHEMA = "vuln_judger.report_findings.v1"
 
 
 class Verdict(str, Enum):
@@ -221,6 +222,9 @@ class RunConfig:
     resume_from_finding_index: int = 0
     resume_reports: List[Any] = field(default_factory=list)
     resume_diagnostics: List[str] = field(default_factory=list)
+    reuse_findings_from_run_id: Optional[str] = None
+    reused_findings: List[Finding] = field(default_factory=list)
+    reused_findings_payload: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -237,6 +241,7 @@ class RunReport:
     llm_providers: Dict[str, Any] = field(default_factory=dict)
     agent_configs: Dict[str, Any] = field(default_factory=dict)
     diagnostics: List[str] = field(default_factory=list)
+    report_findings: Dict[str, Any] = field(default_factory=dict)
     completed_finding_count: int = 0
     current_finding_id: Optional[str] = None
     current_finding_index: Optional[int] = None

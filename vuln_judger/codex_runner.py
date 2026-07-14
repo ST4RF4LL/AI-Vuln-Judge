@@ -30,6 +30,7 @@ from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_
 from .logging_config import logger
 from .models import (
     DEFAULT_SILENCE_REMINDER_MINUTES,
+    REPORT_FINDINGS_SCHEMA,
     AgentConfig,
     Finding,
     RunConfig,
@@ -484,9 +485,10 @@ class CliDrivenRunner:
         check_stop()
 
         findings_path = run_dir / "findings.json"
-        reuse_findings = config.created_at is not None and findings_path.exists()
+        resume_findings = config.created_at is not None and findings_path.exists()
+        copied_findings = bool(config.reused_findings_payload) and not resume_findings
         moderator_report_prompt = _moderator_report_prompt(input_payload, findings_path)
-        if reuse_findings:
+        if resume_findings:
             findings_data = _wait_json(
                 findings_path,
                 should_stop=should_stop,
@@ -495,6 +497,8 @@ class CliDrivenRunner:
                 silence_reminder_seconds=config.silence_reminder_minutes * 60,
                 watchdog_callback=watchdog_event,
             )
+        elif copied_findings:
+            findings_data = _persist_findings_payload(findings_path, config.reused_findings_payload)
         elif moderation_reason is None:
             findings_data = _persist_local_sarif_findings(findings_path, local_findings)
         else:
@@ -515,18 +519,27 @@ class CliDrivenRunner:
         start_index = first_incomplete_finding_index(reports, len(findings))
         payload["finding_count"] = len(findings)
         payload["reports"] = reports
+        payload.pop("report_findings", None)
         payload["completed_finding_count"] = completed_count
         payload["resume_from_finding_index"] = start_index
         payload["resume_from_finding_id"] = findings[start_index].finding_id if start_index < len(findings) else None
         payload["cli_workflow"]["findings_path"] = str(findings_path)
-        preparation_origin = str(findings_data.get("origin") or "moderator")
+        preparation_origin = (
+            "reused" if config.reuse_findings_from_run_id else str(findings_data.get("origin") or "moderator")
+        )
         payload["cli_workflow"]["report_preparation_origin"] = preparation_origin
+        if config.reuse_findings_from_run_id:
+            payload["cli_workflow"]["reused_findings_from_run_id"] = config.reuse_findings_from_run_id
         if self.engine == CODEX_ENGINE:
             payload["codex_workflow"] = payload["cli_workflow"]
-        if preparation_origin == LOCAL_SARIF_FINDINGS_ORIGIN:
-            preparation_message = "复用磁盘中的本地 SARIF 解析结果" if reuse_findings else "已直接复用本地 SARIF 解析结果"
+        if copied_findings:
+            preparation_message = f"已复用任务 {config.reuse_findings_from_run_id} 的报告拆分结果"
+        elif resume_findings and config.reuse_findings_from_run_id:
+            preparation_message = f"复用磁盘中来自任务 {config.reuse_findings_from_run_id} 的报告拆分结果"
+        elif preparation_origin == LOCAL_SARIF_FINDINGS_ORIGIN:
+            preparation_message = "复用磁盘中的本地 SARIF 解析结果" if resume_findings else "已直接复用本地 SARIF 解析结果"
         else:
-            split_action = "复用磁盘中的" if reuse_findings else "已拆分并持久化"
+            split_action = "复用磁盘中的" if resume_findings else "已拆分并持久化"
             preparation_message = f"Moderator {split_action} finding"
         emit(
             "running",
@@ -1599,17 +1612,39 @@ def _persist_local_sarif_findings(path: Path, findings: Sequence[Finding]) -> Di
         "origin": LOCAL_SARIF_FINDINGS_ORIGIN,
         "findings": [to_jsonable(finding) for finding in findings],
     }
+    return _persist_findings_payload(path, data)
+
+
+def _persist_findings_payload(path: Path, data: Dict[str, Any]) -> Dict[str, Any]:
+    persisted = json.loads(json.dumps(data, ensure_ascii=False))
     temporary_path = path.with_name(f".{path.name}.tmp")
     temporary_path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        json.dumps(persisted, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     os.replace(temporary_path, path)
-    return data
+    return persisted
+
+
+def _normalized_findings_payload(
+    findings: Sequence[Finding],
+    *,
+    origin: str,
+    reused_from_run_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "schema": REPORT_FINDINGS_SCHEMA,
+        "origin": origin or "unknown",
+        "finding_count": len(findings),
+        "findings": [to_jsonable(finding) for finding in findings],
+    }
+    if reused_from_run_id:
+        payload["reused_from_run_id"] = reused_from_run_id
+    return payload
 
 
 def _findings_from_persisted(data: Dict[str, Any], report_path: Path) -> List[Finding]:
-    if data.get("origin") != LOCAL_SARIF_FINDINGS_ORIGIN:
+    if data.get("origin") != LOCAL_SARIF_FINDINGS_ORIGIN and data.get("schema") != REPORT_FINDINGS_SCHEMA:
         return _findings_from_moderator(data, report_path)
     raw = data.get("findings")
     if not isinstance(raw, list) or not raw:
@@ -1714,6 +1749,7 @@ def _base_payload(
         "finding_count": len(resume_reports),
         "project_context_facts": 0,
         "reports": resume_reports,
+        "report_findings": dict(config.reused_findings_payload),
         "diagnostics": list(config.resume_diagnostics or []),
         "llm_providers": {"enabled": False, "engine": engine},
         "agent_configs": {role: to_jsonable(agent_configs[role]) for role in CODEX_ROLES},
@@ -1733,6 +1769,7 @@ def _base_payload(
             "max_rounds": config.max_rounds,
             "silence_reminder_minutes": config.silence_reminder_minutes,
             "enable_external_tools": True,
+            "reuse_findings_from_run_id": config.reuse_findings_from_run_id,
         },
         "cli_sessions": session_payload,
         "cli_workflow": workflow,

@@ -13,6 +13,7 @@ from .evidence import EvidenceCollector
 from .llm import LLMClient, build_llm_clients
 from .logging_config import logger
 from .models import (
+    REPORT_FINDINGS_SCHEMA,
     CodeEvidence,
     DebateRole,
     DebateTurn,
@@ -73,21 +74,37 @@ def run_judgement(
         legacy_model=config.llm_model,
         legacy_endpoint=config.llm_endpoint,
     )
-    prepared_report = prepare_report_for_processing(
-        sarif_path,
-        moderator_client=moderator_client,
-        moderator_agent=config.moderator_agent,
-        source_path=source_path,
-        source_indexer=indexer,
-    )
-    diagnostics = list(prepared_report.diagnostics)
-    findings = list(prepared_report.findings) if prepared_report.findings is not None else load_sarif(prepared_report.effective_path)
+    if config.reused_findings:
+        findings = list(config.reused_findings)
+        diagnostics = [f"已复用任务 {config.reuse_findings_from_run_id} 的报告拆分结果"]
+        effective_report_path = sarif_path
+        temporary_report = False
+    else:
+        prepared_report = prepare_report_for_processing(
+            sarif_path,
+            moderator_client=moderator_client,
+            moderator_agent=config.moderator_agent,
+            source_path=source_path,
+            source_indexer=indexer,
+        )
+        diagnostics = list(prepared_report.diagnostics)
+        findings = list(prepared_report.findings) if prepared_report.findings is not None else load_sarif(prepared_report.effective_path)
+        effective_report_path = prepared_report.effective_path
+        temporary_report = prepared_report.temporary
+    report_findings = {
+        "schema": REPORT_FINDINGS_SCHEMA,
+        "origin": "reused" if config.reused_findings else "builtin_prepared",
+        "finding_count": len(findings),
+        "findings": [to_jsonable(finding) for finding in findings],
+    }
+    if config.reuse_findings_from_run_id and config.reused_findings:
+        report_findings["reused_from_run_id"] = config.reuse_findings_from_run_id
     LOG.info(
         "报告解析完成 findings=%s report=%s effective_report=%s temporary=%s",
         len(findings),
         sarif_path,
-        prepared_report.effective_path,
-        prepared_report.temporary,
+        effective_report_path,
+        temporary_report,
     )
     project_context = load_project_context(config.skills_path)
     LOG.info("项目知识库加载完成 facts=%s skills=%s", len(project_context.facts), config.skills_path)
@@ -160,6 +177,7 @@ def run_judgement(
                 llm_providers=llm_providers,
                 agent_configs=agent_configs,
                 diagnostics=list(diagnostics),
+                report_findings=report_findings if config.reused_findings else {},
                 completed_finding_count=completed_count,
                 current_finding_id=current_finding.finding_id if current_finding is not None else None,
                 current_finding_index=current_finding_index,
@@ -238,6 +256,7 @@ def run_judgement(
         llm_providers=llm_providers,
         agent_configs=agent_configs,
         diagnostics=diagnostics,
+        report_findings=report_findings,
         completed_finding_count=len(reports),
         resume_from_finding_index=len(reports),
     )

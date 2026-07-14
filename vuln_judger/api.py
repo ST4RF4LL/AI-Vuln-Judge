@@ -20,6 +20,8 @@ from .codex_runner import (
     CodexDrivenRunner,
     CodexRunnerError,
     CodexRunnerStopped,
+    _findings_from_persisted,
+    _normalized_findings_payload,
     attach_session_websocket,
     capture_session,
     send_session_input,
@@ -165,6 +167,7 @@ def make_handler(
                         },
                     )
                     config = _config_from_payload(payload, provider_store.path, run_id, agent_store, mcp_store.path, skill_store)
+                    _apply_reused_findings(config, store, tasks, tasks_lock)
                     task = _task_from_config(config, run_id, "running")
                     stop_event = Event()
                     pause_event = Event()
@@ -669,7 +672,86 @@ def _config_from_payload(
         affirmative_agent=affirmative_agent,
         negative_agent=negative_agent,
         moderator_agent=moderator_agent,
+        reuse_findings_from_run_id=(str(payload.get("reuse_findings_from_run_id") or "").strip() or None),
     )
+
+
+def _apply_reused_findings(
+    config: RunConfig,
+    store: RunRecordStore,
+    tasks: dict,
+    tasks_lock: Lock,
+) -> None:
+    source_run_id = config.reuse_findings_from_run_id
+    if not source_run_id:
+        return
+    if not source_run_id.startswith("run-") or any(
+        not (character.isalnum() or character in {"-", "_"}) for character in source_run_id
+    ):
+        raise ValueError("复用报告拆分结果的来源任务 ID 非法")
+    source_run = store.get(source_run_id) or _get_task(tasks, tasks_lock, source_run_id)
+    if source_run is None:
+        raise ValueError(f"复用报告拆分结果失败：来源任务 {source_run_id} 不存在")
+    source_report_path = str(
+        source_run.get("sarif_path")
+        or (source_run.get("config") or {}).get("report_path")
+        or (source_run.get("config") or {}).get("sarif_path")
+        or ""
+    ).strip()
+    if source_report_path and Path(source_report_path).expanduser().resolve() != config.sarif_path.expanduser().resolve():
+        raise ValueError("复用报告拆分结果失败：新任务报告路径与来源任务不一致，请取消勾选后重新拆分")
+    findings_payload = _report_findings_payload(source_run)
+    if findings_payload is None:
+        raise ValueError(f"复用报告拆分结果失败：来源任务 {source_run_id} 尚无可复用的 findings")
+    findings = _findings_from_persisted(findings_payload, config.sarif_path)
+    finding_ids = [finding.finding_id for finding in findings]
+    if len(finding_ids) != len(set(finding_ids)):
+        raise ValueError(f"复用报告拆分结果失败：来源任务 {source_run_id} 包含重复 finding_id")
+    config.reused_findings = findings
+    config.reused_findings_payload = _normalized_findings_payload(
+        findings,
+        origin=str(findings_payload.get("origin") or "unknown"),
+        reused_from_run_id=source_run_id,
+    )
+
+
+def _report_findings_payload(run: dict) -> Optional[dict]:
+    snapshot = run.get("report_findings") if isinstance(run, dict) else None
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("findings"), list) and snapshot["findings"]:
+        return json.loads(json.dumps(snapshot, ensure_ascii=False))
+    if not isinstance(run, dict):
+        return None
+    workflow = run.get("cli_workflow") if isinstance(run.get("cli_workflow"), dict) else {}
+    if not workflow and isinstance(run.get("codex_workflow"), dict):
+        workflow = run["codex_workflow"]
+    run_dir_text = str(workflow.get("run_dir") or "").strip()
+    findings_path_text = str(workflow.get("findings_path") or "").strip()
+    if not run_dir_text:
+        return None
+    run_dir = Path(run_dir_text).expanduser().resolve()
+    run_id = str(run.get("run_id") or "")
+    if run_dir.name != run_id:
+        return None
+    expected_path = run_dir / "findings.json"
+    findings_path = Path(findings_path_text).expanduser().resolve() if findings_path_text else expected_path
+    if findings_path != expected_path or not findings_path.is_file():
+        return None
+    try:
+        data = json.loads(findings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _reusable_findings_metadata(run: dict) -> dict:
+    payload = _report_findings_payload(run)
+    findings = payload.get("findings") if isinstance(payload, dict) else None
+    available = isinstance(findings, list) and bool(findings)
+    return {
+        "available": available,
+        "finding_count": len(findings) if available else 0,
+        "origin": str(payload.get("origin") or "unknown") if available else None,
+    }
 
 
 def _run_detail(run):
@@ -700,6 +782,7 @@ def _run_detail(run):
         "resume_from_finding_id": run.get("resume_from_finding_id"),
         "resume_from_finding_index": run.get("resume_from_finding_index"),
         "config": run.get("config", {}),
+        "reusable_findings": _reusable_findings_metadata(run),
         "cli_sessions": cli_sessions,
         "cli_workflow": cli_workflow,
         "codex_sessions": _codex_sessions(run),
@@ -759,6 +842,12 @@ def _task_from_config(config: RunConfig, run_id: str, status: str, error: Option
         "agent_configs": _agent_task_metadata(config),
         "verdict_counts": {},
         "reports": [],
+        "report_findings": dict(config.reused_findings_payload),
+        "reusable_findings": {
+            "available": bool(config.reused_findings),
+            "finding_count": len(config.reused_findings),
+            "origin": str(config.reused_findings_payload.get("origin") or "unknown") if config.reused_findings else None,
+        },
         "error": error,
         "config": _config_task_snapshot(config),
         "completed_finding_count": 0,
@@ -966,6 +1055,8 @@ def _task_from_report_payload(payload: dict, status: str) -> dict:
         "agent_configs": payload.get("agent_configs", {}),
         "verdict_counts": _verdict_counts(payload),
         "reports": payload.get("reports", []),
+        "report_findings": payload.get("report_findings", {}),
+        "reusable_findings": _reusable_findings_metadata(payload),
         "error": payload.get("error"),
         "config": payload.get("config", {}),
         "completed_finding_count": payload.get(
@@ -1251,6 +1342,7 @@ def _config_task_snapshot(config: RunConfig) -> dict:
         "affirmative_provider_id": config.affirmative_provider_id,
         "negative_provider_id": config.negative_provider_id,
         "moderator_provider_id": config.moderator_provider_id,
+        "reuse_findings_from_run_id": config.reuse_findings_from_run_id,
         "affirmative_agent": to_jsonable(config.affirmative_agent) if config.affirmative_agent else None,
         "negative_agent": to_jsonable(config.negative_agent) if config.negative_agent else None,
         "moderator_agent": to_jsonable(config.moderator_agent) if config.moderator_agent else None,
@@ -1405,6 +1497,15 @@ def _config_from_paused_payload(
         reports,
         int(payload.get("finding_count") or len(reports)),
     )
+    if config.reuse_findings_from_run_id:
+        findings_payload = _report_findings_payload(payload)
+        if findings_payload is not None:
+            config.reused_findings = _findings_from_persisted(findings_payload, config.sarif_path)
+            config.reused_findings_payload = _normalized_findings_payload(
+                config.reused_findings,
+                origin=str(findings_payload.get("origin") or "unknown"),
+                reused_from_run_id=config.reuse_findings_from_run_id,
+            )
     return config
 
 
@@ -1853,6 +1954,7 @@ def app_html() -> str:
       color: var(--text);
     }}
     textarea {{ min-height: 88px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+    [hidden] {{ display: none !important; }}
     label {{ display: grid; gap: 5px; font-size: 12px; color: var(--muted); }}
     .checkbox-row {{
       display: flex;
@@ -2632,6 +2734,7 @@ def app_html() -> str:
             <div class="form-grid">
               <label class="wide">报告路径<input id="run-sarif" placeholder="fixtures/demo_sarif/report.sarif 或 report.md"></label>
               <label class="wide">源码路径<input id="run-source" placeholder="fixtures/demo_sarif/source"></label>
+              <label class="wide checkbox-row" id="run-reuse-findings-option" hidden><input id="run-reuse-findings" type="checkbox" checked> 复用报告拆分结果 <span class="muted" id="run-reuse-findings-note"></span></label>
               <label>Skill Source<select id="run-skill-source"></select></label>
               <label class="wide">Skills 路径<input id="run-skills" placeholder="fixtures/demo_sarif/skills"></label>
               <label>执行引擎<select id="run-engine"><option value="codex" selected>Codex 三方复核</option><option value="opencode">OpenCode 三方复核</option><option value="builtin">内置旧流程</option></select></label>
@@ -2677,7 +2780,7 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, reuseFindingsFromRunId: null }};
     const el = {{
       list: document.getElementById('run-list'),
       count: document.getElementById('run-count'),
@@ -2745,6 +2848,9 @@ def app_html() -> str:
       agentModeratorInstructions: document.getElementById('agent-moderator-instructions'),
       runSarif: document.getElementById('run-sarif'),
       runSource: document.getElementById('run-source'),
+      runReuseFindingsOption: document.getElementById('run-reuse-findings-option'),
+      runReuseFindings: document.getElementById('run-reuse-findings'),
+      runReuseFindingsNote: document.getElementById('run-reuse-findings-note'),
       runSkillSource: document.getElementById('run-skill-source'),
       runSkills: document.getElementById('run-skills'),
       runEngine: document.getElementById('run-engine'),
@@ -2767,6 +2873,7 @@ def app_html() -> str:
     }};
 
     document.getElementById('open-run-config').addEventListener('click', async () => {{
+      configureRunFindingsReuse(null);
       el.runConfigModal.classList.add('open');
       await Promise.all([loadProviders(), loadAgentPrompts(), loadIntegrations()]);
       updateRunEngineVisibility();
@@ -3453,6 +3560,7 @@ def app_html() -> str:
       }};
       el.runSarif.value = config.report_path || config.sarif_path || run.sarif_path || '';
       el.runSource.value = config.source_path || run.source_path || '';
+      configureRunFindingsReuse(run);
       el.runSkills.value = config.skills_path || '';
       el.runEngine.value = config.engine || run.engine || 'codex';
       el.runOpenCodeModel.value = config.llm_model || '';
@@ -3474,7 +3582,22 @@ def app_html() -> str:
         config.moderator_provider_id
       );
       updateRunEngineVisibility();
-      el.runResult.textContent = `已从 ${{run.run_id || '历史任务'}} 填入配置。可调整参数后再启动。`;
+      const reuseText = el.runReuseFindings.checked ? '将复用报告拆分结果。' : '该任务没有可复用的报告拆分结果。';
+      el.runResult.textContent = `已从 ${{run.run_id || '历史任务'}} 填入配置。${{reuseText}}可调整参数后再启动。`;
+    }}
+
+    function configureRunFindingsReuse(run) {{
+      const reuse = run && run.reusable_findings && typeof run.reusable_findings === 'object'
+        ? run.reusable_findings
+        : {{}};
+      const available = Boolean(run && run.run_id && reuse.available);
+      state.reuseFindingsFromRunId = available ? run.run_id : null;
+      el.runReuseFindingsOption.hidden = !run;
+      el.runReuseFindings.checked = available;
+      el.runReuseFindings.disabled = !available;
+      el.runReuseFindingsNote.textContent = available
+        ? `（来源 ${{run.run_id}}，${{Number(reuse.finding_count || 0)}} 个 finding）`
+        : (run ? '（来源任务尚无可复用的 findings）' : '');
     }}
 
     async function saveSkillSource() {{
@@ -3857,6 +3980,7 @@ def app_html() -> str:
           affirmative_provider_id: cliMode ? null : (el.runAffirmativeProvider.value || null),
           negative_provider_id: cliMode ? null : (el.runNegativeProvider.value || null),
           moderator_provider_id: cliMode ? null : (el.runModeratorProvider.value || null),
+          reuse_findings_from_run_id: el.runReuseFindings.checked ? state.reuseFindingsFromRunId : null,
           affirmative_agent_profile: el.runAffirmativeAgentProfile.value || null,
           negative_agent_profile: el.runNegativeAgentProfile.value || null,
           moderator_agent_profile: el.runModeratorAgentProfile.value || null

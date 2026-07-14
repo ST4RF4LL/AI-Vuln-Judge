@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
 from vuln_judger.api import (
+    _apply_reused_findings,
     _cli_sessions,
     _codex_terminal_page,
     _config_from_paused_payload,
@@ -49,7 +50,19 @@ from vuln_judger.logging_config import DEFAULT_LOG_RETENTION_DAYS, configure_log
 from vuln_judger.mcp import MCPStdioClient
 from vuln_judger.mcp_config import MCPServerStore
 from vuln_judger.mcp_server import JudgerMCPServer, JudgerMCPSettings, _tool_specs
-from vuln_judger.models import DEFAULT_SILENCE_REMINDER_MINUTES, AgentConfig, CodeEvidence, EvidenceKind, EvidenceStrength, Finding, RunConfig, SourceLocation, Verdict, to_jsonable
+from vuln_judger.models import (
+    DEFAULT_SILENCE_REMINDER_MINUTES,
+    REPORT_FINDINGS_SCHEMA,
+    AgentConfig,
+    CodeEvidence,
+    EvidenceKind,
+    EvidenceStrength,
+    Finding,
+    RunConfig,
+    SourceLocation,
+    Verdict,
+    to_jsonable,
+)
 from vuln_judger.opencode_runner import (
     OPENCODE_PERMISSION_CONFIG,
     OpenCodeCapabilities,
@@ -2032,6 +2045,11 @@ for raw in sys.stdin.buffer:
         self.assertIn('data-run-copy-config="true"', html)
         self.assertIn('async function copyRunToConfig(runId)', html)
         self.assertIn('function fillRunConfigFromHistory(run)', html)
+        self.assertIn('id="run-reuse-findings" type="checkbox" checked', html)
+        self.assertIn('复用报告拆分结果', html)
+        self.assertIn('function configureRunFindingsReuse(run)', html)
+        self.assertIn('state.reuseFindingsFromRunId = available ? run.run_id : null', html)
+        self.assertIn('reuse_findings_from_run_id: el.runReuseFindings.checked ? state.reuseFindingsFromRunId : null', html)
         self.assertIn('可调整参数后再启动', html)
         self.assertIn('function statusChipClass(status)', html)
         self.assertIn('.chip.status-completed', html)
@@ -2077,6 +2095,7 @@ for raw in sys.stdin.buffer:
         self.assertIn('class="run-provider-control" hidden', html)
         self.assertIn('class="run-agent-control"', html)
         self.assertIn('class="run-builtin-control" hidden>最大回合数', html)
+        self.assertIn('[hidden] { display: none !important; }', html)
         self.assertIn('id="run-tool-provider-options"', html)
         self.assertIn('id="run-codex-config-note"', html)
         self.assertIn('id="run-silence-reminder-minutes"', html)
@@ -2590,6 +2609,123 @@ for raw in sys.stdin.buffer:
             self.assertEqual(minimum_config.silence_reminder_minutes, 1)
             self.assertEqual(maximum_config.silence_reminder_minutes, 1440)
 
+    def test_api_loads_and_validates_reused_report_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report.md"
+            report.write_text("# report\n", encoding="utf-8")
+            source = root / "source"
+            source.mkdir()
+            source_run_id = "run-source-findings"
+            run_dir = root / ".workspaces" / "runs" / source_run_id
+            run_dir.mkdir(parents=True)
+            findings_path = run_dir / "findings.json"
+            findings_path.write_text(
+                json.dumps(
+                    {
+                        "findings": [
+                            {"finding_id": "finding-1", "rule_id": "rule-1", "message": "first"},
+                            {"finding_id": "finding-2", "rule_id": "rule-2", "message": "second"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            records = RunRecordStore(root / "records")
+            records.save_payload(
+                {
+                    "run_id": source_run_id,
+                    "sarif_path": str(report),
+                    "cli_workflow": {
+                        "run_dir": str(run_dir),
+                        "findings_path": str(findings_path),
+                    },
+                }
+            )
+            config = _config_from_payload(
+                {
+                    "report_path": str(report),
+                    "source_path": str(source),
+                    "engine": "codex",
+                    "reuse_findings_from_run_id": source_run_id,
+                },
+                root / "providers.json",
+            )
+
+            _apply_reused_findings(config, records, {}, Lock())
+
+            self.assertEqual([item.finding_id for item in config.reused_findings], ["finding-1", "finding-2"])
+            self.assertEqual(config.reused_findings_payload["schema"], REPORT_FINDINGS_SCHEMA)
+            self.assertEqual(config.reused_findings_payload["reused_from_run_id"], source_run_id)
+
+            mismatched = _config_from_payload(
+                {
+                    "report_path": str(root / "other.md"),
+                    "source_path": str(source),
+                    "engine": "codex",
+                    "reuse_findings_from_run_id": source_run_id,
+                },
+                root / "providers.json",
+            )
+            with self.assertRaisesRegex(ValueError, "报告路径与来源任务不一致"):
+                _apply_reused_findings(mismatched, records, {}, Lock())
+
+            findings_path.write_text(
+                json.dumps(
+                    {
+                        "findings": [
+                            {"finding_id": "duplicate", "rule_id": "rule-1", "message": "first"},
+                            {"finding_id": "duplicate", "rule_id": "rule-2", "message": "second"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            duplicate = _config_from_payload(
+                {
+                    "report_path": str(report),
+                    "source_path": str(source),
+                    "engine": "codex",
+                    "reuse_findings_from_run_id": source_run_id,
+                },
+                root / "providers.json",
+            )
+            with self.assertRaisesRegex(ValueError, "重复 finding_id"):
+                _apply_reused_findings(duplicate, records, {}, Lock())
+
+    def test_builtin_runner_skips_report_preparation_for_reused_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "app.py").write_text("print('demo')\n", encoding="utf-8")
+            report_path = root / "report.md"
+            report_path.write_text("# report that would require Moderator\n", encoding="utf-8")
+            finding = Finding(
+                finding_id="reused-builtin",
+                rule_id="rule-reused",
+                message="reused report finding",
+                level="warning",
+                locations=[SourceLocation(file="app.py", line=1)],
+            )
+            config = RunConfig(
+                sarif_path=report_path,
+                source_path=source,
+                engine="builtin",
+                run_id="run-builtin-reused",
+                enable_external_tools=False,
+                reuse_findings_from_run_id="run-source",
+                reused_findings=[finding],
+            )
+
+            with patch("vuln_judger.pipeline.prepare_report_for_processing", side_effect=AssertionError("unexpected")):
+                completed = run_judgement(config)
+
+            self.assertEqual(completed.finding_count, 1)
+            self.assertEqual(completed.report_findings["origin"], "reused")
+            self.assertEqual(completed.report_findings["reused_from_run_id"], "run-source")
+            self.assertIn("已复用任务 run-source 的报告拆分结果", completed.diagnostics)
+
     def test_codex_config_uses_agent_profiles_from_store(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2848,6 +2984,104 @@ for raw in sys.stdin.buffer:
             briefs = [json.loads(path.read_text(encoding="utf-8")) for path in brief_paths]
             self.assertTrue(any(brief["properties"].get("fixture_marker") == "preserved" for brief in briefs))
             self.assertTrue(all(brief["raw"].get("message") for brief in briefs))
+
+    def test_codex_runner_reuses_copied_findings_without_report_moderation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "app.py").write_text("print('demo')\n", encoding="utf-8")
+            report = root / "report.md"
+            report.write_text("# Demo report\n", encoding="utf-8")
+            records = RunRecordStore(root / "records")
+            sent = []
+
+            class FakeSession:
+                def __init__(self, role):
+                    self.role = role
+
+                def info(self):
+                    return {
+                        "role": self.role,
+                        "session_name": f"vj-run-reused-{self.role}",
+                        "target": f"vj-run-reused-{self.role}:codex",
+                    }
+
+                def start(self):
+                    return None
+
+                def send(self, prompt):
+                    sent.append((self.role, prompt))
+
+            sessions = {role: FakeSession(role) for role in ("moderator", "affirmative", "negative")}
+
+            def stage_result(path, **kwargs):
+                self.assertFalse(str(path).endswith("findings.json"))
+                prompt = kwargs["stage_prompt"]
+
+                def field(name):
+                    return prompt.split(f'"{name}": "', 1)[1].split('"', 1)[0]
+
+                role = field("role")
+                identity = {
+                    "role": role,
+                    "finding_id": field("finding_id"),
+                    "attempt_id": field("attempt_id"),
+                    "confidence": 0.8,
+                }
+                if role == "moderator":
+                    return {
+                        **identity,
+                        "verdict": "TRUE_POSITIVE",
+                        "reasoning_summary": "reused-final",
+                        "final_conclusion": "reused-final",
+                    }
+                return {**identity, "position": "TRUE_POSITIVE", "summary": role}
+
+            reused_finding = Finding(
+                finding_id="reused-finding",
+                rule_id="reused-rule",
+                message="copied split result",
+                level="warning",
+                locations=[SourceLocation(file="app.py", line=1)],
+            )
+            config = RunConfig(
+                sarif_path=report,
+                source_path=source,
+                engine="codex",
+                run_id="run-reused",
+                reuse_findings_from_run_id="run-source",
+                reused_findings=[reused_finding],
+                reused_findings_payload={
+                    "schema": REPORT_FINDINGS_SCHEMA,
+                    "origin": "moderator",
+                    "finding_count": 1,
+                    "findings": [to_jsonable(reused_finding)],
+                    "reused_from_run_id": "run-source",
+                },
+            )
+            runner = CodexDrivenRunner(
+                records_dir=records.root,
+                codex_runs_dir=root / ".workspaces" / "runs",
+                codex_command="codex",
+            )
+
+            with patch("vuln_judger.codex_runner._ensure_codex_project_trust"), patch.object(
+                runner,
+                "_sessions",
+                return_value=sessions,
+            ), patch("vuln_judger.codex_runner._wait_json", side_effect=stage_result):
+                completed = runner.run(config, store=records)
+
+            self.assertFalse(any("当前阶段：报告拆分" in prompt for _role, prompt in sent))
+            self.assertEqual([role for role, _prompt in sent], ["affirmative", "negative", "moderator"])
+            self.assertEqual(completed["finding_count"], 1)
+            self.assertEqual(completed["cli_workflow"]["report_preparation_origin"], "reused")
+            self.assertEqual(completed["cli_workflow"]["reused_findings_from_run_id"], "run-source")
+            persisted = json.loads(
+                (root / ".workspaces" / "runs" / "run-reused" / "findings.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(persisted["reused_from_run_id"], "run-source")
 
     def test_codex_runner_persists_all_findings_and_resumes_from_first_incomplete(self):
         with tempfile.TemporaryDirectory() as tmp:
