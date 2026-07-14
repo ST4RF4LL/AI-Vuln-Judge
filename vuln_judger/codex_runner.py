@@ -232,6 +232,7 @@ class CodexTmuxSession:
             )
 
     def send(self, text: str) -> None:
+        text = _normalize_cli_prompt(text)
         if not text:
             raise CodexRunnerError("Codex prompt 不能为空")
         if not self.is_live():
@@ -2468,6 +2469,12 @@ def _location_from_dict(data: Dict[str, Any]) -> SourceLocation:
 def _safe_tmux_name(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", value)[:80].strip("-")
     return cleaned or "vj-session"
+
+
+def _normalize_cli_prompt(value: str) -> str:
+    """Use LF for persisted/API prompts while leaving terminal Enter handling separate."""
+
+    return str(value).replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _safe_tmux_ref(value: str) -> bool:

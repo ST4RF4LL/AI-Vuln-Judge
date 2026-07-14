@@ -2289,6 +2289,7 @@ for raw in sys.stdin.buffer:
                 session.send("line one\r\nline two")
 
             self.assertEqual(session._current_prompt_path.read_text(encoding="utf-8"), "line one\nline two")
+            self.assertNotIn(b"\r", session._current_prompt_path.read_bytes())
             launch = run_tmux.call_args_list[-1].args[0]
             self.assertIn("new-window", launch)
             shell = launch[-1]
@@ -5890,6 +5891,8 @@ class OpenCodeRunnerTests(unittest.TestCase):
             create_session.assert_called_once_with(
                 session.server_url,
                 title="vuln-judger run-1 moderator",
+                directory=session.cwd,
+                model=None,
             )
             tui_launch = run_tmux.call_args.args[0]
             self.assertIn("attach", tui_launch)
@@ -5932,7 +5935,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 self.assertIsNotNone(first_event)
                 first_event.write_text('{"type":"session","sessionID":"ses-1"}\n', encoding="utf-8")
                 session.activity_snapshot()
-                session.send("second prompt")
+                session.send("second\r\nprompt\rtail")
 
             launch = run_tmux.call_args_list[-1].args[0]
             shell = launch[-1]
@@ -5945,12 +5948,19 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertNotIn("second prompt", shell)
             self.assertNotIn("paste-buffer", shell)
             self.assertNotIn("send-keys", shell)
-            self.assertEqual(request_payload["parts"], [{"type": "text", "text": "second prompt"}])
+            self.assertEqual(
+                request_payload["parts"],
+                [{"type": "text", "text": "second\nprompt\ntail"}],
+            )
+            self.assertNotIn(b"\r", session._current_prompt_path.read_bytes())
+            self.assertNotIn(b"\r", session._current_request_path.read_bytes())
             self.assertEqual(
                 request_payload["model"],
                 {"providerID": "openai", "modelID": "gpt-5"},
             )
             self.assertEqual(create_session.call_count, 2)
+            self.assertEqual(create_session.call_args.kwargs["directory"], session.cwd)
+            self.assertEqual(create_session.call_args.kwargs["model"], "openai/gpt-5")
             self.assertEqual(session.info().provider_session_id, "ses-2")
             self.assertEqual(session.info().transport, "serve+prompt-api")
 
@@ -6056,14 +6066,51 @@ class OpenCodeRunnerTests(unittest.TestCase):
             wait_tui.assert_called_once_with("vj-run-1-affirmative:tui")
 
     def test_opencode_prompt_client_posts_directly_to_local_server(self):
-        received = {}
+        received = {"get_paths": []}
 
         class PromptHandler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("content-length") or 0)
                 received["path"] = self.path
                 received["body"] = json.loads(self.rfile.read(length).decode("utf-8"))
-                raw = json.dumps({"info": {"id": "msg-1"}, "parts": []}).encode("utf-8")
+                raw = json.dumps(
+                    {
+                        "data": {
+                            "admittedSeq": 1,
+                            "id": "msg-user-1",
+                            "sessionID": "ses/with space",
+                            "prompt": {"text": "line one\nline two\nline three"},
+                            "delivery": "queue",
+                            "timeCreated": 1,
+                            "promotedSeq": 1,
+                        }
+                    }
+                ).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):  # noqa: N802
+                received["get_paths"].append(self.path)
+                if self.path.startswith("/session/ses%2Fwith%20space/message?"):
+                    payload = [
+                        {
+                            "info": {
+                                "id": "msg-assistant-1",
+                                "sessionID": "ses/with space",
+                                "role": "assistant",
+                                "parentID": "msg-user-1",
+                                "time": {"created": 1, "completed": 2},
+                                "finish": "stop",
+                            },
+                            "parts": [],
+                        }
+                    ]
+                else:
+                    payload = {"ses/with space": {"type": "busy"}}
+                raw = json.dumps(payload).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("content-type", "application/json")
                 self.send_header("content-length", str(len(raw)))
@@ -6081,7 +6128,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 server_url=f"http://127.0.0.1:{server.server_port}",
                 session_id="ses/with space",
                 directory="/mnt/c/source tree",
-                payload={"parts": [{"type": "text", "text": "review finding"}]},
+                payload={"parts": [{"type": "text", "text": "line one\r\nline two\rline three"}]},
                 timeout=5,
             )
         finally:
@@ -6089,13 +6136,85 @@ class OpenCodeRunnerTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-        self.assertEqual(response["info"]["id"], "msg-1")
-        self.assertTrue(received["path"].startswith("/session/ses%2Fwith%20space/message?"))
-        self.assertIn("directory=%2Fmnt%2Fc%2Fsource+tree", received["path"])
+        self.assertEqual(response["admission"]["id"], "msg-user-1")
+        self.assertEqual(response["assistant"]["info"]["id"], "msg-assistant-1")
+        self.assertEqual(received["path"], "/api/session/ses%2Fwith%20space/prompt")
         self.assertEqual(
             received["body"],
-            {"parts": [{"type": "text", "text": "review finding"}]},
+            {
+                "prompt": {"text": "line one\nline two\nline three"},
+                "delivery": "queue",
+                "resume": True,
+            },
         )
+        self.assertTrue(
+            any(
+                path.startswith("/session/ses%2Fwith%20space/message?")
+                and "directory=%2Fmnt%2Fc%2Fsource+tree" in path
+                for path in received["get_paths"]
+            )
+        )
+
+    def test_opencode_prompt_client_fails_when_admitted_agent_loop_stays_idle(self):
+        class IdlePromptHandler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("content-length") or 0)
+                self.rfile.read(length)
+                raw = json.dumps(
+                    {
+                        "data": {
+                            "admittedSeq": 1,
+                            "id": "msg-idle",
+                            "sessionID": "ses-idle",
+                            "prompt": {"text": "review finding"},
+                            "delivery": "queue",
+                            "timeCreated": 1,
+                        }
+                    }
+                ).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):  # noqa: N802
+                payload = {} if self.path.startswith("/session/status?") else []
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), IdlePromptHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch.dict(
+                os.environ,
+                {
+                    "VULN_JUDGER_OPENCODE_AGENT_START_TIMEOUT": "0.1",
+                    "VULN_JUDGER_OPENCODE_POLL_INTERVAL": "0.01",
+                },
+            ), self.assertRaisesRegex(
+                RuntimeError,
+                "accepted prompt msg-idle but agent loop did not start",
+            ):
+                send_prompt(
+                    server_url=f"http://127.0.0.1:{server.server_port}",
+                    session_id="ses-idle",
+                    directory="/mnt/c/source",
+                    payload={"parts": [{"type": "text", "text": "review finding"}]},
+                    timeout=5,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_opencode_dashboard_terminal_accepts_input_for_api_transport(self):
         payload = {

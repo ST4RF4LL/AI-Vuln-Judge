@@ -25,6 +25,7 @@ from .codex_runner import (
     CliSession,
     CodexRunnerError,
     _cli_agent_file_text,
+    _normalize_cli_prompt,
     _run_tmux,
     _safe_tmux_name,
     _wait_for_cli_task_start,
@@ -193,6 +194,7 @@ class OpenCodeTmuxSession:
             _run_tmux(["tmux", "kill-session", "-t", self.session_name], timeout=10, check=False)
 
     def send(self, text: str) -> None:
+        text = _normalize_cli_prompt(text)
         if not text:
             raise CodexRunnerError("OpenCode prompt 不能为空")
         if not self.is_live():
@@ -217,13 +219,12 @@ class OpenCodeTmuxSession:
         exit_path = self.logs_dir / f"exit-{self._sequence:04d}.txt"
         prompt_path.write_text(text, encoding="utf-8")
         request_payload: Dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
-        if self.model:
-            provider_id, separator, model_id = self.model.partition("/")
-            if not separator or not provider_id.strip() or not model_id.strip():
-                raise CodexRunnerError("OpenCode model 必须使用 provider/model 格式")
+        model_parts = _split_opencode_model(self.model)
+        if model_parts:
+            provider_id, model_id = model_parts
             request_payload["model"] = {
-                "providerID": provider_id.strip(),
-                "modelID": model_id.strip(),
+                "providerID": provider_id,
+                "modelID": model_id,
             }
         request_path.write_text(
             json.dumps(request_payload, ensure_ascii=False, indent=2) + "\n",
@@ -440,6 +441,8 @@ class OpenCodeTmuxSession:
         self._provider_session_id = _create_opencode_session(
             self.server_url,
             title=f"vuln-judger {self.run_id} {self.role}",
+            directory=self.cwd,
+            model=self.model,
         )
         return True
 
@@ -447,6 +450,8 @@ class OpenCodeTmuxSession:
         self._provider_session_id = _create_opencode_session(
             self.server_url,
             title=f"vuln-judger {self.run_id} {self.role} task-{self._sequence + 1}",
+            directory=self.cwd,
+            model=self.model,
         )
         self._save_state()
         # Keep the same tmux pane so an already-open Dashboard WebSocket does not
@@ -753,10 +758,32 @@ def _opencode_session_exists(url: str, session_id: str) -> bool:
         raise CodexRunnerError(f"OpenCode session 校验失败：{exc}") from exc
 
 
-def _create_opencode_session(url: str, *, title: str) -> str:
+def _split_opencode_model(model: Optional[str]) -> Optional[tuple[str, str]]:
+    value = (model or "").strip()
+    if not value:
+        return None
+    provider_id, separator, model_id = value.partition("/")
+    if not separator or not provider_id.strip() or not model_id.strip():
+        raise CodexRunnerError("OpenCode model 必须使用 provider/model 格式")
+    return provider_id.strip(), model_id.strip()
+
+
+def _create_opencode_session(
+    url: str,
+    *,
+    title: str,
+    directory: Path,
+    model: Optional[str],
+) -> str:
+    body: Dict[str, Any] = {"title": title}
+    model_parts = _split_opencode_model(model)
+    if model_parts:
+        provider_id, model_id = model_parts
+        body["model"] = {"providerID": provider_id, "id": model_id}
+    query = urllib.parse.urlencode({"directory": str(directory)})
     request = urllib.request.Request(
-        f"{url}/session",
-        data=json.dumps({"title": title}, ensure_ascii=False).encode("utf-8"),
+        f"{url}/session?{query}",
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
         headers={"content-type": "application/json"},
         method="POST",
     )
