@@ -32,6 +32,7 @@ from .codex_runner import (
 )
 from .logging_config import logger
 from .models import AgentConfig, RunConfig
+from .opencode_prompt_client import submit_prompt_async
 
 
 DEFAULT_OPENCODE_WORKSPACES_DIR = REPO_ROOT / ".workspaces" / "runs"
@@ -628,6 +629,44 @@ def ensure_opencode_tui(session: Dict[str, Any]) -> str:
         config_path=cwd / ".opencode" / "opencode.json",
         mini=True,
     )
+
+
+def send_opencode_session_message(session: Dict[str, Any], text: str) -> Dict[str, str]:
+    server_url = _text(session.get("server_url"))
+    session_id = _text(session.get("provider_session_id"))
+    cwd_text = _text(session.get("cwd"))
+    if not all((server_url, session_id, cwd_text)):
+        raise CodexRunnerError("OpenCode session 元数据不完整")
+    if not server_url.startswith(("http://127.0.0.1:", "http://localhost:")):
+        raise CodexRunnerError("OpenCode server URL 必须指向本机")
+    cwd = Path(cwd_text).expanduser().resolve()
+    if not cwd.is_dir():
+        raise CodexRunnerError(f"OpenCode session 目录不存在：{cwd}")
+    normalized = _normalize_cli_prompt(text)
+    if not normalized:
+        raise CodexRunnerError("OpenCode message 不能为空")
+    timeout_raw = os.environ.get("VULN_JUDGER_OPENCODE_MANUAL_PROMPT_TIMEOUT", "10")
+    try:
+        timeout = max(float(timeout_raw), 0.1)
+    except ValueError as exc:
+        raise CodexRunnerError(
+            f"VULN_JUDGER_OPENCODE_MANUAL_PROMPT_TIMEOUT 无效：{timeout_raw}"
+        ) from exc
+    try:
+        message_id = submit_prompt_async(
+            server_url=server_url,
+            session_id=session_id,
+            directory=str(cwd),
+            payload={"parts": [{"type": "text", "text": normalized}]},
+            timeout=timeout,
+        )
+    except RuntimeError as exc:
+        raise CodexRunnerError(str(exc)) from exc
+    return {
+        "message_id": message_id,
+        "session_id": session_id,
+        "target": f"{session.get('session_name')}:tui",
+    }
 
 
 def _ensure_opencode_tui_window(

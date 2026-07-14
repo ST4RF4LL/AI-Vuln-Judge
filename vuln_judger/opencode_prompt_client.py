@@ -10,7 +10,10 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+
+StatusCallback = Callable[[Dict[str, Any]], None]
 
 
 def send_prompt(
@@ -20,6 +23,7 @@ def send_prompt(
     directory: str,
     payload: Dict[str, Any],
     timeout: Optional[float],
+    status_callback: Optional[StatusCallback] = None,
 ) -> Any:
     """Start one legacy OpenCode session turn and wait for its assistant response."""
 
@@ -27,16 +31,20 @@ def send_prompt(
     base_url = server_url.rstrip("/")
     deadline = time.monotonic() + timeout if timeout is not None else None
     query = urllib.parse.urlencode({"directory": directory})
-    message_id = _new_message_id()
-    prompt_payload = _normalized_payload(payload)
-    prompt_payload["messageID"] = message_id
-    _request_json(
-        f"{base_url}/session/{encoded_session}/prompt_async?{query}",
-        method="POST",
-        payload=prompt_payload,
-        timeout=_request_timeout(deadline, session_id),
+    message_id = submit_prompt_async(
+        server_url=server_url,
         session_id=session_id,
-        operation="prompt_async",
+        directory=directory,
+        payload=payload,
+        timeout=_request_timeout(deadline, session_id),
+    )
+    prompt_payload = _normalized_payload(payload)
+    _notify_status(
+        status_callback,
+        session_id=session_id,
+        message_id=message_id,
+        state="submitted",
+        model=_payload_model(prompt_payload),
     )
 
     messages_url = f"{base_url}/session/{encoded_session}/message?{query}"
@@ -44,6 +52,7 @@ def send_prompt(
     start_deadline = time.monotonic() + _agent_start_timeout()
     started = False
     idle_since: Optional[float] = None
+    last_status_signature = ""
 
     while True:
         request_timeout = _request_timeout(deadline, session_id)
@@ -54,6 +63,7 @@ def send_prompt(
             operation="message polling",
         )
         assistant = _assistant_for_prompt(messages, message_id)
+        model = _message_model(messages, message_id, assistant) or _payload_model(prompt_payload)
         if assistant is not None:
             started = True
             info = assistant.get("info") if isinstance(assistant, dict) else None
@@ -62,12 +72,6 @@ def send_prompt(
                     f"OpenCode session {session_id} assistant failed: "
                     f"{json.dumps(info['error'], ensure_ascii=False)}"
                 )
-            completed = isinstance(info, dict) and (
-                isinstance(info.get("time"), dict) and info["time"].get("completed") is not None
-                or bool(info.get("finish"))
-            )
-            if completed:
-                return {"messageID": message_id, "assistant": assistant}
 
         statuses = _request_json(
             status_url,
@@ -76,7 +80,32 @@ def send_prompt(
             operation="status polling",
         )
         status = statuses.get(session_id) if isinstance(statuses, dict) else None
-        status_type = status.get("type") if isinstance(status, dict) else "idle"
+        status_type = str(status.get("type") or "idle") if isinstance(status, dict) else "idle"
+        if _assistant_turn_completed(assistant, status_type):
+            _notify_status(
+                status_callback,
+                session_id=session_id,
+                message_id=message_id,
+                state="completed",
+                model=model,
+            )
+            return {"messageID": message_id, "assistant": assistant}
+        state = "retrying" if status_type == "retry" else "running" if status_type == "busy" else "idle"
+        signature = json.dumps(
+            {"state": state, "status": status, "model": model},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if signature != last_status_signature:
+            _notify_status(
+                status_callback,
+                session_id=session_id,
+                message_id=message_id,
+                state=state,
+                model=model,
+                status=status,
+            )
+            last_status_signature = signature
         if status_type in {"busy", "retry"}:
             started = True
             idle_since = None
@@ -95,6 +124,32 @@ def send_prompt(
                 f"OpenCode session {session_id} returned to idle {detail} for prompt {message_id}"
             )
         time.sleep(_poll_interval())
+
+
+def submit_prompt_async(
+    *,
+    server_url: str,
+    session_id: str,
+    directory: str,
+    payload: Dict[str, Any],
+    timeout: float = 10.0,
+) -> str:
+    """Submit one prompt through the API used by OpenCode's legacy TUI session."""
+
+    encoded_session = urllib.parse.quote(session_id, safe="")
+    query = urllib.parse.urlencode({"directory": directory})
+    message_id = _new_message_id()
+    prompt_payload = _normalized_payload(payload)
+    prompt_payload["messageID"] = message_id
+    _request_json(
+        f"{server_url.rstrip('/')}/session/{encoded_session}/prompt_async?{query}",
+        method="POST",
+        payload=prompt_payload,
+        timeout=timeout,
+        session_id=session_id,
+        operation="prompt_async",
+    )
+    return message_id
 
 
 def _request_json(
@@ -161,6 +216,85 @@ def _assistant_for_prompt(messages: Any, message_id: str) -> Optional[Dict[str, 
         ):
             return message
     return None
+
+
+def _assistant_turn_completed(assistant: Optional[Dict[str, Any]], status_type: str) -> bool:
+    if not isinstance(assistant, dict) or status_type != "idle":
+        return False
+    info = assistant.get("info")
+    if not isinstance(info, dict):
+        return False
+    finish = str(info.get("finish") or "").strip().lower().replace("_", "-")
+    if finish in {"tool-call", "tool-calls"}:
+        return False
+    timing = info.get("time")
+    if isinstance(timing, dict) and timing.get("completed") is not None:
+        return True
+    return finish in {"stop", "length", "content-filter", "cancelled", "canceled", "error"}
+
+
+def _message_model(
+    messages: Any,
+    message_id: str,
+    assistant: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    if isinstance(assistant, dict):
+        info = assistant.get("info")
+        if isinstance(info, dict):
+            provider_id = str(info.get("providerID") or "").strip()
+            model_id = str(info.get("modelID") or "").strip()
+            if provider_id and model_id:
+                return {"providerID": provider_id, "modelID": model_id}
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        info = message.get("info")
+        if not isinstance(info, dict) or info.get("id") != message_id:
+            continue
+        model = info.get("model")
+        if isinstance(model, dict):
+            provider_id = str(model.get("providerID") or "").strip()
+            model_id = str(model.get("modelID") or "").strip()
+            if provider_id and model_id:
+                return {"providerID": provider_id, "modelID": model_id}
+    return None
+
+
+def _payload_model(payload: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    model = payload.get("model")
+    if not isinstance(model, dict):
+        return None
+    provider_id = str(model.get("providerID") or "").strip()
+    model_id = str(model.get("modelID") or "").strip()
+    if not provider_id or not model_id:
+        return None
+    return {"providerID": provider_id, "modelID": model_id}
+
+
+def _notify_status(
+    callback: Optional[StatusCallback],
+    *,
+    session_id: str,
+    message_id: str,
+    state: str,
+    model: Optional[Dict[str, str]],
+    status: Any = None,
+) -> None:
+    if callback is None:
+        return
+    event: Dict[str, Any] = {
+        "type": "prompt_status",
+        "sessionID": session_id,
+        "messageID": message_id,
+        "state": state,
+    }
+    if model:
+        event["model"] = model
+    if isinstance(status, dict):
+        event["status"] = status
+    callback(event)
 
 
 def _payload_text(payload: Dict[str, Any]) -> str:
@@ -248,6 +382,10 @@ def _timeout() -> Optional[float]:
     return timeout if timeout > 0 else None
 
 
+def _print_event(event: Dict[str, Any]) -> None:
+    print(json.dumps(event, ensure_ascii=False), flush=True)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Submit a prompt to a local OpenCode server")
     parser.add_argument("--server-url", required=True)
@@ -278,6 +416,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             directory=args.directory,
             payload=payload,
             timeout=_timeout(),
+            status_callback=_print_event,
         )
     except RuntimeError as exc:
         print(

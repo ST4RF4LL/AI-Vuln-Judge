@@ -28,12 +28,17 @@ from .codex_runner import (
     session_live,
     stop_sessions,
 )
+from .codex_event_log import format_codex_ndjson
 from .evidence_graph import build_evidence_graph, graph_to_markdown
 from .llm import test_provider_connection
 from .logging_config import DEFAULT_LOG_FILE, DEFAULT_LOG_RETENTION_DAYS, configure_logging, logger
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE, MCPServerStore
 from .models import DEFAULT_SILENCE_REMINDER_MINUTES, AgentConfig, RunConfig, to_jsonable
-from .opencode_runner import OpenCodeDrivenRunner, ensure_opencode_tui
+from .opencode_runner import (
+    OpenCodeDrivenRunner,
+    ensure_opencode_tui,
+    send_opencode_session_message,
+)
 from .pipeline import RunStopped, run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderStore
 from .records import RunRecordStore, normalize_run_origin
@@ -445,7 +450,8 @@ def make_handler(
                         self._json({"error": "CLI session 未找到"}, HTTPStatus.NOT_FOUND)
                         return
                     session = dict(session)
-                    if str(session.get("backend") or terminal_payload.get("engine") or "") == OPENCODE_ENGINE:
+                    backend = str(session.get("backend") or terminal_payload.get("engine") or "")
+                    if backend == OPENCODE_ENGINE:
                         try:
                             session["target"] = ensure_opencode_tui(session)
                         except CodexRunnerError as exc:
@@ -456,10 +462,16 @@ def make_handler(
                     if parts[4] == "terminal-ui":
                         self._html(_codex_terminal_page(parts[1], parts[3], session))
                         return
+                    if backend != OPENCODE_ENGINE:
+                        self._json(
+                            {"error": "Codex 使用持久化执行日志，不提供 tmux WebSocket"},
+                            HTTPStatus.CONFLICT,
+                        )
+                        return
                     attach_session_websocket(
                         self,
                         target,
-                        read_only=not _cli_session_accepts_input(terminal_payload, session),
+                        read_only=True,
                     )
                     return
                 if len(parts) == 3 and parts[2] == "export":
@@ -1134,13 +1146,15 @@ def _codex_session_terminal(payload: dict, role: str) -> dict:
     if session is None:
         return {"error": "Codex session 未找到", "role": role, "live": False, "output": ""}
     target = str(session.get("target") or session.get("session_name") or "")
+    output = _codex_event_log(session)
     return {
         "role": session.get("role"),
         "session_name": session.get("session_name"),
         "window_name": session.get("window_name"),
         "target": target,
         "live": session_live(target),
-        "output": capture_session(target),
+        "output": output,
+        "formatted_output": format_codex_ndjson(output),
     }
 
 
@@ -1149,15 +1163,46 @@ def _cli_session_terminal(payload: dict, role: str) -> dict:
     if session is None:
         return {"error": "CLI session 未找到", "role": role, "live": False, "output": ""}
     target = str(session.get("target") or session.get("session_name") or "")
-    return {
+    backend = str(session.get("backend") or payload.get("engine") or "")
+    output = _codex_event_log(session) if backend == CODEX_ENGINE else capture_session(target)
+    result = {
         "role": session.get("role"),
-        "backend": session.get("backend") or payload.get("engine"),
+        "backend": backend,
         "session_name": session.get("session_name"),
         "window_name": session.get("window_name"),
         "target": target,
         "live": session_live(target),
-        "output": capture_session(target),
+        "output": output,
     }
+    if backend == CODEX_ENGINE:
+        result["formatted_output"] = format_codex_ndjson(output)
+    return result
+
+
+def _codex_event_log(session: dict, lines: int = 4000) -> str:
+    cwd_text = str(session.get("cwd") or "").strip()
+    if not cwd_text:
+        return ""
+    cwd = Path(cwd_text).expanduser().resolve()
+    candidates = []
+    event_log = str(session.get("event_log") or "").strip()
+    if event_log:
+        candidates.append(Path(event_log).expanduser())
+    candidates.append(cwd / ".vuln-judger-codex" / "current.ndjson")
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(cwd)
+        except (OSError, ValueError):
+            continue
+        if not resolved.is_file():
+            continue
+        try:
+            rows = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        return "\n".join(rows[-max(1, min(int(lines), 10000)) :]) + ("\n" if rows else "")
+    return ""
 
 
 def _stop_codex_sessions(
@@ -1206,40 +1251,54 @@ def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
     target = str(session.get("target") or session.get("session_name") or "")
     label = {"moderator": "Moderator", "affirmative": "正方", "negative": "反方"}.get(role, role)
     backend = str(session.get("backend") or CODEX_ENGINE)
-    cli_label = "OpenCode 任务会话" if backend == OPENCODE_ENGINE else "Codex 执行日志"
-    route = "cli-sessions" if backend == OPENCODE_ENGINE else "codex-sessions"
-    websocket_path = f"/runs/{run_id}/{route}/{role}/ws"
+    if backend == OPENCODE_ENGINE:
+        return _opencode_terminal_page(run_id, role, label, target)
+    return _codex_log_page(run_id, role, label, target)
+
+
+def _opencode_terminal_page(run_id: str, role: str, label: str, target: str) -> str:
+    websocket_path = f"/runs/{run_id}/cli-sessions/{role}/ws"
+    message_path = f"/runs/{run_id}/cli-sessions/{role}/input"
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{escape(label)} · {escape(cli_label)}</title>
+  <title>{escape(label)} · OpenCode 任务会话</title>
   <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
   <style>
     html, body {{ height: 100%; margin: 0; background: #0d1117; color: #c9d1d9; }}
-    body {{ display: grid; grid-template-rows: auto minmax(0, 1fr); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    body {{ display: grid; grid-template-rows: auto minmax(0, 1fr) auto; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     header {{ display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #30363d; background: #161b22; }}
     h1 {{ margin: 0; font-size: 14px; font-weight: 650; }}
     .meta {{ color: #8b949e; font-size: 12px; overflow-wrap: anywhere; }}
     #terminal {{ min-height: 0; height: 100%; padding: 8px; box-sizing: border-box; }}
     .xterm {{ height: 100%; }}
     .error {{ color: #ff7b72; padding: 12px; white-space: pre-wrap; }}
+    #message-form {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 8px 12px 12px; border-top: 1px solid #30363d; background: #161b22; }}
+    #message-input {{ min-width: 0; border: 1px solid #30363d; background: #0d1117; color: #c9d1d9; padding: 9px 10px; font: inherit; }}
+    #message-form button {{ border: 1px solid #388bfd; background: #238636; color: white; padding: 0 16px; font: inherit; cursor: pointer; }}
+    #message-form button:disabled {{ opacity: .55; cursor: default; }}
   </style>
 </head>
 <body>
   <header>
     <div>
-      <h1>{escape(label)} {escape(cli_label)}</h1>
+      <h1>{escape(label)} OpenCode 任务会话</h1>
       <div class="meta">{escape(run_id)} · {escape(target)}</div>
     </div>
-    <div class="meta">{escape("tmux observer · isolated exec logs" if backend == CODEX_ENGINE else "tmux attach · interactive OpenCode session")}</div>
+    <div class="meta">只读 TUI · HTTP 消息</div>
   </header>
   <div id="terminal"></div>
+  <form id="message-form">
+    <input id="message-input" autocomplete="off" placeholder="发送消息到 OpenCode">
+    <button type="submit">发送</button>
+  </form>
   <script src="/static/vendor/xterm/xterm.js"></script>
   <script src="/static/vendor/xterm/addon-fit.js"></script>
   <script>
     const websocketPath = {json.dumps(websocket_path)};
+    const messagePath = {json.dumps(message_path)};
     const terminalNode = document.getElementById('terminal');
     const TerminalCtor = window.Terminal;
     const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
@@ -1265,34 +1324,156 @@ def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
       const fitAddon = new FitAddonCtor();
       term.loadAddon(fitAddon);
       term.open(terminalNode);
+      function fitTerminal() {{
+        fitAddon.fit();
+      }}
       const ws = new WebSocket(websocketURL(websocketPath));
       ws.binaryType = 'arraybuffer';
-      function sendResize() {{
-        if (ws.readyState !== WebSocket.OPEN) return;
-        fitAddon.fit();
-        ws.send(JSON.stringify({{ type: 'resize', rows: term.rows, cols: term.cols }}));
-      }}
       ws.onopen = () => {{
-        sendResize();
-        term.focus();
+        fitTerminal();
+        ws.send(JSON.stringify({{ type: 'resize', rows: term.rows, cols: term.cols }}));
       }};
       ws.onmessage = event => {{
-        if (event.data instanceof ArrayBuffer) {{
-          term.write(new Uint8Array(event.data));
-        }} else if (event.data instanceof Blob) {{
+        if (event.data instanceof ArrayBuffer) term.write(new Uint8Array(event.data));
+        else if (event.data instanceof Blob) {{
           event.data.arrayBuffer().then(buffer => term.write(new Uint8Array(buffer)));
         }}
       }};
       ws.onclose = () => term.write('\\r\\n\\x1b[33m[tmux connection closed]\\x1b[0m\\r\\n');
       ws.onerror = () => term.write('\\r\\n\\x1b[31m[websocket error]\\x1b[0m\\r\\n');
-      term.onData(data => {{
-        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({{ type: 'input', data }}));
+
+      const messageForm = document.getElementById('message-form');
+      const messageInput = document.getElementById('message-input');
+      messageForm.addEventListener('submit', async event => {{
+        event.preventDefault();
+        const message = messageInput.value.trim();
+        if (!message) return;
+        const button = messageForm.querySelector('button');
+        button.disabled = true;
+        try {{
+          const response = await fetch(messagePath, {{
+            method: 'POST',
+            headers: {{ 'content-type': 'application/json' }},
+            body: JSON.stringify({{ message }})
+          }});
+          const payload = await response.json();
+          if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+          messageInput.value = '';
+        }} catch (error) {{
+          term.write(`\\r\\n\\x1b[31m[message error] ${{error.message}}\\x1b[0m\\r\\n`);
+        }} finally {{
+          button.disabled = false;
+          messageInput.focus();
+        }}
       }});
-      const resizeObserver = new ResizeObserver(() => setTimeout(sendResize, 50));
+      const resizeObserver = new ResizeObserver(() => setTimeout(() => {{
+        fitTerminal();
+        if (ws.readyState === WebSocket.OPEN) {{
+          ws.send(JSON.stringify({{ type: 'resize', rows: term.rows, cols: term.cols }}));
+        }}
+      }}, 50));
       resizeObserver.observe(terminalNode);
       window.addEventListener('beforeunload', () => ws.close());
-      requestAnimationFrame(sendResize);
+      requestAnimationFrame(fitTerminal);
     }}
+  </script>
+</body>
+</html>"""
+
+
+def _codex_log_page(run_id: str, role: str, label: str, target: str) -> str:
+    terminal_path = f"/runs/{run_id}/cli-sessions/{role}/terminal"
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(label)} · Codex 执行日志</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    html, body {{ height: 100%; margin: 0; background: #0d1117; color: #c9d1d9; }}
+    body {{ display: grid; grid-template-rows: auto minmax(0, 1fr); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    header {{ display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px 18px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #30363d; background: #161b22; }}
+    h1 {{ margin: 0; font-size: 14px; font-weight: 650; }}
+    .meta {{ color: #8b949e; font-size: 12px; overflow-wrap: anywhere; }}
+    .controls {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }}
+    .segmented {{ display: inline-grid; grid-template-columns: 1fr 1fr; border: 1px solid #30363d; border-radius: 4px; overflow: hidden; }}
+    .segmented button {{ min-width: 64px; border: 0; border-right: 1px solid #30363d; background: #0d1117; color: #8b949e; padding: 6px 10px; font: inherit; cursor: pointer; }}
+    .segmented button:last-child {{ border-right: 0; }}
+    .segmented button[aria-pressed="true"] {{ background: #238636; color: #ffffff; }}
+    .follow {{ display: inline-flex; align-items: center; gap: 6px; color: #c9d1d9; font-size: 12px; }}
+    .status {{ min-width: 64px; color: #8b949e; font-size: 12px; text-align: right; }}
+    .status.live {{ color: #3fb950; }}
+    .status.error {{ color: #ff7b72; }}
+    #log {{ min-width: 0; min-height: 0; margin: 0; padding: 14px 16px 28px; overflow: auto; box-sizing: border-box; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; font: 13px/1.55 "JetBrains Mono", Menlo, Monaco, Consolas, monospace; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>{escape(label)} Codex 执行日志</h1>
+      <div class="meta">{escape(run_id)} · {escape(target)}</div>
+    </div>
+    <div class="controls">
+      <div class="segmented" role="group" aria-label="日志显示模式">
+        <button type="button" data-log-mode="readable" aria-pressed="true">可读</button>
+        <button type="button" data-log-mode="raw" aria-pressed="false">原始</button>
+      </div>
+      <label class="follow"><input id="follow-log" type="checkbox" checked>自动跟随</label>
+      <span id="log-status" class="status">连接中</span>
+    </div>
+  </header>
+  <pre id="log"></pre>
+  <script>
+    const terminalPath = {json.dumps(terminal_path)};
+    const logNode = document.getElementById('log');
+    const statusNode = document.getElementById('log-status');
+    const followNode = document.getElementById('follow-log');
+    const modeButtons = Array.from(document.querySelectorAll('[data-log-mode]'));
+    let mode = 'readable';
+    let rawOutput = '';
+    let formattedOutput = '';
+    let renderedOutput = null;
+
+    function nearBottom() {{
+      return logNode.scrollHeight - logNode.scrollTop - logNode.clientHeight < 48;
+    }}
+
+    function renderLog() {{
+      const output = mode === 'raw' ? rawOutput : formattedOutput;
+      if (output === renderedOutput) return;
+      const follow = followNode.checked && (renderedOutput === null || nearBottom());
+      renderedOutput = output;
+      logNode.textContent = output || '[暂无执行日志]';
+      if (follow) requestAnimationFrame(() => {{ logNode.scrollTop = logNode.scrollHeight; }});
+    }}
+
+    modeButtons.forEach(button => button.addEventListener('click', () => {{
+      mode = button.dataset.logMode;
+      modeButtons.forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+      renderedOutput = null;
+      renderLog();
+    }}));
+
+    async function pollLog() {{
+      try {{
+        const response = await fetch(terminalPath, {{ cache: 'no-store' }});
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `HTTP ${{response.status}}`);
+        rawOutput = String(payload.output || '');
+        formattedOutput = String(payload.formatted_output || rawOutput);
+        statusNode.textContent = payload.live ? '日志在线' : '日志已停止';
+        statusNode.className = `status${{payload.live ? ' live' : ''}}`;
+        renderLog();
+      }} catch (error) {{
+        statusNode.textContent = error.message;
+        statusNode.className = 'status error';
+      }} finally {{
+        window.setTimeout(pollLog, 1000);
+      }}
+    }}
+
+    pollLog();
   </script>
 </body>
 </html>"""
@@ -1325,11 +1506,11 @@ def _send_codex_session_input(
     backend = str(session.get("backend") or payload.get("engine") or "")
     if backend == OPENCODE_ENGINE:
         try:
-            target = ensure_opencode_tui(session)
+            submitted = send_opencode_session_message(session, message)
         except CodexRunnerError as exc:
             return {"ok": False, "role": role, "error": str(exc)}
-    else:
-        target = str(session.get("target") or session.get("session_name") or "")
+        return {"ok": True, "role": role, **submitted}
+    target = str(session.get("target") or session.get("session_name") or "")
     if not target:
         return None
     try:
@@ -4527,9 +4708,11 @@ def app_html() -> str:
     function renderCodexSessionButtons(run) {{
       const sessions = Array.isArray(run.cli_sessions) ? run.cli_sessions : (Array.isArray(run.codex_sessions) ? run.codex_sessions : []);
       if (!sessions.length) return '';
-      const labels = {{ moderator: 'Moderator 终端', affirmative: '正方终端', negative: '反方终端' }};
       const liveCount = sessions.filter(session => session.live).length;
       const backend = run.engine === 'opencode' ? 'OpenCode' : 'Codex';
+      const labels = backend === 'Codex'
+        ? {{ moderator: 'Moderator 日志', affirmative: '正方日志', negative: '反方日志' }}
+        : {{ moderator: 'Moderator 终端', affirmative: '正方终端', negative: '反方终端' }};
       return `<div><strong>CLI Sessions：</strong><div class="codex-session-buttons">
         ${{sessions.map(session => `<button type="button" title="${{backend === 'Codex' ? '在当前页面打开 Codex 隔离执行日志' : '在当前页面打开 OpenCode 隔离任务会话'}}" data-run-id="${{esc(run.run_id)}}" data-codex-terminal-role="${{esc(session.role || '')}}" data-cli-backend="${{esc(session.backend || run.engine || '')}}">
           ${{esc(labels[session.role] || session.role || backend)}}${{session.live ? ' · live' : ''}}

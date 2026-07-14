@@ -150,7 +150,9 @@ CLI 执行槽，并按 `Affirmative -> Negative -> Moderator` 组成三级流水
 向下游交付材料。每个 `(finding, stage)` 都使用独立上下文：Codex 通过新的
 `codex exec --ephemeral --json` 执行，OpenCode 在保留本地 server 的同时为每个阶段创建新的
 provider session。输出携带 `finding_id`、`role` 和 `attempt_id`，调度器会在接收时校验，防止并发
-任务串线或误读旧文件。
+任务串线或误读旧文件。Codex 的 Web 视图直接读取持久化 NDJSON 执行日志，不依赖存活的 tmux
+窗口，也不提供交互式 prompt 注入。页面默认把 JSONL 事件整理为消息、命令、工具调用和错误，仍可
+切换到原始事件用于排障；这不是 Codex TUI，因为 `codex exec --json` 本身只输出事件流。
 
 ### OpenCode 驱动引擎
 
@@ -160,7 +162,11 @@ provider session。输出携带 `finding_id`、`role` 和 `attempt_id`，调度�
 不再启动 `opencode run` 子进程，也不混用 v2 durable prompt 与 legacy session 状态，从而避开
 WSL 的 detached tmux 中 `opencode run` 已接收 prompt、却未可靠启动响应的问题。
 Web 端的 CLI Session 终端使用当前阶段 session 的 `opencode attach --mini` pane；切换阶段时
-会原位重启 pane，因此已打开的 WebSocket 不会误切到 server 窗口，并且可直接查看输出和输入消息。
+会原位重启 pane，因此已打开的 WebSocket 不会误切到 server 窗口。TUI pane 仅用于只读观察；
+Web 手动消息与自动阶段 prompt 使用相同的 `prompt_async` HTTP API。
+
+自动 prompt worker 会把 `submitted`、`running`、`retrying`、`idle` 和 `completed` 状态变化写入
+阶段 NDJSON，同时记录 OpenCode 实际解析出的 provider/model。原生 retry 仍完全由 OpenCode 管理。
 
 每个角色目录都会生成 `.opencode/opencode.json`，并通过 `OPENCODE_CONFIG` 和
 `OPENCODE_CONFIG_CONTENT` 显式注入 `{"permission":"allow"}`。这不会修改源码仓库或用户
@@ -174,6 +180,7 @@ TUI；自动任务投递只依赖本地 HTTP API。
 - `VULN_JUDGER_OPENCODE_WORKSPACES_DIR`：OpenCode 任务工作目录。
 - `VULN_JUDGER_OPENCODE_READY_TIMEOUT`：等待本地 server 就绪的秒数，默认 30。
 - `VULN_JUDGER_OPENCODE_TUI_READY_TIMEOUT`：等待 TUI 生成可捕获画面的秒数，默认 10。
+- `VULN_JUDGER_OPENCODE_MANUAL_PROMPT_TIMEOUT`：Web 手动消息提交 HTTP 超时秒数，默认 10。
 - `VULN_JUDGER_OPENCODE_AGENT_START_TIMEOUT`：prompt 已接收后等待 agent loop 启动的秒数，默认 15。
 - `VULN_JUDGER_OPENCODE_PROMPT_TIMEOUT`：可选的单次本地 prompt HTTP 请求超时秒数，默认不设硬超时。
 
@@ -380,6 +387,8 @@ Codex/OpenCode 三方复核引擎会直接复用合法、无分组歧义的 SARI
 分组存在歧义时才调用 Moderator 拆分。报告准备完成后会立即把全部 finding 写入运行记录，并在
 `.workspaces/runs/<run-id>/findings/<finding-id>/brief.json` 保存各自的输入材料。前端会将
 尚未裁决的 finding 标记为“未完成”或“处理中”，并同时展示三个角色槽当前处理的 finding。
+Markdown 只拆出一个 finding 时，调度器会直接从源报告补齐完整 `report_markdown`，避免模型复制
+正文时因尾部换行等无意义差异阻塞流水线。
 每个 finding 的 `cli_workflow.pipeline.stages` 会保存阶段状态、尝试次数、`attempt_id`、输出路径和
 起止时间。暂停或服务重启后，恢复流程会保留已成功的上游阶段，只清理首个未完成 stage 及其下游
 输出；例如正方已完成、反方中断时，会直接从反方继续。旧版仅保存 finding 级状态的运行记录仍可恢复。

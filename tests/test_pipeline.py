@@ -21,6 +21,7 @@ from vuln_judger.api import (
     _apply_reused_findings,
     _cli_session_accepts_input,
     _cli_sessions,
+    _codex_event_log,
     _codex_terminal_page,
     _config_from_paused_payload,
     _config_from_payload,
@@ -40,12 +41,15 @@ from vuln_judger.codex_runner import (
     CodexRunnerStopped,
     CodexTmuxSession,
     _ensure_codex_project_trust,
+    _finalize_markdown_findings,
+    _moderator_report_prompt,
     _prepare_codex_agent_dirs,
     session_live,
     _validate_pipeline_output,
     _wait_for_cli_task_start,
     _wait_json,
 )
+from vuln_judger.codex_event_log import format_codex_ndjson
 from vuln_judger.agents import AgentDirectoryStore
 from vuln_judger.debate import DebateOrchestrator
 from vuln_judger.evidence import EvidenceBundle
@@ -74,6 +78,7 @@ from vuln_judger.opencode_runner import (
     OpenCodeTmuxSession,
     ensure_opencode_tui,
     probe_opencode,
+    send_opencode_session_message,
 )
 from vuln_judger.opencode_prompt_client import send_prompt
 from vuln_judger.pipeline import run_judgement
@@ -2183,18 +2188,156 @@ for raw in sys.stdin.buffer:
         self.assertEqual(summary["finding_status"], "in_progress")
         self.assertNotIn("codex_workflow", summary)
 
-    def test_codex_terminal_page_uses_xterm_websocket(self):
+    def test_codex_terminal_page_polls_persisted_execution_log(self):
         html = _codex_terminal_page(
             "run-1",
             "moderator",
-            {"target": "vj-run-1-moderator:codex", "session_name": "vj-run-1-moderator"},
+            {
+                "backend": "codex",
+                "target": "vj-run-1-moderator:slot",
+                "session_name": "vj-run-1-moderator",
+            },
         )
-        self.assertIn('/static/vendor/xterm/xterm.css', html)
-        self.assertIn('/static/vendor/xterm/xterm.js', html)
-        self.assertIn('/static/vendor/xterm/addon-fit.js', html)
-        self.assertIn('/runs/run-1/codex-sessions/moderator/ws', html)
-        self.assertIn('new WebSocket(websocketURL(websocketPath))', html)
-        self.assertIn("tmux observer · isolated exec logs", html)
+        self.assertIn('/runs/run-1/cli-sessions/moderator/terminal', html)
+        self.assertIn('window.setTimeout(pollLog, 1000)', html)
+        self.assertIn('data-log-mode="readable"', html)
+        self.assertIn('data-log-mode="raw"', html)
+        self.assertIn('payload.formatted_output || rawOutput', html)
+        self.assertIn('id="follow-log"', html)
+        self.assertNotIn('/static/vendor/xterm/', html)
+        self.assertNotIn('new TerminalCtor(', html)
+        self.assertNotIn('new WebSocket(', html)
+        self.assertNotIn('id="message-form"', html)
+
+    def test_codex_ndjson_is_rendered_as_readable_execution_log(self):
+        raw = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps({"type": "turn.started"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "已完成复核。"},
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": ["rg", "dangerous_call"],
+                            "aggregated_output": "src/demo.py:12",
+                            "status": "completed",
+                            "exit_code": 0,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 12, "output_tokens": 7},
+                    }
+                ),
+                "not-json",
+            ]
+        )
+
+        output = format_codex_ndjson(raw)
+
+        self.assertIn("[会话]\nthread-1", output)
+        self.assertIn("[Codex]\n已完成复核。", output)
+        self.assertIn("[命令完成]\n$ rg dangerous_call", output)
+        self.assertIn("src/demo.py:12", output)
+        self.assertIn("输入 12 tokens", output)
+        self.assertIn("输出 7 tokens", output)
+        self.assertIn("not-json", output)
+
+    def test_codex_event_log_remains_readable_without_tmux(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            log_dir = cwd / ".vuln-judger-codex"
+            log_dir.mkdir()
+            current = log_dir / "current.ndjson"
+            current.write_text('{"type":"turn.started"}\n{"type":"turn.completed"}\n', encoding="utf-8")
+
+            output = _codex_event_log(
+                {
+                    "cwd": str(cwd),
+                    "event_log": str(current),
+                    "target": "missing:slot",
+                }
+            )
+
+        self.assertIn('turn.started', output)
+        self.assertIn('turn.completed', output)
+
+    def test_codex_log_http_routes_work_without_tmux(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "session"
+            log_dir = cwd / ".vuln-judger-codex"
+            log_dir.mkdir(parents=True)
+            current = log_dir / "current.ndjson"
+            current.write_text(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "route output"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            store = RunRecordStore(root / "records")
+            store.save_payload(
+                {
+                    "run_id": "run-log",
+                    "engine": "codex",
+                    "status": "completed",
+                    "cli_sessions": [
+                        {
+                            "backend": "codex",
+                            "role": "moderator",
+                            "session_name": "vj-run-log-moderator",
+                            "target": "vj-run-log-moderator:slot",
+                            "cwd": str(cwd),
+                            "event_log": str(current),
+                        }
+                    ],
+                }
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(store))
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with urllib.request.urlopen(
+                    f"{base}/runs/run-log/cli-sessions/moderator/terminal-ui",
+                    timeout=5,
+                ) as response:
+                    html = response.read().decode("utf-8")
+                with urllib.request.urlopen(
+                    f"{base}/runs/run-log/cli-sessions/moderator/terminal",
+                    timeout=5,
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(
+                        f"{base}/runs/run-log/cli-sessions/moderator/ws",
+                        timeout=5,
+                    )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertIn('data-log-mode="readable"', html)
+        self.assertNotIn('/static/vendor/xterm/', html)
+        self.assertIn('"type": "item.completed"', payload["output"])
+        self.assertIn("[Codex]\nroute output", payload["formatted_output"])
+        self.assertEqual(caught.exception.code, HTTPStatus.CONFLICT)
+        self.assertIn("不提供 tmux WebSocket", caught.exception.read().decode("utf-8"))
 
     def test_stop_codex_sessions_closes_all_live_sessions(self):
         payload = {
@@ -2257,6 +2400,7 @@ for raw in sys.stdin.buffer:
             self.assertIn("tail -n 200 -F", launch_args[-1])
             self.assertNotIn("codex", launch_args)
             self.assertEqual(session.info().transport, "exec-ephemeral-json")
+            self.assertEqual(Path(session.info().event_log), session.current_event_path)
 
     def test_codex_send_uses_ephemeral_exec_with_prompt_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2373,6 +2517,53 @@ for raw in sys.stdin.buffer:
                 attempt_id="attempt-1",
                 strict_identity=True,
             )
+
+    def test_wait_json_reports_missing_output_file(self):
+        class FinishedSession:
+            role = "affirmative"
+
+            def task_finished(self):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(
+            CodexRunnerError,
+            "最后错误：文件不存在",
+        ):
+            _wait_json(
+                Path(tmp) / "result.json",
+                should_stop=None,
+                reminder_session=FinishedSession(),
+                timeout_seconds=1,
+                poll_interval_seconds=0.001,
+            )
+
+    def test_markdown_single_finding_is_finalized_from_source_report(self):
+        report_text = "# Finding\n\nEvidence\n\n"
+        data = {
+            "findings": [
+                {
+                    "finding_id": "finding-1",
+                    "rule_id": "demo",
+                    "message": "demo",
+                    "level": "warning",
+                    "locations": [],
+                    "code_flows": [],
+                    "report_markdown": "# Finding\n\nEvidence\n",
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "findings.json"
+            finalized = _finalize_markdown_findings(path, data, report_text)
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(finalized["findings"][0]["report_markdown"], report_text)
+        self.assertEqual(persisted["findings"][0]["report_markdown"], report_text)
+        self.assertEqual(data["findings"][0]["report_markdown"], "# Finding\n\nEvidence\n")
+
+        prompt = _moderator_report_prompt({"report_path": "/tmp/report.md"}, Path("/tmp/findings.json"))
+        self.assertIn("单 finding 时可留空", prompt)
+        self.assertIn("不要对 report_markdown 与源文件做逐字节相等校验", prompt)
 
     def test_wait_json_reminds_idle_next_agent_after_previous_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6065,8 +6256,56 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertIn("ses-new", launch)
             wait_tui.assert_called_once_with("vj-run-1-affirmative:tui")
 
+    def test_opencode_manual_message_uses_prompt_async_api(self):
+        received = {}
+
+        class ManualPromptHandler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("content-length") or 0)
+                received["path"] = self.path
+                received["body"] = json.loads(self.rfile.read(length).decode("utf-8"))
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("content-length", "0")
+                self.end_headers()
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ManualPromptHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp, patch(
+                "vuln_judger.opencode_prompt_client._new_message_id",
+                return_value="msg-manual",
+            ):
+                result = send_opencode_session_message(
+                    {
+                        "server_url": f"http://127.0.0.1:{server.server_port}",
+                        "provider_session_id": "ses-manual",
+                        "cwd": tmp,
+                        "session_name": "vj-run-1-affirmative",
+                    },
+                    "line one\r\nline two",
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(result["message_id"], "msg-manual")
+        self.assertTrue(received["path"].startswith("/session/ses-manual/prompt_async?"))
+        self.assertEqual(
+            received["body"],
+            {
+                "parts": [{"type": "text", "text": "line one\nline two"}],
+                "messageID": "msg-manual",
+            },
+        )
+
     def test_opencode_prompt_client_posts_directly_to_local_server(self):
         received = {"get_paths": []}
+        statuses = []
 
         class PromptHandler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
@@ -6094,7 +6333,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                         }
                     ]
                 else:
-                    payload = {"ses/with space": {"type": "busy"}}
+                    payload = {"ses/with space": {"type": "idle"}}
                 raw = json.dumps(payload).encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("content-type", "application/json")
@@ -6122,6 +6361,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                         "parts": [{"type": "text", "text": "line one\r\nline two\rline three"}],
                     },
                     timeout=5,
+                    status_callback=statuses.append,
                 )
         finally:
             server.shutdown()
@@ -6130,6 +6370,8 @@ class OpenCodeRunnerTests(unittest.TestCase):
 
         self.assertEqual(response["messageID"], "msg-user-1")
         self.assertEqual(response["assistant"]["info"]["id"], "msg-assistant-1")
+        self.assertEqual([status["state"] for status in statuses], ["submitted", "completed"])
+        self.assertEqual(statuses[-1]["model"], {"providerID": "openai", "modelID": "gpt-5"})
         self.assertTrue(
             received["path"].startswith(
                 "/session/ses%2Fwith%20space/prompt_async?"
@@ -6151,6 +6393,76 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 for path in received["get_paths"]
             )
         )
+
+    def test_opencode_prompt_client_waits_past_tool_call_finish(self):
+        state = {"message_polls": 0}
+        statuses = []
+
+        class ToolCallPromptHandler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("content-length") or 0)
+                self.rfile.read(length)
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("content-length", "0")
+                self.end_headers()
+
+            def do_GET(self):  # noqa: N802
+                if self.path.startswith("/session/ses-tools/message?"):
+                    state["message_polls"] += 1
+                    finish = "tool-calls" if state["message_polls"] == 1 else "stop"
+                    payload = [
+                        {
+                            "info": {
+                                "id": "msg-assistant-tools",
+                                "sessionID": "ses-tools",
+                                "role": "assistant",
+                                "parentID": "msg-tools",
+                                "time": {"created": 1},
+                                "finish": finish,
+                            },
+                            "parts": [],
+                        }
+                    ]
+                else:
+                    status = "busy" if state["message_polls"] == 1 else "idle"
+                    payload = {"ses-tools": {"type": status}}
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ToolCallPromptHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch(
+                "vuln_judger.opencode_prompt_client._new_message_id",
+                return_value="msg-tools",
+            ), patch.dict(
+                os.environ,
+                {"VULN_JUDGER_OPENCODE_POLL_INTERVAL": "0.01"},
+            ):
+                response = send_prompt(
+                    server_url=f"http://127.0.0.1:{server.server_port}",
+                    session_id="ses-tools",
+                    directory="/tmp/source",
+                    payload={"parts": [{"type": "text", "text": "review"}]},
+                    timeout=5,
+                    status_callback=statuses.append,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(state["message_polls"], 2)
+        self.assertEqual(response["assistant"]["info"]["finish"], "stop")
+        self.assertEqual([status["state"] for status in statuses], ["submitted", "running", "completed"])
 
     def test_opencode_prompt_client_fails_when_async_session_stays_idle(self):
         class IdlePromptHandler(BaseHTTPRequestHandler):
@@ -6203,6 +6515,8 @@ class OpenCodeRunnerTests(unittest.TestCase):
             thread.join(timeout=5)
 
     def test_opencode_prompt_client_does_not_treat_busy_session_as_not_started(self):
+        statuses = []
+
         class BusyPromptHandler(BaseHTTPRequestHandler):
             def do_POST(self):  # noqa: N802
                 length = int(self.headers.get("content-length") or 0)
@@ -6245,11 +6559,80 @@ class OpenCodeRunnerTests(unittest.TestCase):
                     directory="/mnt/c/source",
                     payload={"parts": [{"type": "text", "text": "review finding"}]},
                     timeout=0.25,
+                    status_callback=statuses.append,
                 )
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+        self.assertEqual(statuses[0]["state"], "submitted")
+        self.assertTrue(any(status["state"] == "running" for status in statuses))
+
+    def test_opencode_prompt_client_records_native_retry_status(self):
+        statuses = []
+
+        class RetryPromptHandler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("content-length") or 0)
+                self.rfile.read(length)
+                self.send_response(HTTPStatus.NO_CONTENT)
+                self.send_header("content-length", "0")
+                self.end_headers()
+
+            def do_GET(self):  # noqa: N802
+                payload = (
+                    {
+                        "ses-retry": {
+                            "type": "retry",
+                            "attempt": 2,
+                            "message": "Upstream rate limit exceeded",
+                            "next": 123456,
+                        }
+                    }
+                    if self.path.startswith("/session/status?")
+                    else []
+                )
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), RetryPromptHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with patch(
+                "vuln_judger.opencode_prompt_client._new_message_id",
+                return_value="msg-retry",
+            ), patch.dict(
+                os.environ,
+                {
+                    "VULN_JUDGER_OPENCODE_AGENT_START_TIMEOUT": "0.1",
+                    "VULN_JUDGER_OPENCODE_POLL_INTERVAL": "0.01",
+                },
+            ), self.assertRaisesRegex(RuntimeError, "prompt timed out"):
+                send_prompt(
+                    server_url=f"http://127.0.0.1:{server.server_port}",
+                    session_id="ses-retry",
+                    directory="/mnt/c/source",
+                    payload={"parts": [{"type": "text", "text": "review finding"}]},
+                    timeout=0.25,
+                    status_callback=statuses.append,
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        retry = next(status for status in statuses if status["state"] == "retrying")
+        self.assertEqual(retry["status"]["attempt"], 2)
+        self.assertIn("rate limit", retry["status"]["message"].lower())
 
     def test_opencode_dashboard_terminal_accepts_input_for_api_transport(self):
         payload = {
@@ -6273,16 +6656,20 @@ class OpenCodeRunnerTests(unittest.TestCase):
         )
         html = _codex_terminal_page("run-1", "affirmative", payload["cli_sessions"][0])
         self.assertIn("/runs/run-1/cli-sessions/affirmative/ws", html)
-        self.assertIn("tmux attach · interactive OpenCode session", html)
-        self.assertIn("term.onData", html)
+        self.assertIn("只读 TUI · HTTP 消息", html)
+        self.assertIn('id="message-form"', html)
+        self.assertIn("/runs/run-1/cli-sessions/affirmative/input", html)
+        self.assertNotIn("term.onData", html)
 
+        submitted = {
+            "message_id": "msg-manual",
+            "session_id": "ses-1",
+            "target": "vj-run-1-affirmative:tui",
+        }
         with tempfile.TemporaryDirectory() as tmp, patch(
-            "vuln_judger.api.session_live", return_value=True
-        ), patch(
-            "vuln_judger.api.ensure_opencode_tui", return_value="vj-run-1-affirmative:tui"
-        ) as ensure_tui, patch(
-            "vuln_judger.api.send_session_input"
-        ) as send_input:
+            "vuln_judger.api.send_opencode_session_message",
+            return_value=submitted,
+        ) as send_message:
             result = _send_codex_session_input(
                 RunRecordStore(Path(tmp)),
                 {"run-1": payload},
@@ -6293,8 +6680,12 @@ class OpenCodeRunnerTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        ensure_tui.assert_called_once()
-        send_input.assert_called_once_with("vj-run-1-affirmative:tui", "manual review")
+        self.assertEqual(result["message_id"], "msg-manual")
+        send_message.assert_called_once()
+        submitted_session, submitted_text = send_message.call_args.args
+        self.assertEqual(submitted_text, "manual review")
+        self.assertEqual(submitted_session["session_name"], "vj-run-1-affirmative")
+        self.assertEqual(submitted_session["target"], "vj-run-1-affirmative:tui")
 
     def test_session_live_validates_exact_tmux_window(self):
         completed = subprocess.CompletedProcess(["tmux"], 0, "", "")

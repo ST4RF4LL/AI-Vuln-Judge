@@ -158,7 +158,7 @@ class CodexTmuxSession:
             window_name=self.window_name,
             target=self.target,
             cwd=str(self.cwd),
-            event_log=str(self._current_event_path) if self._current_event_path else None,
+            event_log=str(self.current_event_path),
         )
 
     def start(self) -> None:
@@ -538,6 +538,8 @@ class CliDrivenRunner:
                 silence_reminder_seconds=config.silence_reminder_minutes * 60,
                 watchdog_callback=watchdog_event,
             )
+        if moderation_reason == "markdown" and not copied_findings:
+            findings_data = _finalize_markdown_findings(findings_path, findings_data, report_text)
         findings = _findings_from_persisted(findings_data, report_path)
         finding_briefs = _persist_finding_briefs(findings, source_indexer, run_dir)
         reports = _reconcile_finding_reports(findings, config.resume_reports)
@@ -1499,8 +1501,10 @@ def _cli_activity_snapshot(session: CliSession) -> tuple[str, bool]:
 
 
 def _read_json_object(path: Optional[Path]) -> tuple[Optional[Dict[str, Any]], str]:
-    if path is None or not path.exists():
-        return None, ""
+    if path is None:
+        return None, "未提供输出文件路径"
+    if not path.exists():
+        return None, "文件不存在"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
@@ -1583,11 +1587,12 @@ def _moderator_report_prompt(input_payload: Dict[str, Any], findings_path: Path)
         "      \"level\": \"error|warning|note|unknown\",\n"
         "      \"locations\": [{\"file\":\"相对或报告路径\",\"line\":1,\"column\":1,\"symbol\":\"可选\"}],\n"
         "      \"code_flows\": [[{\"file\":\"...\",\"line\":1}]],\n"
-        "      \"report_markdown\": \"保留该 finding 的完整报告上下文\"\n"
+        "      \"report_markdown\": \"该 finding 对应的报告原文片段；单 finding 时可留空\"\n"
         "    }\n"
         "  ]\n"
         "}\n\n"
-        "约束：不要新增报告没有支持的事实；如果无法拆分则输出一个 finding，report_markdown 放完整报告。\n"
+        "约束：不要新增报告没有支持的事实。若报告只有一个 finding，report_markdown 可留空，调度器会从源文件精确补齐；"
+        "不要手工复制整份报告，也不要对 report_markdown 与源文件做逐字节相等校验。多 finding 时仅保留各自对应的原文片段。\n"
         "输入任务 JSON：\n"
         "```json\n"
         + json.dumps(input_payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -1691,6 +1696,17 @@ def _persist_findings_payload(path: Path, data: Dict[str, Any]) -> Dict[str, Any
     )
     os.replace(temporary_path, path)
     return persisted
+
+
+def _finalize_markdown_findings(path: Path, data: Dict[str, Any], report_text: str) -> Dict[str, Any]:
+    raw_findings = data.get("findings")
+    if not isinstance(raw_findings, list) or len(raw_findings) != 1 or not isinstance(raw_findings[0], dict):
+        return data
+    finalized = dict(data)
+    finding = dict(raw_findings[0])
+    finding["report_markdown"] = report_text
+    finalized["findings"] = [finding]
+    return _persist_findings_payload(path, finalized)
 
 
 def _normalized_findings_payload(
