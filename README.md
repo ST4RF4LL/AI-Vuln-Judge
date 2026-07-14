@@ -155,15 +155,16 @@ provider session。输出携带 `finding_id`、`role` 和 `attempt_id`，调度�
 ### OpenCode 驱动引擎
 
 选择 `engine: "opencode"` 时，每个角色会启动一个仅监听 `127.0.0.1` 的
-`opencode serve`，通过本地 HTTP API 为每个阶段创建新的 OpenCode session，再用
-`opencode run --attach --format json --session` 发送阶段 prompt，不依赖 TUI 按键、焦点或
-粘贴行为。JSON 事件中的 session ID 仍作为旧记录兼容兜底。Web 端的 CLI Session 终端使用当前
-阶段 session 的 `opencode attach --mini` 窗口，只读展示执行输出；该 TUI 不承担自动任务投递。
+`opencode serve`，通过本地 HTTP API 为每个阶段创建新的 OpenCode session，并直接调用
+`session.prompt` 对应的消息接口发送阶段 prompt。任务投递不再启动 `opencode run` 子进程，
+从而避开 WSL 的 detached tmux 中 `opencode run` 已接收 prompt、却未可靠启动响应的问题。
+Web 端的 CLI Session 终端使用当前阶段 session 的 `opencode attach --mini` pane；切换阶段时
+会原位重启 pane，因此已打开的 WebSocket 不会误切到 server 窗口，并且可直接查看输出和输入消息。
 
 每个角色目录都会生成 `.opencode/opencode.json`，并通过 `OPENCODE_CONFIG` 和
 `OPENCODE_CONFIG_CONTENT` 显式注入 `{"permission":"allow"}`。这不会修改源码仓库或用户
-全局配置。启动时还会探测 `--auto` / `--dangerously-skip-permissions` 等当前版本实际提供的
-参数；缺少 `--attach`、`--dir`、`--format`、`--session` 或可捕获的 `--mini` TUI 时会直接失败。
+全局配置。启动时会检查 `opencode attach` 是否提供 `--dir`、`--session` 和可捕获的 `--mini`
+TUI；自动任务投递只依赖本地 HTTP API。
 
 可选环境变量：
 
@@ -172,6 +173,7 @@ provider session。输出携带 `finding_id`、`role` 和 `attempt_id`，调度�
 - `VULN_JUDGER_OPENCODE_WORKSPACES_DIR`：OpenCode 任务工作目录。
 - `VULN_JUDGER_OPENCODE_READY_TIMEOUT`：等待本地 server 就绪的秒数，默认 30。
 - `VULN_JUDGER_OPENCODE_TUI_READY_TIMEOUT`：等待 TUI 生成可捕获画面的秒数，默认 10。
+- `VULN_JUDGER_OPENCODE_PROMPT_TIMEOUT`：可选的单次本地 prompt HTTP 请求超时秒数，默认不设硬超时。
 
 ### Codex 配置
 

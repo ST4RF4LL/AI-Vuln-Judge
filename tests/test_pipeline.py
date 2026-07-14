@@ -19,12 +19,14 @@ from unittest.mock import patch
 from vuln_judger.analyzers import AnalyzerSettings, AtlasAnalyzer
 from vuln_judger.api import (
     _apply_reused_findings,
+    _cli_session_accepts_input,
     _cli_sessions,
     _codex_terminal_page,
     _config_from_paused_payload,
     _config_from_payload,
     _finding_summary,
     _pause_payload,
+    _send_codex_session_input,
     _stop_codex_sessions,
     app_html,
     make_handler,
@@ -39,6 +41,7 @@ from vuln_judger.codex_runner import (
     CodexTmuxSession,
     _ensure_codex_project_trust,
     _prepare_codex_agent_dirs,
+    session_live,
     _validate_pipeline_output,
     _wait_for_cli_task_start,
     _wait_json,
@@ -72,6 +75,7 @@ from vuln_judger.opencode_runner import (
     ensure_opencode_tui,
     probe_opencode,
 )
+from vuln_judger.opencode_prompt_client import send_prompt
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunRecordStore
@@ -5800,15 +5804,9 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 self.assertEqual(json.loads(config_path.read_text(encoding="utf-8"))["permission"], "allow")
                 self.assertIn("OpenCode Agent", (role_dir / "AGENTS.md").read_text(encoding="utf-8"))
 
-    def test_opencode_probe_detects_installed_permission_flag(self):
+    def test_opencode_probe_only_requires_attach_tui_capabilities(self):
         responses = [
             subprocess.CompletedProcess(["opencode", "--version"], 0, "1.17.10\n", ""),
-            subprocess.CompletedProcess(
-                ["opencode", "run", "--help"],
-                0,
-                "--attach --dir --format --session --dangerously-skip-permissions",
-                "",
-            ),
             subprocess.CompletedProcess(
                 ["opencode", "attach", "--help"],
                 0,
@@ -5820,7 +5818,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
             capabilities = probe_opencode("opencode")
 
         self.assertEqual(capabilities.version, "1.17.10")
-        self.assertEqual(capabilities.permission_flag, "--dangerously-skip-permissions")
+        self.assertTrue(capabilities.attach_mini)
 
     def test_opencode_tui_attach_uses_saved_session_id(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5870,7 +5868,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 source_path=root,
                 run_dir=root,
                 command="opencode",
-                capabilities=OpenCodeCapabilities("1.17.10", None),
+                capabilities=OpenCodeCapabilities("1.17.10"),
             )
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
 
@@ -5912,7 +5910,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 source_path=root,
                 run_dir=root,
                 command="opencode",
-                capabilities=OpenCodeCapabilities("1.17.10", "--dangerously-skip-permissions"),
+                capabilities=OpenCodeCapabilities("1.17.10"),
                 model="openai/gpt-5",
             )
 
@@ -5938,18 +5936,23 @@ class OpenCodeRunnerTests(unittest.TestCase):
 
             launch = run_tmux.call_args_list[-1].args[0]
             shell = launch[-1]
-            self.assertIn("opencode run", shell)
-            self.assertIn("--attach", shell)
-            self.assertIn("--format json", shell)
-            self.assertIn("--dangerously-skip-permissions", shell)
-            self.assertIn("--session ses-2", shell)
-            self.assertIn("--model openai/gpt-5", shell)
-            self.assertIn("'second prompt'", shell)
-            self.assertNotIn("< ", shell)
+            request_payload = json.loads(session._current_request_path.read_text(encoding="utf-8"))
+            self.assertIn("opencode_prompt_client.py", shell)
+            self.assertIn("--server-url", shell)
+            self.assertIn("--session-id ses-2", shell)
+            self.assertIn("--request-file", shell)
+            self.assertNotIn("opencode run", shell)
+            self.assertNotIn("second prompt", shell)
             self.assertNotIn("paste-buffer", shell)
             self.assertNotIn("send-keys", shell)
+            self.assertEqual(request_payload["parts"], [{"type": "text", "text": "second prompt"}])
+            self.assertEqual(
+                request_payload["model"],
+                {"providerID": "openai", "modelID": "gpt-5"},
+            )
             self.assertEqual(create_session.call_count, 2)
             self.assertEqual(session.info().provider_session_id, "ses-2")
+            self.assertEqual(session.info().transport, "serve+prompt-api")
 
     def test_opencode_nonzero_run_exit_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5963,7 +5966,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 source_path=root,
                 run_dir=root,
                 command="opencode",
-                capabilities=OpenCodeCapabilities("1.17.10", None),
+                capabilities=OpenCodeCapabilities("1.17.10"),
             )
             event_path = cwd / "event.ndjson"
             exit_path = cwd / "exit.txt"
@@ -5989,7 +5992,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 source_path=root,
                 run_dir=root,
                 command="opencode",
-                capabilities=OpenCodeCapabilities("1.17.10", None),
+                capabilities=OpenCodeCapabilities("1.17.10"),
             )
             session.logs_dir.mkdir()
             prompt_path = session.logs_dir / "prompt-0001.txt"
@@ -6016,9 +6019,139 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertIsNone(failure)
             self.assertEqual(session._provider_session_id, "ses-new")
             shell = run_tmux.call_args.args[0][-1]
-            self.assertNotIn("--session ses-old", shell)
-            self.assertIn("--session ses-new", shell)
+            self.assertNotIn("--session-id ses-old", shell)
+            self.assertIn("--session-id ses-new", shell)
             self.assertEqual(session._current_prompt_path.read_text(encoding="utf-8"), "resume this stage")
+
+    def test_opencode_tui_session_rotation_respawns_stable_pane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "role"
+            cwd.mkdir()
+            session = OpenCodeTmuxSession(
+                role="affirmative",
+                run_id="run-1",
+                cwd=cwd,
+                source_path=root,
+                run_dir=root,
+                command="opencode",
+                capabilities=OpenCodeCapabilities("1.17.10"),
+            )
+            session._provider_session_id = "ses-new"
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+            with patch("vuln_judger.opencode_runner._tmux_target_live", return_value=True), patch(
+                "vuln_judger.opencode_runner._wait_for_opencode_tui"
+            ) as wait_tui, patch(
+                "vuln_judger.opencode_runner._run_tmux", return_value=completed
+            ) as run_tmux:
+                session._ensure_tui(restart=True)
+
+            launch = run_tmux.call_args.args[0]
+            self.assertIn("respawn-pane", launch)
+            self.assertNotIn("new-window", launch)
+            self.assertIn("vj-run-1-affirmative:tui", launch)
+            self.assertIn("opencode", launch)
+            self.assertIn("ses-new", launch)
+            wait_tui.assert_called_once_with("vj-run-1-affirmative:tui")
+
+    def test_opencode_prompt_client_posts_directly_to_local_server(self):
+        received = {}
+
+        class PromptHandler(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                length = int(self.headers.get("content-length") or 0)
+                received["path"] = self.path
+                received["body"] = json.loads(self.rfile.read(length).decode("utf-8"))
+                raw = json.dumps({"info": {"id": "msg-1"}, "parts": []}).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), PromptHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            response = send_prompt(
+                server_url=f"http://127.0.0.1:{server.server_port}",
+                session_id="ses/with space",
+                directory="/mnt/c/source tree",
+                payload={"parts": [{"type": "text", "text": "review finding"}]},
+                timeout=5,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(response["info"]["id"], "msg-1")
+        self.assertTrue(received["path"].startswith("/session/ses%2Fwith%20space/message?"))
+        self.assertIn("directory=%2Fmnt%2Fc%2Fsource+tree", received["path"])
+        self.assertEqual(
+            received["body"],
+            {"parts": [{"type": "text", "text": "review finding"}]},
+        )
+
+    def test_opencode_dashboard_terminal_accepts_input_for_api_transport(self):
+        payload = {
+            "engine": OPENCODE_ENGINE,
+            "cli_sessions": [
+                {
+                    "backend": OPENCODE_ENGINE,
+                    "role": "affirmative",
+                    "session_name": "vj-run-1-affirmative",
+                    "target": "vj-run-1-affirmative:tui",
+                    "transport": "serve+prompt-api",
+                }
+            ],
+        }
+        self.assertTrue(_cli_session_accepts_input(payload, payload["cli_sessions"][0]))
+        self.assertFalse(
+            _cli_session_accepts_input(
+                {"engine": "codex"},
+                {"backend": "codex", "transport": "exec-ephemeral-json"},
+            )
+        )
+        html = _codex_terminal_page("run-1", "affirmative", payload["cli_sessions"][0])
+        self.assertIn("/runs/run-1/cli-sessions/affirmative/ws", html)
+        self.assertIn("tmux attach · interactive OpenCode session", html)
+        self.assertIn("term.onData", html)
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "vuln_judger.api.session_live", return_value=True
+        ), patch(
+            "vuln_judger.api.ensure_opencode_tui", return_value="vj-run-1-affirmative:tui"
+        ) as ensure_tui, patch(
+            "vuln_judger.api.send_session_input"
+        ) as send_input:
+            result = _send_codex_session_input(
+                RunRecordStore(Path(tmp)),
+                {"run-1": payload},
+                Lock(),
+                "run-1",
+                "affirmative",
+                "manual review",
+            )
+
+        self.assertTrue(result["ok"])
+        ensure_tui.assert_called_once()
+        send_input.assert_called_once_with("vj-run-1-affirmative:tui", "manual review")
+
+    def test_session_live_validates_exact_tmux_window(self):
+        completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+        with patch("vuln_judger.codex_runner._run_tmux", return_value=completed) as run_tmux:
+            self.assertTrue(session_live("vj-run-1-affirmative:tui"))
+
+        run_tmux.assert_called_once_with(
+            ["tmux", "list-panes", "-t", "vj-run-1-affirmative:tui"],
+            timeout=5,
+            check=False,
+        )
 
     def test_web_and_mcp_surface_opencode_engine(self):
         html = app_html()

@@ -459,7 +459,7 @@ def make_handler(
                     attach_session_websocket(
                         self,
                         target,
-                        read_only=str(session.get("transport") or "tmux-tui") != "tmux-tui",
+                        read_only=not _cli_session_accepts_input(terminal_payload, session),
                     )
                     return
                 if len(parts) == 3 and parts[2] == "export":
@@ -1122,6 +1122,13 @@ def _codex_session_for_role(payload: dict, role: str) -> Optional[dict]:
     return None
 
 
+def _cli_session_accepts_input(payload: dict, session: dict) -> bool:
+    backend = str(session.get("backend") or payload.get("engine") or "")
+    if backend == OPENCODE_ENGINE:
+        return True
+    return str(session.get("transport") or "tmux-tui") == "tmux-tui"
+
+
 def _codex_session_terminal(payload: dict, role: str) -> dict:
     session = _codex_session_for_role(payload, role)
     if session is None:
@@ -1226,7 +1233,7 @@ def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
       <h1>{escape(label)} {escape(cli_label)}</h1>
       <div class="meta">{escape(run_id)} · {escape(target)}</div>
     </div>
-    <div class="meta">{escape("tmux observer · isolated exec logs" if backend == CODEX_ENGINE else "tmux attach · isolated OpenCode session")}</div>
+    <div class="meta">{escape("tmux observer · isolated exec logs" if backend == CODEX_ENGINE else "tmux attach · interactive OpenCode session")}</div>
   </header>
   <div id="terminal"></div>
   <script src="/static/vendor/xterm/xterm.js"></script>
@@ -1309,16 +1316,22 @@ def _send_codex_session_input(
     session = _codex_session_for_role(payload, role)
     if session is None:
         return None
-    target = str(session.get("target") or session.get("session_name") or "")
-    if not target:
-        return None
-    transport = str(session.get("transport") or "tmux-tui")
-    if transport != "tmux-tui":
+    if not _cli_session_accepts_input(payload, session):
         return {
             "ok": False,
             "role": role,
             "error": "当前 CLI 自动控制使用隔离的非交互任务 transport，不接受 prompt 注入",
         }
+    backend = str(session.get("backend") or payload.get("engine") or "")
+    if backend == OPENCODE_ENGINE:
+        try:
+            target = ensure_opencode_tui(session)
+        except CodexRunnerError as exc:
+            return {"ok": False, "role": role, "error": str(exc)}
+    else:
+        target = str(session.get("target") or session.get("session_name") or "")
+    if not target:
+        return None
     try:
         send_session_input(target, message)
     except (CodexRunnerError, subprocess.CalledProcessError) as exc:

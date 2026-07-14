@@ -1001,7 +1001,17 @@ def _codex_submit_key() -> str:
 def session_live(session_name: str) -> bool:
     if not _safe_tmux_ref(session_name):
         return False
-    return _run_tmux(["tmux", "has-session", "-t", session_name], check=False).returncode == 0
+    # `has-session -t session:window` only validates the session portion. On WSL
+    # this made a missing OpenCode `:tui` window look alive, after which the Web
+    # terminal attached to whichever window happened to be current (often server).
+    return (
+        _run_tmux(
+            ["tmux", "list-panes", "-t", session_name],
+            timeout=5,
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 def stop_sessions(payload: Dict[str, Any]) -> None:

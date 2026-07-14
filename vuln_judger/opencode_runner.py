@@ -6,6 +6,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -40,7 +41,6 @@ LOG = logger("opencode_runner")
 @dataclass(frozen=True)
 class OpenCodeCapabilities:
     version: str
-    permission_flag: Optional[str]
     attach_mini: bool = True
 
 
@@ -61,7 +61,7 @@ class OpenCodeSessionInfo:
 
 
 class OpenCodeTmuxSession:
-    """Hosts OpenCode in tmux while prompts use the non-interactive run CLI."""
+    """Hosts OpenCode in tmux while prompts use its local HTTP API."""
 
     def __init__(
         self,
@@ -94,6 +94,7 @@ class OpenCodeTmuxSession:
         self.state_path = self.logs_dir / "session.json"
         self._sequence = 0
         self._current_prompt_path: Optional[Path] = None
+        self._current_request_path: Optional[Path] = None
         self._current_started_path: Optional[Path] = None
         self._current_event_path: Optional[Path] = None
         self._current_exit_path: Optional[Path] = None
@@ -115,7 +116,7 @@ class OpenCodeTmuxSession:
             target=self.target,
             cwd=str(self.cwd),
             backend=OPENCODE_ENGINE,
-            transport="serve+run-json",
+            transport="serve+prompt-api",
             server_url=self.server_url,
             server_target=self.server_target,
             provider_session_id=self._provider_session_id,
@@ -128,9 +129,9 @@ class OpenCodeTmuxSession:
         if self.is_live() and _server_healthy(self.server_url):
             if _tmux_target_live(self.run_target):
                 _run_tmux(["tmux", "kill-window", "-t", self.run_target], timeout=10, check=False)
-            self._ensure_provider_session(validate=True)
+            provider_changed = self._ensure_provider_session(validate=True)
             self._save_state()
-            self._ensure_tui()
+            self._ensure_tui(restart=provider_changed)
             return
         if _tmux_target_live(self.session_name):
             _run_tmux(["tmux", "kill-session", "-t", self.session_name], check=False)
@@ -199,47 +200,57 @@ class OpenCodeTmuxSession:
         if _tmux_target_live(self.run_target):
             raise CodexRunnerError(f"OpenCode session 正在执行任务：{self.role}")
         self._rotate_provider_session()
-        self._ensure_tui()
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self._session_recovery_attempted = False
         self._launch_prompt(text)
 
     def _launch_prompt(self, text: str) -> None:
         self._refresh_provider_session_id()
+        if not self._provider_session_id:
+            provider_changed = self._ensure_provider_session()
+            self._ensure_tui(restart=provider_changed)
         self._sequence += 1
         prompt_path = self.logs_dir / f"prompt-{self._sequence:04d}.txt"
+        request_path = self.logs_dir / f"request-{self._sequence:04d}.json"
         event_path = self.logs_dir / f"events-{self._sequence:04d}.ndjson"
         started_path = self.logs_dir / f"started-{self._sequence:04d}.txt"
         exit_path = self.logs_dir / f"exit-{self._sequence:04d}.txt"
         prompt_path.write_text(text, encoding="utf-8")
+        request_payload: Dict[str, Any] = {"parts": [{"type": "text", "text": text}]}
+        if self.model:
+            provider_id, separator, model_id = self.model.partition("/")
+            if not separator or not provider_id.strip() or not model_id.strip():
+                raise CodexRunnerError("OpenCode model 必须使用 provider/model 格式")
+            request_payload["model"] = {
+                "providerID": provider_id.strip(),
+                "modelID": model_id.strip(),
+            }
+        request_path.write_text(
+            json.dumps(request_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         event_path.unlink(missing_ok=True)
         started_path.unlink(missing_ok=True)
         exit_path.unlink(missing_ok=True)
 
+        prompt_client = Path(__file__).with_name("opencode_prompt_client.py").resolve()
         args = [
-            "env",
-            f"OPENCODE_CONFIG={self.config_path}",
-            f"OPENCODE_CONFIG_CONTENT={_permission_config_content()}",
-            self.command,
-            "run",
-            "--attach",
+            sys.executable,
+            str(prompt_client),
+            "--server-url",
             self.server_url,
-            "--dir",
+            "--session-id",
+            self._provider_session_id,
+            "--directory",
             str(self.cwd),
-            "--format",
-            "json",
+            "--request-file",
+            str(request_path),
         ]
-        if self.capabilities.permission_flag:
-            args.append(self.capabilities.permission_flag)
-        if self.model:
-            args.extend(["--model", self.model])
-        if self._provider_session_id:
-            args.extend(["--session", self._provider_session_id])
-
-        # OpenCode defines the task as a positional `message`. Passing it explicitly
-        # avoids a detached tmux process treating stdin as received input without
-        # reliably submitting it to the agent loop.
-        invocation = _shell_command([*args, "--", text])
+        # In the reported WSL setup, `opencode run --attach` launched from a
+        # detached tmux pane accepted the prompt but did not reliably start the
+        # agent response. Submit through the already healthy local server instead;
+        # the prompt stays out of argv and the worker remains observable in tmux.
+        invocation = _shell_command(args)
         shell = (
             f"set +e; printf '%s\\n' \"$$\" > {shlex.quote(str(started_path))}; "
             f"{invocation} "
@@ -249,6 +260,7 @@ class OpenCodeTmuxSession:
         self._current_event_path = event_path
         self._current_exit_path = exit_path
         self._current_prompt_path = prompt_path
+        self._current_request_path = request_path
         self._current_started_path = started_path
         _run_tmux(
             [
@@ -312,7 +324,7 @@ class OpenCodeTmuxSession:
             and (self._current_exit_path is None or not self._current_exit_path.exists())
         ):
             detail = _tail_text(self._current_event_path, 30) if self._current_event_path else ""
-            return f"OpenCode run 异常终止，未写入退出码；{detail}"
+            return f"OpenCode prompt 请求异常终止，未写入退出码；{detail}"
         if self._current_exit_path is None or not self._current_exit_path.exists():
             return None
         try:
@@ -333,18 +345,18 @@ class OpenCodeTmuxSession:
                 prompt = ""
             if prompt:
                 self._session_recovery_attempted = True
-                if _tmux_target_live(self.target):
-                    _run_tmux(["tmux", "kill-window", "-t", self.target], timeout=10, check=False)
                 self._provider_session_id = None
                 self._current_prompt_path = None
+                self._current_request_path = None
                 self._current_started_path = None
                 self._current_event_path = None
                 self._current_exit_path = None
                 self._ensure_provider_session()
+                self._ensure_tui(restart=True)
                 self._save_state()
                 self._launch_prompt(prompt)
                 return None
-        return f"OpenCode run 退出码 {exit_code}；{detail}"
+        return f"OpenCode prompt 退出码 {exit_code}；{detail}"
 
     def task_finished(self) -> bool:
         return bool(
@@ -374,7 +386,9 @@ class OpenCodeTmuxSession:
         started_log = _text(state.get("started_log"))
         exit_log = _text(state.get("exit_log"))
         prompt_log = _text(state.get("prompt_log"))
+        request_log = _text(state.get("request_log"))
         self._current_prompt_path = Path(prompt_log) if prompt_log else None
+        self._current_request_path = Path(request_log) if request_log else None
         self._current_started_path = Path(started_log) if started_log else None
         self._current_event_path = Path(event_log) if event_log else None
         self._current_exit_path = Path(exit_log) if exit_log else None
@@ -387,6 +401,7 @@ class OpenCodeTmuxSession:
             "server_url": self.server_url,
             "provider_session_id": self._provider_session_id,
             "prompt_log": str(self._current_prompt_path) if self._current_prompt_path else None,
+            "request_log": str(self._current_request_path) if self._current_request_path else None,
             "started_log": str(self._current_started_path) if self._current_started_path else None,
             "event_log": str(self._current_event_path) if self._current_event_path else None,
             "exit_log": str(self._current_exit_path) if self._current_exit_path else None,
@@ -411,31 +426,34 @@ class OpenCodeTmuxSession:
                 continue
             session_id = _find_session_id(event)
             if session_id:
+                changed = session_id != self._provider_session_id
                 self._provider_session_id = session_id
                 self._save_state()
-                self._ensure_tui()
+                self._ensure_tui(restart=changed)
                 return
 
-    def _ensure_provider_session(self, *, validate: bool = False) -> None:
+    def _ensure_provider_session(self, *, validate: bool = False) -> bool:
         if self._provider_session_id and (
             not validate or _opencode_session_exists(self.server_url, self._provider_session_id)
         ):
-            return
+            return False
         self._provider_session_id = _create_opencode_session(
             self.server_url,
             title=f"vuln-judger {self.run_id} {self.role}",
         )
+        return True
 
     def _rotate_provider_session(self) -> None:
-        if _tmux_target_live(self.target):
-            _run_tmux(["tmux", "kill-window", "-t", self.target], timeout=10, check=False)
         self._provider_session_id = _create_opencode_session(
             self.server_url,
             title=f"vuln-judger {self.run_id} {self.role} task-{self._sequence + 1}",
         )
         self._save_state()
+        # Keep the same tmux pane so an already-open Dashboard WebSocket does not
+        # fall back to the server window when the provider session changes.
+        self._ensure_tui(restart=True)
 
-    def _ensure_tui(self) -> None:
+    def _ensure_tui(self, *, restart: bool = False) -> None:
         if not self._provider_session_id or not _tmux_target_live(self.server_target):
             return
         _ensure_opencode_tui_window(
@@ -446,6 +464,7 @@ class OpenCodeTmuxSession:
             command=self.command,
             config_path=self.config_path,
             mini=self.capabilities.attach_mini,
+            restart=restart,
         )
 
 
@@ -544,11 +563,6 @@ class OpenCodeDrivenRunner(CliDrivenRunner):
 
 def probe_opencode(command: str) -> OpenCodeCapabilities:
     version_result = _run_opencode([command, "--version"], timeout=15)
-    help_result = _run_opencode([command, "run", "--help"], timeout=15)
-    help_text = f"{help_result.stdout}\n{help_result.stderr}"
-    missing = [flag for flag in ("--attach", "--dir", "--format", "--session") if flag not in help_text]
-    if missing:
-        raise CodexRunnerError(f"OpenCode run 缺少必要能力：{', '.join(missing)}")
     attach_result = _run_opencode([command, "attach", "--help"], timeout=15)
     attach_help = f"{attach_result.stdout}\n{attach_result.stderr}"
     attach_missing = [flag for flag in ("--dir", "--session") if flag not in attach_help]
@@ -556,14 +570,8 @@ def probe_opencode(command: str) -> OpenCodeCapabilities:
         raise CodexRunnerError(f"OpenCode attach 缺少必要能力：{', '.join(attach_missing)}")
     if "--mini" not in attach_help:
         raise CodexRunnerError("OpenCode attach 缺少可捕获的 --mini TUI；请升级 OpenCode")
-    permission_flag = None
-    for flag in ("--auto", "--dangerously-skip-permissions"):
-        if flag in help_text:
-            permission_flag = flag
-            break
     return OpenCodeCapabilities(
         version=(version_result.stdout or version_result.stderr or "unknown").strip(),
-        permission_flag=permission_flag,
         attach_mini=True,
     )
 
@@ -626,9 +634,11 @@ def _ensure_opencode_tui_window(
     command: str,
     config_path: Path,
     mini: bool,
+    restart: bool = False,
 ) -> str:
     target = f"{session_name}:tui"
-    if _tmux_target_live(target):
+    target_live = _tmux_target_live(target)
+    if target_live and not restart:
         return target
     server_target = f"{session_name}:server"
     if not _tmux_target_live(server_target):
@@ -647,21 +657,36 @@ def _ensure_opencode_tui_window(
     ]
     if mini:
         args.append("--mini")
-    _run_tmux(
-        [
-            "tmux",
-            "new-window",
-            "-d",
-            "-t",
-            session_name,
-            "-n",
-            "tui",
-            "-c",
-            str(cwd),
-            *args,
-        ],
-        timeout=15,
-    )
+    if target_live:
+        _run_tmux(
+            [
+                "tmux",
+                "respawn-pane",
+                "-k",
+                "-t",
+                target,
+                "-c",
+                str(cwd),
+                *args,
+            ],
+            timeout=15,
+        )
+    else:
+        _run_tmux(
+            [
+                "tmux",
+                "new-window",
+                "-d",
+                "-t",
+                session_name,
+                "-n",
+                "tui",
+                "-c",
+                str(cwd),
+                *args,
+            ],
+            timeout=15,
+        )
     _wait_for_opencode_tui(target)
     return target
 
