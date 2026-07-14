@@ -124,6 +124,8 @@ class OpenCodeTmuxSession:
     def start(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         if self.is_live() and _server_healthy(self.server_url):
+            if _tmux_target_live(self.run_target):
+                _run_tmux(["tmux", "kill-window", "-t", self.run_target], timeout=10, check=False)
             self._ensure_provider_session(validate=True)
             self._save_state()
             self._ensure_tui()
@@ -192,10 +194,10 @@ class OpenCodeTmuxSession:
             raise CodexRunnerError("OpenCode prompt 不能为空")
         if not self.is_live():
             self.start()
-        self._ensure_provider_session()
-        self._ensure_tui()
         if _tmux_target_live(self.run_target):
             raise CodexRunnerError(f"OpenCode session 正在执行任务：{self.role}")
+        self._rotate_provider_session()
+        self._ensure_tui()
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self._session_recovery_attempted = False
         self._launch_prompt(text)
@@ -318,6 +320,13 @@ class OpenCodeTmuxSession:
                 return None
         return f"OpenCode run 退出码 {exit_code}；{detail}"
 
+    def task_finished(self) -> bool:
+        return bool(
+            self._current_exit_path
+            and self._current_exit_path.exists()
+            and not _tmux_target_live(self.run_target)
+        )
+
     def _load_state(self) -> None:
         try:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -385,6 +394,15 @@ class OpenCodeTmuxSession:
             self.server_url,
             title=f"vuln-judger {self.run_id} {self.role}",
         )
+
+    def _rotate_provider_session(self) -> None:
+        if _tmux_target_live(self.target):
+            _run_tmux(["tmux", "kill-window", "-t", self.target], timeout=10, check=False)
+        self._provider_session_id = _create_opencode_session(
+            self.server_url,
+            title=f"vuln-judger {self.run_id} {self.role} task-{self._sequence + 1}",
+        )
+        self._save_state()
 
     def _ensure_tui(self) -> None:
         if not self._provider_session_id or not _tmux_target_live(self.server_target):

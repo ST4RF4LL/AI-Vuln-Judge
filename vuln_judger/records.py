@@ -113,6 +113,7 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "current_finding_id": payload.get("current_finding_id"),
         "current_finding_index": payload.get("current_finding_index"),
+        "current_finding_ids": payload.get("current_finding_ids") or {},
         "resume_from_finding_id": payload.get("resume_from_finding_id"),
         "resume_from_finding_index": payload.get("resume_from_finding_index"),
         "cli_sessions": sessions,
@@ -140,7 +141,7 @@ def _paused_after_restart(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     completed_count = completed_finding_count(reports)
     engine = str(updated.get("engine") or (updated.get("config") or {}).get("engine") or "builtin")
-    if engine != "codex":
+    if engine not in {"codex", "opencode"}:
         reports = reports[:completed_count]
     finding_count = _bounded_int(
         updated.get("finding_count"),
@@ -161,6 +162,7 @@ def _paused_after_restart(payload: Dict[str, Any]) -> Dict[str, Any]:
     updated["resume_from_finding_index"] = resume_index
     updated["current_finding_id"] = None
     updated["current_finding_index"] = None
+    updated["current_finding_ids"] = {}
     updated["error"] = None
     diagnostics = list(updated.get("diagnostics") or [])
     diagnostics.append(f"{_now()} 服务重启时发现任务未完成，已保存为暂停状态，可从恢复点继续。")
@@ -173,6 +175,7 @@ def _stopped_after_restart(payload: Dict[str, Any]) -> Dict[str, Any]:
     updated["status"] = "stopped"
     updated["current_finding_id"] = None
     updated["current_finding_index"] = None
+    updated["current_finding_ids"] = {}
     updated["error"] = None
     diagnostics = list(updated.get("diagnostics") or [])
     diagnostics.append(f"{_now()} 服务重启时发现任务正在停止，已标记为已停止。")

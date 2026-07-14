@@ -49,8 +49,36 @@ def mark_incomplete_findings_pending(
             item["finding_status"] = FINDING_COMPLETED if index < hinted_completed else FINDING_PENDING
         elif not finding_report_completed(item):
             item["finding_status"] = FINDING_PENDING
+        if not finding_report_completed(item):
+            _mark_pipeline_stages_interrupted(item)
         normalized.append(item)
     return normalized
+
+
+def _mark_pipeline_stages_interrupted(report: Dict[str, Any]) -> None:
+    workflow = report.get("cli_workflow") if isinstance(report.get("cli_workflow"), dict) else {}
+    if not workflow and isinstance(report.get("codex_workflow"), dict):
+        workflow = report["codex_workflow"]
+    if not workflow:
+        return
+    pipeline = workflow.get("pipeline") if isinstance(workflow.get("pipeline"), dict) else {}
+    stages = pipeline.get("stages") if isinstance(pipeline.get("stages"), dict) else {}
+    changed = False
+    normalized_stages: Dict[str, Any] = {}
+    for role, raw_stage in stages.items():
+        stage = dict(raw_stage) if isinstance(raw_stage, dict) else {}
+        if str(stage.get("status") or "") in {"dispatching", "running"}:
+            stage["status"] = "interrupted"
+            changed = True
+        normalized_stages[str(role)] = stage
+    if not changed:
+        return
+    normalized_pipeline = dict(pipeline)
+    normalized_pipeline["stages"] = normalized_stages
+    normalized_workflow = dict(workflow)
+    normalized_workflow["pipeline"] = normalized_pipeline
+    report["cli_workflow"] = normalized_workflow
+    report["codex_workflow"] = normalized_workflow
 
 
 def first_incomplete_finding_index(

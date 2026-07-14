@@ -453,7 +453,11 @@ def make_handler(
                     if parts[4] == "terminal-ui":
                         self._html(_codex_terminal_page(parts[1], parts[3], session))
                         return
-                    attach_session_websocket(self, target)
+                    attach_session_websocket(
+                        self,
+                        target,
+                        read_only=str(session.get("transport") or "tmux-tui") != "tmux-tui",
+                    )
                     return
                 if len(parts) == 3 and parts[2] == "export":
                     payload = active_task if active_task is not None else run if run is not None else task
@@ -692,6 +696,7 @@ def _run_detail(run):
         ),
         "current_finding_id": run.get("current_finding_id"),
         "current_finding_index": run.get("current_finding_index"),
+        "current_finding_ids": run.get("current_finding_ids") or {},
         "resume_from_finding_id": run.get("resume_from_finding_id"),
         "resume_from_finding_index": run.get("resume_from_finding_index"),
         "config": run.get("config", {}),
@@ -759,6 +764,7 @@ def _task_from_config(config: RunConfig, run_id: str, status: str, error: Option
         "completed_finding_count": 0,
         "current_finding_id": None,
         "current_finding_index": None,
+        "current_finding_ids": {},
         "resume_from_finding_id": None,
         "resume_from_finding_index": 0,
     }
@@ -968,6 +974,7 @@ def _task_from_report_payload(payload: dict, status: str) -> dict:
         ),
         "current_finding_id": payload.get("current_finding_id"),
         "current_finding_index": payload.get("current_finding_index"),
+        "current_finding_ids": payload.get("current_finding_ids") or {},
         "resume_from_finding_id": payload.get("resume_from_finding_id"),
         "resume_from_finding_index": payload.get("resume_from_finding_index"),
         "cli_sessions": _cli_sessions(payload),
@@ -1101,7 +1108,7 @@ def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
     target = str(session.get("target") or session.get("session_name") or "")
     label = {"moderator": "Moderator", "affirmative": "正方", "negative": "反方"}.get(role, role)
     backend = str(session.get("backend") or CODEX_ENGINE)
-    cli_label = "OpenCode TUI" if backend == OPENCODE_ENGINE else "Codex TUI"
+    cli_label = "OpenCode 任务会话" if backend == OPENCODE_ENGINE else "Codex 执行日志"
     route = "cli-sessions" if backend == OPENCODE_ENGINE else "codex-sessions"
     websocket_path = f"/runs/{run_id}/{route}/{role}/ws"
     return f"""<!doctype html>
@@ -1128,7 +1135,7 @@ def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
       <h1>{escape(label)} {escape(cli_label)}</h1>
       <div class="meta">{escape(run_id)} · {escape(target)}</div>
     </div>
-    <div class="meta">{escape("tmux attach · raw TUI" if backend == CODEX_ENGINE else "tmux attach · OpenCode TUI")}</div>
+    <div class="meta">{escape("tmux observer · isolated exec logs" if backend == CODEX_ENGINE else "tmux attach · isolated OpenCode session")}</div>
   </header>
   <div id="terminal"></div>
   <script src="/static/vendor/xterm/xterm.js"></script>
@@ -1214,11 +1221,12 @@ def _send_codex_session_input(
     target = str(session.get("target") or session.get("session_name") or "")
     if not target:
         return None
-    if str(session.get("backend") or payload.get("engine") or CODEX_ENGINE) == OPENCODE_ENGINE:
+    transport = str(session.get("transport") or "tmux-tui")
+    if transport != "tmux-tui":
         return {
             "ok": False,
             "role": role,
-            "error": "OpenCode 自动控制使用非交互 run transport，server 终端不接受 prompt 注入",
+            "error": "当前 CLI 自动控制使用隔离的非交互任务 transport，不接受 prompt 注入",
         }
     try:
         send_session_input(target, message)
@@ -1272,6 +1280,7 @@ def _pause_payload(config: RunConfig, last_payload: Optional[dict], reason: str)
     payload["completed_finding_count"] = completed_count
     payload["current_finding_id"] = None
     payload["current_finding_index"] = None
+    payload["current_finding_ids"] = {}
     payload["resume_from_finding_id"] = resume_id
     payload["resume_from_finding_index"] = resume_index
     payload["config"] = payload.get("config") or _config_task_snapshot(config)
@@ -1279,7 +1288,7 @@ def _pause_payload(config: RunConfig, last_payload: Optional[dict], reason: str)
     resume_text = f"finding index {resume_index}"
     if resume_id:
         resume_text += f" ({resume_id})"
-    diagnostics.append(f"{reason}；任务已暂停，恢复时将从 {resume_text} 重新处理。")
+    diagnostics.append(f"{reason}；任务已暂停，恢复时将从 {resume_text} 的首个未完成 stage 继续。")
     payload["diagnostics"] = diagnostics
     return payload
 
@@ -4385,7 +4394,7 @@ def app_html() -> str:
       const liveCount = sessions.filter(session => session.live).length;
       const backend = run.engine === 'opencode' ? 'OpenCode' : 'Codex';
       return `<div><strong>CLI Sessions：</strong><div class="codex-session-buttons">
-        ${{sessions.map(session => `<button type="button" title="${{backend === 'Codex' ? '在当前页面打开原始 Codex TUI' : '在当前页面打开 OpenCode TUI'}}" data-run-id="${{esc(run.run_id)}}" data-codex-terminal-role="${{esc(session.role || '')}}" data-cli-backend="${{esc(session.backend || run.engine || '')}}">
+        ${{sessions.map(session => `<button type="button" title="${{backend === 'Codex' ? '在当前页面打开 Codex 隔离执行日志' : '在当前页面打开 OpenCode 隔离任务会话'}}" data-run-id="${{esc(run.run_id)}}" data-codex-terminal-role="${{esc(session.role || '')}}" data-cli-backend="${{esc(session.backend || run.engine || '')}}">
           ${{esc(labels[session.role] || session.role || backend)}}${{session.live ? ' · live' : ''}}
         </button>`).join('')}}
         <button type="button" class="danger-button" title="${{backend === 'Codex' ? '关闭当前任务的全部 Codex tmux session' : '关闭当前任务的全部 OpenCode tmux session'}}" data-run-id="${{esc(run.run_id)}}" data-codex-stop-sessions="true" ${{liveCount ? '' : 'disabled'}}>
@@ -4395,6 +4404,16 @@ def app_html() -> str:
     }}
 
     function renderCodexActiveAgent(run, findings, status) {{
+      const activeIds = run.current_finding_ids && typeof run.current_finding_ids === 'object'
+        ? run.current_finding_ids
+        : {{}};
+      const activeRoles = Object.entries(activeIds).filter(([, findingId]) => Boolean(findingId));
+      if (status === 'running' && activeRoles.length) {{
+        const labels = {{ affirmative: '正方', negative: '反方', moderator: 'Moderator' }};
+        return `<div><strong>当前流水线：</strong> ${{activeRoles.map(([role, findingId]) =>
+          `<span class="chip status-running">${{esc(labels[role] || role)}} · ${{esc(findingId)}}</span>`
+        ).join(' ')}}</div>`;
+      }}
       const state = inferCodexActiveAgent(run, findings, status);
       if (!state) return '';
       const chipClass = state.active ? 'chip status-running' : 'chip';
@@ -4469,7 +4488,7 @@ def app_html() -> str:
       const url = `/runs/${{encodeURIComponent(runId)}}/cli-sessions/${{encodeURIComponent(role)}}/terminal-ui`;
       const labels = {{ moderator: 'Moderator', affirmative: '正方', negative: '反方' }};
       const run = state.runs.find(item => item.run_id === runId) || {{}};
-      const backend = run.engine === 'opencode' ? 'OpenCode TUI' : 'Codex TUI';
+      const backend = run.engine === 'opencode' ? 'OpenCode 任务会话' : 'Codex 执行日志';
       el.codexTerminalFrameTitle.textContent = `${{labels[role] || role}} ${{backend}}`;
       el.codexTerminalFrameMeta.textContent = `${{runId}} · ${{role}}`;
       el.codexTerminalFrame.src = url;

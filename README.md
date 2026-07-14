@@ -141,16 +141,24 @@ uv run vuln-judger mcp \
 `response_mode: full` 返回完整 run/report 内容。
 
 `judge_report` 的 Codex/OpenCode 引擎会启动 Moderator、Affirmative、Negative 三个独立
-CLI session。任务进度持续写入 `--records-dir`，因此 CLI 引擎要求 `save: true`。通常不要设置
+CLI 执行槽，并按 `Affirmative -> Negative -> Moderator` 组成三级流水线。同一 finding 仍严格按
+阶段顺序推进，不同 finding 可以同时占用三个角色槽；两个阶段间各保留一个待处理缓冲，避免上游
+无限堆积。任务进度持续写入 `--records-dir`，因此 CLI 引擎要求 `save: true`。通常不要设置
 `wait_for_completion: true`，否则长任务可能触发 MCP 客户端工具超时。
+
+任务管理器只通过 `brief.json`、正方 `result.json`、反方 `result.json` 和 Moderator `final.json`
+向下游交付材料。每个 `(finding, stage)` 都使用独立上下文：Codex 通过新的
+`codex exec --ephemeral --json` 执行，OpenCode 在保留本地 server 的同时为每个阶段创建新的
+provider session。输出携带 `finding_id`、`role` 和 `attempt_id`，调度器会在接收时校验，防止并发
+任务串线或误读旧文件。
 
 ### OpenCode 驱动引擎
 
 选择 `engine: "opencode"` 时，每个角色会启动一个仅监听 `127.0.0.1` 的
-`opencode serve`，通过本地 HTTP API 预先创建明确的 OpenCode session，再用
+`opencode serve`，通过本地 HTTP API 为每个阶段创建新的 OpenCode session，再用
 `opencode run --attach --format json --session` 发送阶段 prompt，不依赖 TUI 按键、焦点或
-粘贴行为。JSON 事件中的 session ID 仍作为旧记录兼容兜底。Web 端的 CLI Session 终端使用同一 session 的
-`opencode attach --mini` 窗口，因此可以捕获并交互查看历史输出；该 TUI 不承担自动任务投递。
+粘贴行为。JSON 事件中的 session ID 仍作为旧记录兼容兜底。Web 端的 CLI Session 终端使用当前
+阶段 session 的 `opencode attach --mini` 窗口，只读展示执行输出；该 TUI 不承担自动任务投递。
 
 每个角色目录都会生成 `.opencode/opencode.json`，并通过 `OPENCODE_CONFIG` 和
 `OPENCODE_CONFIG_CONTENT` 显式注入 `{"permission":"allow"}`。这不会修改源码仓库或用户
@@ -367,12 +375,14 @@ uv run vuln-judger api \
 Codex/OpenCode 三方复核引擎会直接复用合法、无分组歧义的 SARIF results；Markdown、解析失败或
 分组存在歧义时才调用 Moderator 拆分。报告准备完成后会立即把全部 finding 写入运行记录，并在
 `.workspaces/runs/<run-id>/findings/<finding-id>/brief.json` 保存各自的输入材料。前端会将
-尚未裁决的 finding 标记为“未完成”或“处理中”。暂停后恢复时，新 session 会保留已完成结果，
-清理首个未完成 finding 的旧阶段输出，并从该 finding 重新开始。
+尚未裁决的 finding 标记为“未完成”或“处理中”，并同时展示三个角色槽当前处理的 finding。
+每个 finding 的 `cli_workflow.pipeline.stages` 会保存阶段状态、尝试次数、`attempt_id`、输出路径和
+起止时间。暂停或服务重启后，恢复流程会保留已成功的上游阶段，只清理首个未完成 stage 及其下游
+输出；例如正方已完成、反方中断时，会直接从反方继续。旧版仅保存 finding 级状态的运行记录仍可恢复。
 
 启动 CLI 任务时可设置“静默提醒时间”，默认 30 分钟。等待下一阶段 JSON 输出期间，如果
 目标 session 仍有输出或处于执行状态，静默计时器会重新开始；如果上一阶段已经交付而
-下一 Agent 持续静默，系统会发送简短的继续任务提醒。退出的 session 会重启并重新接收完整阶段
+下一 Agent 持续静默，交互式旧 session 会收到继续任务提醒；隔离的非交互任务会重新接收完整阶段
 prompt。默认不再用一小时硬超时终止阶段；需要绝对步骤超时时可显式设置
 `VULN_JUDGER_CLI_STEP_TIMEOUT`（秒）；旧的 `VULN_JUDGER_CODEX_STEP_TIMEOUT` 仍兼容。
 

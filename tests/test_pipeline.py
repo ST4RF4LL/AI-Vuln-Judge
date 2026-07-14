@@ -38,6 +38,7 @@ from vuln_judger.codex_runner import (
     CodexTmuxSession,
     _ensure_codex_project_trust,
     _prepare_codex_agent_dirs,
+    _validate_pipeline_output,
     _wait_json,
 )
 from vuln_judger.agents import AgentDirectoryStore
@@ -1763,6 +1764,62 @@ for raw in sys.stdin.buffer:
             self.assertEqual([item["finding_status"] for item in saved["reports"]], ["completed", "pending", "pending"])
             self.assertIn("服务重启时发现任务未完成", saved["diagnostics"][-1])
 
+    def test_record_store_preserves_opencode_stage_checkpoint_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunRecordStore(Path(tmp) / "records")
+            affirmative = {
+                "role": "affirmative",
+                "finding_id": "finding-2",
+                "attempt_id": "attempt-a",
+                "position": "TRUE_POSITIVE",
+                "confidence": 0.8,
+            }
+            store.save_payload(
+                {
+                    "run_id": "run-opencode-recover",
+                    "status": "running",
+                    "engine": "opencode",
+                    "created_at": "2026-07-14T00:00:00Z",
+                    "source_path": "/src",
+                    "sarif_path": "/report.sarif",
+                    "finding_count": 2,
+                    "completed_finding_count": 1,
+                    "current_finding_ids": {"negative": "finding-2"},
+                    "reports": [
+                        {"finding_id": "finding-1", "finding_status": "completed", "verdict": "TRUE_POSITIVE"},
+                        {
+                            "finding_id": "finding-2",
+                            "finding_status": "in_progress",
+                            "cli_workflow": {
+                                "affirmative": affirmative,
+                                "negative": {},
+                                "moderator": {},
+                                "pipeline": {
+                                    "version": 1,
+                                    "stages": {
+                                        "affirmative": {"status": "succeeded", "attempt": 1},
+                                        "negative": {"status": "running", "attempt": 1},
+                                        "moderator": {"status": "pending", "attempt": 0},
+                                    },
+                                },
+                            },
+                        },
+                    ],
+                    "diagnostics": [],
+                    "config": {"engine": "opencode", "report_path": "/report.sarif", "source_path": "/src"},
+                }
+            )
+
+            store.recover_unfinished()
+
+            saved = store.get("run-opencode-recover")
+            self.assertEqual(len(saved["reports"]), 2)
+            self.assertEqual(saved["reports"][1]["cli_workflow"]["affirmative"], affirmative)
+            stages = saved["reports"][1]["cli_workflow"]["pipeline"]["stages"]
+            self.assertEqual(stages["affirmative"]["status"], "succeeded")
+            self.assertEqual(stages["negative"]["status"], "interrupted")
+            self.assertEqual(saved["current_finding_ids"], {})
+
     def test_mcp_store_migrates_default_atlas_to_focus_args(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "mcp.json"
@@ -2052,7 +2109,7 @@ for raw in sys.stdin.buffer:
         self.assertIn('id="codex-terminal-frame-modal"', html)
         self.assertIn('id="close-codex-terminal-frame"', html)
         self.assertIn('id="codex-terminal-frame"', html)
-        self.assertIn('在当前页面打开原始 Codex TUI', html)
+        self.assertIn('在当前页面打开 Codex 隔离执行日志', html)
         self.assertIn("el.codexTerminalFrame.src = url", html)
         self.assertIn("el.codexTerminalFrame.src = 'about:blank'", html)
         self.assertIn('button.danger-button', html)
@@ -2113,7 +2170,7 @@ for raw in sys.stdin.buffer:
         self.assertIn('/static/vendor/xterm/addon-fit.js', html)
         self.assertIn('/runs/run-1/codex-sessions/moderator/ws', html)
         self.assertIn('new WebSocket(websocketURL(websocketPath))', html)
-        self.assertIn("tmux attach · raw TUI", html)
+        self.assertIn("tmux observer · isolated exec logs", html)
 
     def test_stop_codex_sessions_closes_all_live_sessions(self):
         payload = {
@@ -2149,38 +2206,7 @@ for raw in sys.stdin.buffer:
         self.assertEqual(sessions.call_count, 2)
         stop.assert_called_once()
 
-    def test_codex_start_uses_yolo_mode_by_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "source"
-            run_dir = root / "workspace"
-            source.mkdir()
-            run_dir.mkdir()
-            session = CodexTmuxSession(
-                role="moderator",
-                run_id="run-1",
-                cwd=run_dir,
-                source_path=source,
-                run_dir=run_dir,
-                command="codex",
-            )
-            completed = [
-                subprocess.CompletedProcess(["tmux"], 1, "", ""),
-                subprocess.CompletedProcess(["tmux"], 0, "", ""),
-            ]
-            with patch("vuln_judger.codex_runner._run_tmux", side_effect=completed) as run_tmux:
-                with patch.object(CodexTmuxSession, "_accept_trust_prompt"), patch.object(
-                    CodexTmuxSession, "_wait_until_input_ready"
-                ):
-                    session.start()
-
-            launch_args = run_tmux.call_args_list[1].args[0]
-            self.assertIn("--dangerously-bypass-approvals-and-sandbox", launch_args)
-            self.assertNotIn("--sandbox", launch_args)
-            self.assertNotIn("--ask-for-approval", launch_args)
-            self.assertEqual(launch_args[launch_args.index("--cd") + 1], str(run_dir.resolve()))
-
-    def test_codex_send_uses_bracketed_paste_and_control_submit(self):
+    def test_codex_start_creates_persistent_observer_slot(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "source"
@@ -2196,25 +2222,82 @@ for raw in sys.stdin.buffer:
                 command="codex",
             )
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
-            with patch.object(session, "is_live", return_value=True), patch.object(
-                session, "_wait_until_input_ready"
-            ), patch("vuln_judger.codex_runner.subprocess.run", return_value=completed) as run, patch(
+            with patch.object(session, "is_live", return_value=False), patch(
                 "vuln_judger.codex_runner._run_tmux", return_value=completed
-            ) as run_tmux, patch.dict(
-                os.environ,
-                {"VULN_JUDGER_CODEX_PASTE_SETTLE": "0", "VULN_JUDGER_CODEX_SUBMIT_KEY": "C-m"},
-                clear=False,
-            ):
+            ) as run_tmux:
+                session.start()
+
+            launch_args = run_tmux.call_args.args[0]
+            self.assertIn("new-session", launch_args)
+            self.assertIn("slot", launch_args)
+            self.assertIn("tail -n 200 -F", launch_args[-1])
+            self.assertNotIn("codex", launch_args)
+            self.assertEqual(session.info().transport, "exec-ephemeral-json")
+
+    def test_codex_send_uses_ephemeral_exec_with_prompt_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            run_dir = root / "workspace"
+            source.mkdir()
+            run_dir.mkdir()
+            session = CodexTmuxSession(
+                role="moderator",
+                run_id="run-1",
+                cwd=run_dir,
+                source_path=source,
+                run_dir=run_dir,
+                command="codex",
+            )
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+            with patch.object(session, "is_live", return_value=True), patch(
+                "vuln_judger.codex_runner._run_tmux", return_value=completed
+            ) as run_tmux:
                 session.send("line one\r\nline two")
 
-            self.assertEqual(run.call_args.kwargs["input"], "line one\nline two")
-            tmux_calls = [call.args[0] for call in run_tmux.call_args_list]
-            self.assertIn(
-                ["tmux", "paste-buffer", "-d", "-p", "-r", "-b", "vj-run-1-moderator-input", "-t", session.target],
-                tmux_calls,
+            self.assertEqual(session._current_prompt_path.read_text(encoding="utf-8"), "line one\nline two")
+            launch = run_tmux.call_args_list[-1].args[0]
+            self.assertIn("new-window", launch)
+            shell = launch[-1]
+            self.assertIn("codex exec", shell)
+            self.assertIn("--ephemeral", shell)
+            self.assertIn("--json", shell)
+            self.assertIn("--skip-git-repo-check", shell)
+            self.assertIn("--dangerously-bypass-approvals-and-sandbox", shell)
+            self.assertNotIn("paste-buffer", shell)
+            self.assertNotIn("send-keys", shell)
+
+    def test_pipeline_output_identity_rejects_cross_finding_or_attempt(self):
+        valid = {
+            "role": "affirmative",
+            "finding_id": "finding-1",
+            "attempt_id": "attempt-1",
+            "position": "TRUE_POSITIVE",
+            "confidence": 0.8,
+        }
+        _validate_pipeline_output(
+            valid,
+            finding_id="finding-1",
+            role="affirmative",
+            attempt_id="attempt-1",
+            strict_identity=True,
+        )
+        with self.assertRaises(CodexRunnerError):
+            _validate_pipeline_output(
+                {**valid, "finding_id": "finding-2"},
+                finding_id="finding-1",
+                role="affirmative",
+                attempt_id="attempt-1",
+                strict_identity=True,
             )
-            self.assertIn(["tmux", "send-keys", "-t", session.target, "C-m"], tmux_calls)
-            self.assertNotIn(["tmux", "send-keys", "-t", session.target, "Enter"], tmux_calls)
+        with self.assertRaises(CodexRunnerError):
+            _validate_pipeline_output(
+                {**valid, "attempt_id": "old-attempt"},
+                finding_id="finding-1",
+                role="affirmative",
+                attempt_id="attempt-1",
+                strict_identity=True,
+            )
 
     def test_wait_json_reminds_idle_next_agent_after_previous_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2377,6 +2460,51 @@ for raw in sys.stdin.buffer:
 
             self.assertEqual(result, {"findings": []})
             self.assertEqual(session.sent, ["full moderator prompt"])
+            self.assertEqual(events[0]["kind"], "prompt_redelivered")
+
+    def test_wait_json_redelivers_full_prompt_for_idle_isolated_transport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "previous.json"
+            output = root / "result.json"
+            previous.write_text('{"position":"TRUE_POSITIVE"}\n', encoding="utf-8")
+            events = []
+
+            class IsolatedSession:
+                role = "negative"
+
+                def __init__(self):
+                    self.sent = []
+
+                def info(self):
+                    return {"role": self.role, "transport": "exec-ephemeral-json"}
+
+                def is_live(self):
+                    return True
+
+                def activity_snapshot(self):
+                    return "idle", False
+
+                def send(self, text):
+                    self.sent.append(text)
+                    output.write_text('{"summary":"recovered"}\n', encoding="utf-8")
+
+            session = IsolatedSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                previous_output_path=previous,
+                stage_prompt="full isolated stage prompt",
+                silence_reminder_seconds=0.02,
+                watchdog_callback=events.append,
+                poll_interval_seconds=0.002,
+                activity_poll_seconds=0.005,
+            )
+
+            self.assertEqual(result, {"summary": "recovered"})
+            self.assertEqual(session.sent, ["full isolated stage prompt"])
             self.assertEqual(events[0]["kind"], "prompt_redelivered")
 
     def test_codex_project_trust_is_written_for_workspace(self):
@@ -2653,26 +2781,31 @@ for raw in sys.stdin.buffer:
                     sent.append((self.role, prompt))
 
             sessions = {role: FakeSession(role) for role in ("moderator", "affirmative", "negative")}
-            stage_results = iter(
-                [
-                    {"position": "TRUE_POSITIVE", "confidence": 0.8, "summary": "affirmative"},
-                    {"position": "FALSE_POSITIVE", "confidence": 0.6, "summary": "negative"},
-                    {
+            def stage_result(_path, **kwargs):
+                prompt = kwargs["stage_prompt"]
+
+                def field(name):
+                    return prompt.split(f'"{name}": "', 1)[1].split('"', 1)[0]
+
+                role = field("role")
+                identity = {
+                    "role": role,
+                    "finding_id": field("finding_id"),
+                    "attempt_id": field("attempt_id"),
+                    "confidence": 0.7,
+                }
+                if role == "moderator":
+                    return {
+                        **identity,
                         "verdict": "INCONCLUSIVE",
-                        "confidence": 0.5,
-                        "reasoning_summary": "final-1",
-                        "final_conclusion": "final-1",
-                    },
-                    {"position": "TRUE_POSITIVE", "confidence": 0.8, "summary": "affirmative"},
-                    {"position": "FALSE_POSITIVE", "confidence": 0.6, "summary": "negative"},
-                    {
-                        "verdict": "INCONCLUSIVE",
-                        "confidence": 0.5,
-                        "reasoning_summary": "final-2",
-                        "final_conclusion": "final-2",
-                    },
-                ]
-            )
+                        "reasoning_summary": f"final-{identity['finding_id']}",
+                        "final_conclusion": f"final-{identity['finding_id']}",
+                    }
+                return {
+                    **identity,
+                    "position": "TRUE_POSITIVE" if role == "affirmative" else "FALSE_POSITIVE",
+                    "summary": role,
+                }
             runner = CodexDrivenRunner(
                 records_dir=records.root,
                 codex_runs_dir=root / ".workspaces" / "runs",
@@ -2689,17 +2822,23 @@ for raw in sys.stdin.buffer:
                 runner,
                 "_sessions",
                 return_value=sessions,
-            ), patch("vuln_judger.codex_runner._wait_json", side_effect=lambda *_args, **_kwargs: next(stage_results)), patch(
+            ), patch("vuln_judger.codex_runner._wait_json", side_effect=stage_result), patch(
                 "vuln_judger.codex_runner.SourceIndexer",
                 wraps=SourceIndexer,
             ) as indexer_factory:
                 completed = runner.run(config, store=records)
 
             self.assertEqual(indexer_factory.call_count, 1)
-            self.assertEqual([role for role, _prompt in sent], ["affirmative", "negative", "moderator"] * 2)
+            self.assertEqual({role: sum(1 for sent_role, _ in sent if sent_role == role) for role in ("affirmative", "negative", "moderator")}, {"affirmative": 2, "negative": 2, "moderator": 2})
+            for finding_id in {stage_result(None, stage_prompt=prompt)["finding_id"] for _role, prompt in sent}:
+                roles = [role for role, prompt in sent if f'"finding_id": "{finding_id}"' in prompt]
+                self.assertLess(roles.index("affirmative"), roles.index("negative"))
+                self.assertLess(roles.index("negative"), roles.index("moderator"))
             self.assertFalse(any("当前阶段：报告拆分" in prompt for _role, prompt in sent))
             self.assertEqual(completed["finding_count"], 2)
             self.assertEqual(completed["cli_workflow"]["report_preparation_origin"], "local_sarif")
+            self.assertEqual(completed["cli_workflow"]["pipeline"]["slot_count"], 3)
+            self.assertEqual(completed["cli_workflow"]["pipeline"]["context_mode"], "isolated-per-finding-stage")
             findings_path = root / ".workspaces" / "runs" / "run-local-sarif" / "findings.json"
             persisted = json.loads(findings_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["origin"], "local_sarif")
@@ -2748,33 +2887,47 @@ for raw in sys.stdin.buffer:
             def sessions(sent):
                 return {role: FakeSession(role, sent) for role in ("moderator", "affirmative", "negative")}
 
-            affirmative = {"position": "TRUE_POSITIVE", "confidence": 0.8, "summary": "affirmative"}
-            negative = {"position": "TRUE_POSITIVE", "confidence": 0.7, "summary": "negative"}
+            def stage_result(prompt):
+                def field(name):
+                    return prompt.split(f'"{name}": "', 1)[1].split('"', 1)[0]
 
-            def final(index):
+                role = field("role")
+                finding_id = field("finding_id")
+                identity = {
+                    "role": role,
+                    "finding_id": finding_id,
+                    "attempt_id": field("attempt_id"),
+                    "confidence": 0.8,
+                }
+                if role == "moderator":
+                    suffix = finding_id.rsplit("-", 1)[-1]
+                    return {
+                        **identity,
+                        "verdict": "TRUE_POSITIVE",
+                        "reasoning_summary": f"final-{suffix}",
+                        "final_conclusion": f"final-{suffix}",
+                    }
                 return {
-                    "verdict": "TRUE_POSITIVE",
-                    "confidence": 0.9,
-                    "reasoning_summary": f"final-{index}",
-                    "final_conclusion": f"final-{index}",
+                    **identity,
+                    "position": "TRUE_POSITIVE",
+                    "summary": role,
                 }
 
             initial_sent = []
-            initial_waits = iter(
-                [
-                    findings_data,
-                    affirmative,
-                    negative,
-                    final(1),
-                    CodexRunnerStopped("pause during finding-2"),
-                ]
-            )
+            initial_progress = []
+            final_one_done = Event()
 
-            def initial_wait(*_args, **_kwargs):
-                value = next(initial_waits)
-                if isinstance(value, Exception):
-                    raise value
-                return value
+            def initial_wait(path, **kwargs):
+                if str(path).endswith("findings.json"):
+                    return findings_data
+                prompt = kwargs["stage_prompt"]
+                result = stage_result(prompt)
+                if result["role"] == "moderator" and result["finding_id"] == "finding-1":
+                    final_one_done.set()
+                if result["role"] == "negative" and result["finding_id"] == "finding-2":
+                    self.assertTrue(final_one_done.wait(2))
+                    raise CodexRunnerStopped("pause during finding-2 negative stage")
+                return result
 
             config = RunConfig(
                 sarif_path=report,
@@ -2793,9 +2946,24 @@ for raw in sys.stdin.buffer:
                 return_value=sessions(initial_sent),
             ), patch("vuln_judger.codex_runner._wait_json", side_effect=initial_wait):
                 with self.assertRaises(CodexRunnerStopped):
-                    runner.run(config, store=records)
+                    runner.run(
+                        config,
+                        store=records,
+                        progress_callback=lambda payload: initial_progress.append(json.loads(json.dumps(payload))),
+                    )
 
             running = records.get("run-multi")
+            self.assertTrue(
+                any(
+                    payload.get("current_finding_ids")
+                    == {
+                        "affirmative": "finding-3",
+                        "negative": "finding-2",
+                        "moderator": "finding-1",
+                    }
+                    for payload in initial_progress
+                )
+            )
             self.assertEqual(len(running["reports"]), 3)
             self.assertEqual(
                 [item["finding_status"] for item in running["reports"]],
@@ -2835,18 +3003,7 @@ for raw in sys.stdin.buffer:
                 value = str(path)
                 if value.endswith("findings.json"):
                     return findings_data
-                if "finding-2" in value and value.endswith("affirmative/result.json"):
-                    self.assertFalse(stale_result.exists())
-                    return affirmative
-                if value.endswith("negative/result.json"):
-                    return negative
-                if "finding-2" in value and value.endswith("moderator/final.json"):
-                    return final(2)
-                if "finding-3" in value and value.endswith("affirmative/result.json"):
-                    return affirmative
-                if "finding-3" in value and value.endswith("moderator/final.json"):
-                    return final(3)
-                raise AssertionError(f"unexpected wait path: {path}")
+                return stage_result(_kwargs["stage_prompt"])
 
             resume_config = RunConfig(
                 sarif_path=report,
@@ -2874,7 +3031,15 @@ for raw in sys.stdin.buffer:
             self.assertTrue(resumed_progress)
             self.assertTrue(all(len(payload["reports"]) == 3 for payload in resumed_progress))
             self.assertTrue(all(payload["reports"][0]["final_conclusion"] == "final-1" for payload in resumed_progress))
-            self.assertEqual([role for role, _ in resumed_sent], ["affirmative", "negative", "moderator"] * 2)
+            resumed_roles = [role for role, _ in resumed_sent]
+            self.assertEqual(resumed_roles.count("affirmative"), 1)
+            self.assertEqual(resumed_roles.count("negative"), 2)
+            self.assertEqual(resumed_roles.count("moderator"), 2)
+            self.assertFalse(
+                any(role == "affirmative" and '"finding_id": "finding-2"' in prompt for role, prompt in resumed_sent)
+            )
+            restored_affirmative = json.loads(stale_result.read_text(encoding="utf-8"))
+            self.assertEqual(restored_affirmative["finding_id"], "finding-2")
             self.assertEqual(completed["completed_finding_count"], 3)
             self.assertEqual([item["finding_status"] for item in completed["reports"]], ["completed"] * 3)
             self.assertEqual([item["final_conclusion"] for item in completed["reports"]], ["final-1", "final-2", "final-3"])
@@ -5447,7 +5612,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertIn("attach", tui_launch)
             self.assertIn("ses-created", tui_launch)
 
-    def test_opencode_prompt_uses_run_json_transport_and_explicit_session(self):
+    def test_opencode_prompt_rotates_provider_session_per_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cwd = root / "role"
@@ -5471,8 +5636,8 @@ class OpenCodeRunnerTests(unittest.TestCase):
 
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
             with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
-                "vuln_judger.opencode_runner._create_opencode_session", return_value="ses-123"
-            ), patch(
+                "vuln_judger.opencode_runner._create_opencode_session", side_effect=["ses-1", "ses-2"]
+            ) as create_session, patch(
                 "vuln_judger.opencode_runner._wait_for_opencode_tui"
             ), patch(
                 "vuln_judger.opencode_runner._run_tmux", return_value=completed
@@ -5480,7 +5645,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 session.send("first prompt")
                 first_event = session._current_event_path
                 self.assertIsNotNone(first_event)
-                first_event.write_text('{"type":"session","sessionID":"ses-123"}\n', encoding="utf-8")
+                first_event.write_text('{"type":"session","sessionID":"ses-1"}\n', encoding="utf-8")
                 session.activity_snapshot()
                 session.send("second prompt")
 
@@ -5490,10 +5655,12 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertIn("--attach", shell)
             self.assertIn("--format json", shell)
             self.assertIn("--dangerously-skip-permissions", shell)
-            self.assertIn("--session ses-123", shell)
+            self.assertIn("--session ses-2", shell)
             self.assertIn("--model openai/gpt-5", shell)
             self.assertNotIn("paste-buffer", shell)
             self.assertNotIn("send-keys", shell)
+            self.assertEqual(create_session.call_count, 2)
+            self.assertEqual(session.info().provider_session_id, "ses-2")
 
     def test_opencode_nonzero_run_exit_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,16 +6,22 @@ import hashlib
 import json
 import os
 import pty
+import queue
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
 import struct
 import subprocess
 import termios
+import threading
 import time
-from dataclasses import dataclass
+import uuid
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
@@ -59,11 +65,10 @@ ROLE_LABELS = {
     "negative": "反方",
 }
 VERDICTS = {"TRUE_POSITIVE", "FALSE_POSITIVE", "INCONCLUSIVE"}
+PIPELINE_ROLES = ("affirmative", "negative", "moderator")
+PIPELINE_DOWNSTREAM_ROLES = ("moderator", "negative", "affirmative")
+PIPELINE_ACTIVE_STATUSES = {"dispatching", "running"}
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-CODEX_STARTUP_MARKERS = (
-    "Starting MCP server",
-    "Starting MCP servers",
-)
 CODEX_ACTIVE_PROGRESS_RE = re.compile(
     r"\((?:(?:\d+h\s+)?(?:\d+m\s+)?)\d+s\s*[•·]\s*esc to interrupt\)",
     re.IGNORECASE,
@@ -101,6 +106,8 @@ class CliSession(Protocol):
 
     def failure_message(self) -> Optional[str]: ...
 
+    def task_finished(self) -> bool: ...
+
 
 @dataclass
 class CodexSessionInfo:
@@ -110,7 +117,8 @@ class CodexSessionInfo:
     target: str
     cwd: str
     backend: str = CODEX_ENGINE
-    transport: str = "tmux-tui"
+    transport: str = "exec-ephemeral-json"
+    event_log: Optional[str] = None
 
 
 class CodexTmuxSession:
@@ -131,8 +139,15 @@ class CodexTmuxSession:
         self.run_dir = run_dir.resolve()
         self.command = command
         self.session_name = _safe_tmux_name(f"vj-{run_id}-{role}")
-        self.window_name = "codex"
+        self.window_name = "slot"
         self.target = f"{self.session_name}:{self.window_name}"
+        self.run_target = f"{self.session_name}:run"
+        self.logs_dir = self.cwd / ".vuln-judger-codex"
+        self.current_event_path = self.logs_dir / "current.ndjson"
+        self._sequence = _last_log_sequence(self.logs_dir, "prompt-")
+        self._current_prompt_path: Optional[Path] = None
+        self._current_event_path: Optional[Path] = None
+        self._current_exit_path: Optional[Path] = None
 
     def info(self) -> CodexSessionInfo:
         return CodexSessionInfo(
@@ -141,14 +156,20 @@ class CodexTmuxSession:
             window_name=self.window_name,
             target=self.target,
             cwd=str(self.cwd),
+            event_log=str(self._current_event_path) if self._current_event_path else None,
         )
 
     def start(self) -> None:
         if self.is_live():
-            return
-        yolo = _env_flag("VULN_JUDGER_CODEX_YOLO", default=True)
+            if _tmux_window_live(self.session_name, self.window_name):
+                if _tmux_window_live(self.session_name, "run"):
+                    _run_tmux(["tmux", "kill-window", "-t", self.run_target], timeout=10, check=False)
+                return
+            _run_tmux(["tmux", "kill-session", "-t", self.session_name], timeout=10, check=False)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.current_event_path.touch(exist_ok=True)
         LOG.info(
-            "Codex session 启动",
+            "Codex execution slot 启动",
             extra={
                 "event": "codex.session.start",
                 "run_id": self.run_id,
@@ -157,8 +178,11 @@ class CodexTmuxSession:
                 "cwd": str(self.cwd),
                 "source_path": str(self.source_path),
                 "run_dir": str(self.run_dir),
-                "yolo": yolo,
             },
+        )
+        observer = (
+            f"touch {shlex.quote(str(self.current_event_path))}; "
+            f"exec tail -n 200 -F {shlex.quote(str(self.current_event_path))}"
         )
         args = [
             "tmux",
@@ -170,33 +194,13 @@ class CodexTmuxSession:
             self.window_name,
             "-c",
             str(self.cwd),
-            self.command,
-            "--cd",
-            str(self.cwd),
-            "--add-dir",
-            str(REPO_ROOT),
-            "--add-dir",
-            str(self.source_path),
-            "--add-dir",
-            str(self.run_dir),
-            "--no-alt-screen",
+            "sh",
+            "-lc",
+            observer,
         ]
-        if yolo:
-            args.append("--dangerously-bypass-approvals-and-sandbox")
-        else:
-            args.extend(
-                [
-                    "--sandbox",
-                    os.environ.get("VULN_JUDGER_CODEX_SANDBOX", "workspace-write"),
-                    "--ask-for-approval",
-                    os.environ.get("VULN_JUDGER_CODEX_APPROVAL", "never"),
-                ]
-            )
         _run_tmux(args, timeout=30)
-        self._accept_trust_prompt()
-        self._wait_until_input_ready()
         LOG.info(
-            "Codex session ready",
+            "Codex execution slot ready",
             extra={
                 "event": "codex.session.ready",
                 "run_id": self.run_id,
@@ -226,9 +230,57 @@ class CodexTmuxSession:
             )
 
     def send(self, text: str) -> None:
+        if not text:
+            raise CodexRunnerError("Codex prompt 不能为空")
         if not self.is_live():
             self.start()
-        self._wait_until_input_ready()
+        if _tmux_window_live(self.session_name, "run"):
+            raise CodexRunnerError(f"Codex execution slot 正在执行任务：{self.role}")
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self._sequence += 1
+        prompt_path = self.logs_dir / f"prompt-{self._sequence:04d}.txt"
+        event_path = self.logs_dir / f"events-{self._sequence:04d}.ndjson"
+        exit_path = self.logs_dir / f"exit-{self._sequence:04d}.txt"
+        raw_exit_path = self.logs_dir / f"exit-{self._sequence:04d}.raw"
+        prompt_path.write_text(text, encoding="utf-8")
+        event_path.unlink(missing_ok=True)
+        exit_path.unlink(missing_ok=True)
+        raw_exit_path.unlink(missing_ok=True)
+        self.current_event_path.write_text("", encoding="utf-8")
+
+        args = [
+            self.command,
+            "exec",
+            "--ephemeral",
+            "--json",
+            "--cd",
+            str(self.cwd),
+            "--add-dir",
+            str(REPO_ROOT),
+            "--add-dir",
+            str(self.source_path),
+            "--add-dir",
+            str(self.run_dir),
+            "--skip-git-repo-check",
+        ]
+        if _env_flag("VULN_JUDGER_CODEX_YOLO", default=True):
+            args.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            args.extend(
+                [
+                    "--sandbox",
+                    os.environ.get("VULN_JUDGER_CODEX_SANDBOX", "workspace-write"),
+                ]
+            )
+        args.append("-")
+        invocation = shlex.join(args)
+        shell = (
+            f"set +e; ({invocation} < {shlex.quote(str(prompt_path))}; "
+            f"printf '%s\\n' \"$?\" > {shlex.quote(str(raw_exit_path))}) 2>&1 "
+            f"| tee {shlex.quote(str(event_path))} {shlex.quote(str(self.current_event_path))}; "
+            f"status=$(cat {shlex.quote(str(raw_exit_path))}); "
+            f"printf '%s\\n' \"$status\" > {shlex.quote(str(exit_path))}; exit \"$status\""
+        )
         LOG.info(
             "Codex prompt 发送",
             extra={
@@ -240,80 +292,81 @@ class CodexTmuxSession:
                 "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
             },
         )
-        buffer_name = _safe_tmux_name(f"{self.session_name}-input")
-        _send_text_to_tmux_target(self.target, buffer_name, text)
+        _run_tmux(
+            [
+                "tmux",
+                "new-window",
+                "-d",
+                "-t",
+                self.session_name,
+                "-n",
+                "run",
+                "-c",
+                str(self.cwd),
+                "sh",
+                "-lc",
+                shell,
+            ],
+            timeout=15,
+        )
+        self._current_prompt_path = prompt_path
+        self._current_event_path = event_path
+        self._current_exit_path = exit_path
 
     def capture(self, lines: int = 240) -> str:
-        if not self.is_live():
-            return ""
-        result = _run_tmux(
-            ["tmux", "capture-pane", "-p", "-S", f"-{max(1, min(lines, 2000))}", "-t", self.target],
-            timeout=10,
-            check=False,
-        )
-        return result.stdout or ""
+        if self._current_event_path:
+            return _tail_file(self._current_event_path, lines)
+        return ""
 
     def activity_snapshot(self) -> tuple[str, bool]:
-        capture = self.capture()
-        return capture, _session_busy(capture)
+        token = ""
+        if self._current_event_path and self._current_event_path.exists():
+            stat = self._current_event_path.stat()
+            token = f"{stat.st_size}:{stat.st_mtime_ns}"
+        return token, _tmux_window_live(self.session_name, "run")
 
     def failure_message(self) -> Optional[str]:
-        return None
+        if not self.task_finished() or self._current_exit_path is None:
+            return None
+        try:
+            exit_code = int(self._current_exit_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
+        if exit_code == 0:
+            return None
+        return f"Codex exec 退出码 {exit_code}；{self.capture(30)}"
 
-    def _accept_trust_prompt(self) -> None:
-        deadline = time.monotonic() + 12
-        markers = (
-            "allow codex to work in this folder",
-            "do you trust the contents of this directory",
-            "do you trust the files in this folder",
-            "2. no, quit",
+    def task_finished(self) -> bool:
+        return bool(
+            self._current_exit_path
+            and self._current_exit_path.exists()
+            and not _tmux_window_live(self.session_name, "run")
         )
-        while time.monotonic() < deadline:
-            text = self.capture(lines=80).lower()
-            if any(marker in text for marker in markers):
-                _run_tmux(["tmux", "send-keys", "-t", self.target, _codex_submit_key()], timeout=5)
-                return
-            time.sleep(0.25)
 
-    def _wait_until_input_ready(self) -> None:
-        deadline = time.monotonic() + float(os.environ.get("VULN_JUDGER_CODEX_READY_TIMEOUT", "120"))
-        stable_samples = 0
-        last_text = ""
-        while time.monotonic() < deadline:
-            text = self.capture(lines=120)
-            last_text = text
-            if self._accept_trust_prompt_if_visible(text):
-                stable_samples = 0
-                time.sleep(0.5)
-                continue
-            busy = bool(CODEX_ACTIVE_PROGRESS_RE.search(text) or CODEX_BACKGROUND_RUNNING_RE.search(text))
-            if text.strip() and not busy and not any(marker in text for marker in CODEX_STARTUP_MARKERS):
-                stable_samples += 1
-                if stable_samples >= 3:
-                    return
-            else:
-                stable_samples = 0
-            time.sleep(0.5)
-        startup = next((marker for marker in CODEX_STARTUP_MARKERS if marker in last_text), "none")
-        raise CodexRunnerError(f"Codex session did not become input-ready: {self.target}; startup_marker={startup}")
 
-    def _accept_trust_prompt_if_visible(self, text: str) -> bool:
-        markers = (
-            "allow codex to work in this folder",
-            "do you trust the contents of this directory",
-            "do you trust the files in this folder",
-            "2. no, quit",
-        )
-        if any(marker in text.lower() for marker in markers):
-            _run_tmux(["tmux", "send-keys", "-t", self.target, _codex_submit_key()], timeout=5)
-            return True
-        return False
+@dataclass
+class _PipelineFinding:
+    index: int
+    finding: Finding
+    brief_path: Path
+    result_paths: Dict[str, Path]
+    data: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    stages: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    preserved_report: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class _ActivePipelineStage:
+    role: str
+    item: _PipelineFinding
+    attempt_id: str
+    future: Future[Dict[str, Any]]
 
 
 class CliDrivenRunner:
     engine = CODEX_ENGINE
     cli_name = "Codex"
-    session_description = "Codex TUI"
+    session_description = "Codex execution slot"
 
     def __init__(
         self,
@@ -483,134 +536,233 @@ class CliDrivenRunner:
                 f"{len(findings) - completed_count} 个未完成。",
             ],
         )
-        previous_output_path = findings_path
-
-        for finding_index, finding in enumerate(findings):
-            if finding_index < start_index:
-                continue
-            check_stop()
-            finding_dir = run_dir / "findings" / _safe_path_part(finding.finding_id)
-            finding_dir.mkdir(parents=True, exist_ok=True)
-            _reset_incomplete_finding_outputs(finding_dir)
-            reports = _replace_finding_report(
-                reports,
-                finding_index,
-                {**_pending_report(finding), "finding_status": FINDING_IN_PROGRESS},
-            )
-            payload["current_finding_id"] = finding.finding_id
-            payload["current_finding_index"] = finding_index
-            payload["resume_from_finding_id"] = finding.finding_id
-            payload["resume_from_finding_index"] = finding_index
-            emit("running", reports=reports, completed_finding_count=completed_finding_count(reports))
-
-            brief_path = finding_briefs[finding.finding_id]
-
-            affirmative_dir = finding_dir / "affirmative"
-            negative_dir = finding_dir / "negative"
-            moderator_dir = finding_dir / "moderator"
-            affirmative_dir.mkdir(exist_ok=True)
-            negative_dir.mkdir(exist_ok=True)
-            moderator_dir.mkdir(exist_ok=True)
-
-            affirmative_result = affirmative_dir / "result.json"
-            affirmative_prompt = _worker_prompt(
-                role="affirmative",
-                finding=finding,
-                source_path=source_path,
-                brief_path=brief_path,
-                result_path=affirmative_result,
-                peer_result_path=None,
-                round_index=finding_index + 1,
-            )
-            sessions["affirmative"].send(affirmative_prompt)
-            affirmative_data = _wait_json(
-                affirmative_result,
-                should_stop=should_stop,
-                reminder_session=sessions["affirmative"],
-                previous_output_path=previous_output_path,
-                stage_prompt=affirmative_prompt,
-                silence_reminder_seconds=config.silence_reminder_minutes * 60,
-                watchdog_callback=watchdog_event,
-            )
-            previous_output_path = affirmative_result
-            reports = _replace_finding_report(
-                reports,
-                finding_index,
-                _partial_report(finding, affirmative_data, None, None),
-            )
-            emit("running", reports=reports, completed_finding_count=completed_finding_count(reports))
-
-            negative_result = negative_dir / "result.json"
-            negative_prompt = _worker_prompt(
-                role="negative",
-                finding=finding,
-                source_path=source_path,
-                brief_path=brief_path,
-                result_path=negative_result,
-                peer_result_path=affirmative_result,
-                round_index=finding_index + 1,
-            )
-            sessions["negative"].send(negative_prompt)
-            negative_data = _wait_json(
-                negative_result,
-                should_stop=should_stop,
-                reminder_session=sessions["negative"],
-                previous_output_path=previous_output_path,
-                stage_prompt=negative_prompt,
-                silence_reminder_seconds=config.silence_reminder_minutes * 60,
-                watchdog_callback=watchdog_event,
-            )
-            previous_output_path = negative_result
-            reports = _replace_finding_report(
-                reports,
-                finding_index,
-                _partial_report(finding, affirmative_data, negative_data, None),
-            )
-            emit("running", reports=reports, completed_finding_count=completed_finding_count(reports))
-
-            final_result = moderator_dir / "final.json"
-            moderator_final_prompt = _moderator_final_prompt(
-                finding=finding,
-                source_path=source_path,
-                brief_path=brief_path,
-                affirmative_result=affirmative_result,
-                negative_result=negative_result,
-                final_path=final_result,
-            )
-            sessions["moderator"].send(moderator_final_prompt)
-            final_data = _wait_json(
-                final_result,
-                should_stop=should_stop,
-                reminder_session=sessions["moderator"],
-                previous_output_path=previous_output_path,
-                stage_prompt=moderator_final_prompt,
-                silence_reminder_seconds=config.silence_reminder_minutes * 60,
-                watchdog_callback=watchdog_event,
-            )
-            previous_output_path = final_result
-            reports = _replace_finding_report(
-                reports,
-                finding_index,
-                _final_report(finding, affirmative_data, negative_data, final_data),
-            )
-            completed_count = completed_finding_count(reports)
-            next_index = first_incomplete_finding_index(reports, len(findings))
-            emit(
-                "running",
-                reports=reports,
-                completed_finding_count=completed_count,
-                resume_from_finding_index=next_index,
-                resume_from_finding_id=findings[next_index].finding_id if next_index < len(findings) else None,
-            )
+        reports = self._run_finding_pipeline(
+            findings=findings,
+            finding_briefs=finding_briefs,
+            reports=reports,
+            run_dir=run_dir,
+            source_path=source_path,
+            sessions=sessions,
+            config=config,
+            emit=emit,
+            check_stop=check_stop,
+            should_stop=should_stop,
+            watchdog_event=watchdog_event,
+            payload=payload,
+        )
 
         payload["reports"] = reports
         payload["completed_finding_count"] = completed_finding_count(reports)
         payload["current_finding_id"] = None
         payload["current_finding_index"] = None
+        payload["current_finding_ids"] = {}
         payload["resume_from_finding_id"] = None
         payload["resume_from_finding_index"] = len(findings)
         emit("completed")
         return payload
+
+    def _run_finding_pipeline(
+        self,
+        *,
+        findings: Sequence[Finding],
+        finding_briefs: Dict[str, Path],
+        reports: List[Dict[str, Any]],
+        run_dir: Path,
+        source_path: Path,
+        sessions: Dict[str, CliSession],
+        config: RunConfig,
+        emit: Callable[..., None],
+        check_stop: Callable[[], None],
+        should_stop: Optional[Callable[[], bool]],
+        watchdog_event: Callable[[Dict[str, Any]], None],
+        payload: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        items = _initialize_pipeline_findings(
+            findings,
+            finding_briefs,
+            run_dir,
+            reports,
+            resume=bool(config.created_at is not None or config.resume_reports),
+        )
+        ready: Dict[str, deque[int]] = {role: deque() for role in PIPELINE_ROLES}
+        active: Dict[str, _ActivePipelineStage] = {}
+        watchdog_events: queue.Queue[Dict[str, Any]] = queue.Queue()
+        abort_event = threading.Event()
+
+        for item in items:
+            next_role = _next_pipeline_role(item)
+            if next_role is not None:
+                item.stages[next_role]["status"] = "ready"
+                ready[next_role].append(item.index)
+
+        def stopped() -> bool:
+            return abort_event.is_set() or (should_stop is not None and should_stop())
+
+        def persist() -> None:
+            nonlocal reports
+            for item in items:
+                reports = _replace_finding_report(reports, item.index, _pipeline_report(item))
+            current_ids = {
+                role: active[role].item.finding.finding_id
+                for role in PIPELINE_ROLES
+                if role in active
+            }
+            current = next(
+                (active[role].item for role in PIPELINE_DOWNSTREAM_ROLES if role in active),
+                None,
+            )
+            resume_index = first_incomplete_finding_index(reports, len(findings))
+            workflow = dict(payload.get("cli_workflow") or payload.get("codex_workflow") or {})
+            workflow["pipeline"] = _pipeline_snapshot(items, ready, active)
+            updates: Dict[str, Any] = {
+                "reports": reports,
+                "completed_finding_count": completed_finding_count(reports),
+                "current_finding_ids": current_ids,
+                "current_finding_id": current.finding.finding_id if current else None,
+                "current_finding_index": current.index if current else None,
+                "resume_from_finding_index": resume_index,
+                "resume_from_finding_id": (
+                    findings[resume_index].finding_id if resume_index < len(findings) else None
+                ),
+                "cli_workflow": workflow,
+            }
+            if self.engine == CODEX_ENGINE:
+                updates["codex_workflow"] = workflow
+            emit("running", **updates)
+
+        def execute_stage(
+            role: str,
+            item: _PipelineFinding,
+            prompt: str,
+            attempt_id: str,
+        ) -> Dict[str, Any]:
+            session = sessions[role]
+            previous_path = (
+                item.brief_path
+                if role == "affirmative"
+                else item.result_paths["affirmative"]
+                if role == "negative"
+                else item.result_paths["negative"]
+            )
+            result = _wait_json(
+                item.result_paths[role],
+                should_stop=stopped,
+                reminder_session=session,
+                previous_output_path=previous_path,
+                stage_prompt=prompt,
+                silence_reminder_seconds=config.silence_reminder_minutes * 60,
+                watchdog_callback=watchdog_events.put,
+            )
+            _validate_pipeline_output(
+                result,
+                finding_id=item.finding.finding_id,
+                role=role,
+                attempt_id=attempt_id,
+                strict_identity=True,
+            )
+            return result
+
+        def can_dispatch(role: str) -> bool:
+            if role in active or not ready[role]:
+                return False
+            if role == "affirmative" and len(ready["negative"]) >= 1:
+                return False
+            if role == "negative" and len(ready["moderator"]) >= 1:
+                return False
+            return True
+
+        executor = ThreadPoolExecutor(max_workers=3, thread_name_prefix=f"vj-{self.engine}-pipeline")
+        persist()
+        try:
+            while any(_next_pipeline_role(item) is not None for item in items):
+                check_stop()
+                changed = False
+
+                while True:
+                    try:
+                        event = watchdog_events.get_nowait()
+                    except queue.Empty:
+                        break
+                    watchdog_event(event)
+
+                for role in PIPELINE_DOWNSTREAM_ROLES:
+                    running = active.get(role)
+                    if running is None or not running.future.done():
+                        continue
+                    item = running.item
+                    try:
+                        result = running.future.result()
+                    except CodexRunnerStopped:
+                        item.stages[role]["status"] = "interrupted"
+                        item.stages[role]["completed_at"] = _now()
+                        active.pop(role, None)
+                        changed = True
+                        raise
+                    except Exception:
+                        item.stages[role]["status"] = "failed"
+                        item.stages[role]["completed_at"] = _now()
+                        active.pop(role, None)
+                        changed = True
+                        raise
+                    item.data[role] = result
+                    item.stages[role]["status"] = "succeeded"
+                    item.stages[role]["completed_at"] = _now()
+                    active.pop(role, None)
+                    next_role = _role_after(role)
+                    if next_role is not None:
+                        item.stages[next_role]["status"] = "ready"
+                        ready[next_role].append(item.index)
+                    changed = True
+
+                for role in PIPELINE_DOWNSTREAM_ROLES:
+                    if not can_dispatch(role):
+                        continue
+                    item = items[ready[role].popleft()]
+                    _clear_pipeline_from(item, role)
+                    attempt_id = uuid.uuid4().hex
+                    stage = item.stages[role]
+                    stage["status"] = "running"
+                    stage["attempt"] = int(stage.get("attempt") or 0) + 1
+                    stage["attempt_id"] = attempt_id
+                    stage["started_at"] = _now()
+                    stage["completed_at"] = None
+                    prompt = _pipeline_stage_prompt(
+                        role=role,
+                        item=item,
+                        source_path=source_path,
+                        attempt_id=attempt_id,
+                    )
+                    try:
+                        sessions[role].send(prompt)
+                    except Exception:
+                        stage["status"] = "failed"
+                        stage["completed_at"] = _now()
+                        raise
+                    future = executor.submit(execute_stage, role, item, prompt, attempt_id)
+                    active[role] = _ActivePipelineStage(role, item, attempt_id, future)
+                    changed = True
+
+                if changed:
+                    persist()
+                    continue
+                if not active and any(ready[role] for role in PIPELINE_ROLES):
+                    raise CodexRunnerError("三级流水线调度停滞，存在 ready stage 但没有可执行任务")
+                time.sleep(0.1)
+        except BaseException:
+            abort_event.set()
+            for running in active.values():
+                running.future.cancel()
+                stage = running.item.stages[running.role]
+                if stage.get("status") in PIPELINE_ACTIVE_STATUSES:
+                    stage["status"] = "interrupted"
+                    stage["completed_at"] = _now()
+            executor.shutdown(wait=True, cancel_futures=True)
+            persist()
+            raise
+        else:
+            executor.shutdown(wait=True)
+            persist()
+        return reports
 
     def _prepare_run_dir(self, run_dir: Path) -> None:
         raise NotImplementedError
@@ -1005,6 +1157,23 @@ def _run_tmux(args: Sequence[str], timeout: int = 10, check: bool = True) -> sub
     return result
 
 
+def _tmux_window_live(session_name: str, window_name: str) -> bool:
+    result = _run_tmux(
+        ["tmux", "list-windows", "-t", session_name, "-F", "#{window_name}"],
+        timeout=5,
+        check=False,
+    )
+    return result.returncode == 0 and window_name in (result.stdout or "").splitlines()
+
+
+def _tail_file(path: Path, lines: int) -> str:
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    return "\n".join(content[-max(1, lines) :])
+
+
 def _env_flag(name: str, *, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -1076,7 +1245,8 @@ def _wait_json(
         if should_stop is not None and should_stop():
             raise CodexRunnerStopped("Codex-driven task stopped")
         data, last_error = _read_json_object(path)
-        if data is not None:
+        task_finished = _cli_task_finished(reminder_session)
+        if data is not None and task_finished is not False:
             LOG.info(
                 "Codex JSON 输出就绪",
                 extra={"event": "codex.output.ready", "output_path": str(path)},
@@ -1088,6 +1258,11 @@ def _wait_json(
             failure = failure_method() if callable(failure_method) else None
             if failure:
                 raise CodexRunnerError(f"CLI session 执行失败：{failure}")
+            task_finished = _cli_task_finished(reminder_session)
+            if data is None and task_finished is True:
+                raise CodexRunnerError(
+                    f"CLI session 已结束但未生成合法 JSON：{path}；最后错误：{last_error}"
+                )
 
         now = time.monotonic()
         if deadline is not None and now >= deadline:
@@ -1112,7 +1287,7 @@ def _wait_json(
 
             if now >= silence_deadline:
                 data, last_error = _read_json_object(path)
-                if data is not None:
+                if data is not None and _cli_task_finished(reminder_session) is not False:
                     LOG.info(
                         "Codex JSON 输出就绪",
                         extra={"event": "codex.output.ready", "output_path": str(path)},
@@ -1131,6 +1306,15 @@ def _wait_json(
                 last_capture = _cli_activity_snapshot(reminder_session)[0] if reminder_session.is_live() else ""
 
         time.sleep(max(float(poll_interval_seconds), 0.01))
+
+
+def _cli_task_finished(session: Optional[CliSession]) -> Optional[bool]:
+    if session is None:
+        return None
+    method = getattr(session, "task_finished", None)
+    if not callable(method):
+        return None
+    return bool(method())
 
 
 def _handle_silence_deadline(
@@ -1159,7 +1343,16 @@ def _handle_silence_deadline(
             previous_data, _ = _read_json_object(previous_output_path)
             _, busy = _cli_activity_snapshot(session)
             current_data, _ = _read_json_object(path)
-            if current_data is None and previous_data is not None and not busy:
+            transport = _cli_session_transport(session)
+            if current_data is None and not busy and stage_prompt and transport != "tmux-tui":
+                session.send(stage_prompt)
+                event = {
+                    "kind": "prompt_redelivered",
+                    "role": session.role,
+                    "output_path": str(path),
+                    "at": _now(),
+                }
+            elif current_data is None and previous_data is not None and not busy:
                 session.send(SILENCE_REMINDER_PROMPT)
                 event = {
                     "kind": "reminder",
@@ -1200,6 +1393,17 @@ def _handle_silence_deadline(
     )
     if watchdog_callback is not None:
         watchdog_callback(event)
+
+
+def _cli_session_transport(session: CliSession) -> str:
+    info_method = getattr(session, "info", None)
+    if not callable(info_method):
+        return "tmux-tui"
+    try:
+        info = to_jsonable(info_method())
+    except Exception:
+        return "tmux-tui"
+    return str(info.get("transport") or "tmux-tui") if isinstance(info, dict) else "tmux-tui"
 
 
 def _session_busy(text: str) -> bool:
@@ -1321,6 +1525,7 @@ def _worker_prompt(
     result_path: Path,
     peer_result_path: Optional[Path],
     round_index: int,
+    attempt_id: str,
 ) -> str:
     is_affirmative = role == "affirmative"
     peer = f"\n上一阶段正方结果文件：{peer_result_path}\n反方可以读取它进行质疑，但必须先独立复核源码证据。" if peer_result_path else ""
@@ -1336,6 +1541,7 @@ def _worker_prompt(
         "{\n"
         f"  \"role\": \"{role}\",\n"
         f"  \"finding_id\": \"{finding.finding_id}\",\n"
+        f"  \"attempt_id\": \"{attempt_id}\",\n"
         "  \"position\": \"TRUE_POSITIVE|FALSE_POSITIVE|INCONCLUSIVE\",\n"
         "  \"confidence\": 0.0,\n"
         "  \"summary\": \"结论性材料，给 Web 默认展示\",\n"
@@ -1358,6 +1564,7 @@ def _moderator_final_prompt(
     affirmative_result: Path,
     negative_result: Path,
     final_path: Path,
+    attempt_id: str,
 ) -> str:
     return (
         "当前阶段：最终裁决。请遵循本 session 初始 AGENTS.md 中的 Moderator 角色约束，基于正方和反方已保存的结果做最终裁决。\n"
@@ -1370,7 +1577,9 @@ def _moderator_final_prompt(
         f"{final_path}\n\n"
         "JSON schema：\n"
         "{\n"
+        "  \"role\": \"moderator\",\n"
         f"  \"finding_id\": \"{finding.finding_id}\",\n"
+        f"  \"attempt_id\": \"{attempt_id}\",\n"
         "  \"verdict\": \"TRUE_POSITIVE|FALSE_POSITIVE|INCONCLUSIVE\",\n"
         "  \"confidence\": 0.0,\n"
         "  \"reasoning_summary\": \"Web 默认展示的最终摘要\",\n"
@@ -1477,7 +1686,16 @@ def _base_payload(
         "engine": engine,
         "run_dir": str(run_dir),
         "sessions": session_payload,
-        "schedule": "moderator report processing -> affirmative -> negative -> moderator final",
+        "schedule": "3-stage pipeline: affirmative -> negative -> moderator (3 isolated CLI slots)",
+        "pipeline": {
+            "version": 1,
+            "context_mode": "isolated-per-finding-stage",
+            "slot_count": 3,
+            "buffer_capacity": 1,
+            "slots": {role: None for role in PIPELINE_ROLES},
+            "queue_depths": {role: 0 for role in PIPELINE_ROLES},
+            "stage_completed_counts": {role: 0 for role in PIPELINE_ROLES},
+        },
         "watchdog": {
             "silence_reminder_minutes": config.silence_reminder_minutes,
             "reminder_count": 0,
@@ -1502,6 +1720,7 @@ def _base_payload(
         "completed_finding_count": completed_finding_count(resume_reports),
         "current_finding_id": None,
         "current_finding_index": None,
+        "current_finding_ids": {},
         "resume_from_finding_id": (
             resume_reports[resume_index].get("finding_id") if resume_index < len(resume_reports) else None
         ),
@@ -1538,6 +1757,286 @@ def _refresh_cli_session_payload(
     if engine == CODEX_ENGINE:
         payload["codex_sessions"] = session_payload
         payload["codex_workflow"] = workflow
+
+
+def _initialize_pipeline_findings(
+    findings: Sequence[Finding],
+    finding_briefs: Dict[str, Path],
+    run_dir: Path,
+    reports: Sequence[Dict[str, Any]],
+    *,
+    resume: bool,
+) -> List[_PipelineFinding]:
+    items: List[_PipelineFinding] = []
+    for index, finding in enumerate(findings):
+        finding_dir = run_dir / "findings" / _safe_path_part(finding.finding_id)
+        result_paths = {
+            "affirmative": finding_dir / "affirmative" / "result.json",
+            "negative": finding_dir / "negative" / "result.json",
+            "moderator": finding_dir / "moderator" / "final.json",
+        }
+        for path in result_paths.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+        existing = dict(reports[index]) if index < len(reports) and isinstance(reports[index], dict) else {}
+        workflow = existing.get("cli_workflow") if isinstance(existing.get("cli_workflow"), dict) else {}
+        if not workflow and isinstance(existing.get("codex_workflow"), dict):
+            workflow = existing["codex_workflow"]
+        pipeline = workflow.get("pipeline") if isinstance(workflow.get("pipeline"), dict) else {}
+        previous_stages = pipeline.get("stages") if isinstance(pipeline.get("stages"), dict) else {}
+        data: Dict[str, Dict[str, Any]] = {}
+        stages: Dict[str, Dict[str, Any]] = {}
+
+        for role in PIPELINE_ROLES:
+            if not resume:
+                result_paths[role].unlink(missing_ok=True)
+            candidate, _ = _read_json_object(result_paths[role]) if resume else (None, "")
+            if candidate is not None:
+                try:
+                    _validate_pipeline_output(
+                        candidate,
+                        finding_id=finding.finding_id,
+                        role=role,
+                        attempt_id=None,
+                        strict_identity=False,
+                    )
+                except CodexRunnerError:
+                    result_paths[role].unlink(missing_ok=True)
+                    candidate = None
+            if candidate is None and isinstance(workflow.get(role), dict) and workflow.get(role):
+                candidate = dict(workflow[role])
+                try:
+                    _validate_pipeline_output(
+                        candidate,
+                        finding_id=finding.finding_id,
+                        role=role,
+                        attempt_id=None,
+                        strict_identity=False,
+                    )
+                except CodexRunnerError:
+                    candidate = None
+            if candidate is not None:
+                data[role] = candidate
+                if not result_paths[role].exists():
+                    _write_json_object(result_paths[role], candidate)
+
+            previous = previous_stages.get(role) if isinstance(previous_stages.get(role), dict) else {}
+            stages[role] = {
+                "status": "succeeded" if candidate is not None else "pending",
+                "attempt": max(_integer(previous.get("attempt"), 0), 0),
+                "attempt_id": previous.get("attempt_id"),
+                "output_path": str(result_paths[role]),
+                "started_at": previous.get("started_at"),
+                "completed_at": previous.get("completed_at") if candidate is not None else None,
+            }
+
+        if "affirmative" not in data:
+            data.pop("negative", None)
+            data.pop("moderator", None)
+            result_paths["negative"].unlink(missing_ok=True)
+            result_paths["moderator"].unlink(missing_ok=True)
+        elif "negative" not in data:
+            data.pop("moderator", None)
+            result_paths["moderator"].unlink(missing_ok=True)
+        for role in PIPELINE_ROLES:
+            if role not in data:
+                stages[role]["status"] = "pending"
+                stages[role]["completed_at"] = None
+
+        preserved = existing if existing and finding_report_completed(existing) else None
+        items.append(
+            _PipelineFinding(
+                index=index,
+                finding=finding,
+                brief_path=finding_briefs[finding.finding_id],
+                result_paths=result_paths,
+                data=data,
+                stages=stages,
+                preserved_report=preserved,
+            )
+        )
+    return items
+
+
+def _next_pipeline_role(item: _PipelineFinding) -> Optional[str]:
+    if item.preserved_report is not None and finding_report_completed(item.preserved_report):
+        return None
+    for role in PIPELINE_ROLES:
+        if role not in item.data:
+            return role
+    return None
+
+
+def _role_after(role: str) -> Optional[str]:
+    try:
+        index = PIPELINE_ROLES.index(role)
+    except ValueError:
+        return None
+    return PIPELINE_ROLES[index + 1] if index + 1 < len(PIPELINE_ROLES) else None
+
+
+def _clear_pipeline_from(item: _PipelineFinding, role: str) -> None:
+    start = PIPELINE_ROLES.index(role)
+    item.preserved_report = None
+    for downstream in PIPELINE_ROLES[start:]:
+        item.data.pop(downstream, None)
+        item.result_paths[downstream].unlink(missing_ok=True)
+        stage = item.stages[downstream]
+        stage["status"] = "pending"
+        stage["attempt_id"] = None
+        stage["started_at"] = None
+        stage["completed_at"] = None
+
+
+def _pipeline_stage_prompt(
+    *,
+    role: str,
+    item: _PipelineFinding,
+    source_path: Path,
+    attempt_id: str,
+) -> str:
+    if role == "moderator":
+        return _moderator_final_prompt(
+            finding=item.finding,
+            source_path=source_path,
+            brief_path=item.brief_path,
+            affirmative_result=item.result_paths["affirmative"],
+            negative_result=item.result_paths["negative"],
+            final_path=item.result_paths["moderator"],
+            attempt_id=attempt_id,
+        )
+    return _worker_prompt(
+        role=role,
+        finding=item.finding,
+        source_path=source_path,
+        brief_path=item.brief_path,
+        result_path=item.result_paths[role],
+        peer_result_path=item.result_paths["affirmative"] if role == "negative" else None,
+        round_index=item.index + 1,
+        attempt_id=attempt_id,
+    )
+
+
+def _pipeline_report(item: _PipelineFinding) -> Dict[str, Any]:
+    if item.preserved_report is not None and finding_report_completed(item.preserved_report):
+        return dict(item.preserved_report)
+    affirmative = item.data.get("affirmative")
+    negative = item.data.get("negative")
+    final = item.data.get("moderator")
+    if final is not None and affirmative is not None and negative is not None:
+        report = _final_report(item.finding, affirmative, negative, final)
+    elif affirmative is not None or negative is not None:
+        report = _partial_report(item.finding, affirmative, negative, None)
+    else:
+        report = _pending_report(item.finding)
+        if any(stage.get("status") in PIPELINE_ACTIVE_STATUSES for stage in item.stages.values()):
+            report["finding_status"] = FINDING_IN_PROGRESS
+    workflow = dict(report.get("cli_workflow") or {})
+    workflow["pipeline"] = {
+        "version": 1,
+        "stages": {role: dict(item.stages[role]) for role in PIPELINE_ROLES},
+    }
+    report["cli_workflow"] = workflow
+    report["codex_workflow"] = workflow
+    report["finding_stage"] = _finding_stage(item)
+    return report
+
+
+def _finding_stage(item: _PipelineFinding) -> str:
+    if item.preserved_report is not None and finding_report_completed(item.preserved_report):
+        return "completed"
+    if "moderator" in item.data:
+        return "completed"
+    for role in PIPELINE_DOWNSTREAM_ROLES:
+        status = str(item.stages[role].get("status") or "pending")
+        if status in {"running", "failed", "interrupted"}:
+            return f"{role}_{status}"
+    next_role = _next_pipeline_role(item)
+    return f"{next_role}_ready" if next_role else "completed"
+
+
+def _pipeline_snapshot(
+    items: Sequence[_PipelineFinding],
+    ready: Dict[str, deque[int]],
+    active: Dict[str, _ActivePipelineStage],
+) -> Dict[str, Any]:
+    return {
+        "version": 1,
+        "context_mode": "isolated-per-finding-stage",
+        "slot_count": 3,
+        "buffer_capacity": 1,
+        "slots": {
+            role: active[role].item.finding.finding_id if role in active else None
+            for role in PIPELINE_ROLES
+        },
+        "queue_depths": {role: len(ready[role]) for role in PIPELINE_ROLES},
+        "stage_completed_counts": {
+            role: sum(1 for item in items if role in item.data) for role in PIPELINE_ROLES
+        },
+    }
+
+
+def _validate_pipeline_output(
+    data: Dict[str, Any],
+    *,
+    finding_id: str,
+    role: str,
+    attempt_id: Optional[str],
+    strict_identity: bool,
+) -> None:
+    actual_finding = str(data.get("finding_id") or "")
+    actual_role = str(data.get("role") or "")
+    actual_attempt = str(data.get("attempt_id") or "")
+    if (strict_identity or actual_finding) and actual_finding != finding_id:
+        raise CodexRunnerError(f"stage 输出 finding_id 不匹配：期望 {finding_id}，实际 {actual_finding or '<missing>'}")
+    if (strict_identity or actual_role) and actual_role != role:
+        raise CodexRunnerError(f"stage 输出 role 不匹配：期望 {role}，实际 {actual_role or '<missing>'}")
+    if attempt_id is not None and actual_attempt != attempt_id:
+        raise CodexRunnerError(
+            f"stage 输出 attempt_id 不匹配：期望 {attempt_id}，实际 {actual_attempt or '<missing>'}"
+        )
+    decision_key = "verdict" if role == "moderator" else "position"
+    decision = str(data.get(decision_key) or "")
+    if decision and decision not in VERDICTS:
+        raise CodexRunnerError(f"stage 输出 {decision_key} 非法：{decision}")
+    if not decision:
+        raise CodexRunnerError(f"stage 输出缺少 {decision_key}")
+    if "confidence" in data:
+        try:
+            confidence = float(data["confidence"])
+        except (TypeError, ValueError) as exc:
+            raise CodexRunnerError("stage 输出 confidence 必须是数字") from exc
+        if not 0.0 <= confidence <= 1.0:
+            raise CodexRunnerError("stage 输出 confidence 必须位于 0 到 1")
+    elif strict_identity:
+        raise CodexRunnerError("stage 输出缺少 confidence")
+
+
+def _write_json_object(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _integer(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _last_log_sequence(logs_dir: Path, prefix: str) -> int:
+    highest = 0
+    for path in logs_dir.glob(f"{prefix}*.txt"):
+        suffix = path.stem.removeprefix(prefix)
+        try:
+            highest = max(highest, int(suffix))
+        except ValueError:
+            continue
+    return highest
 
 
 def _final_report(
@@ -1667,6 +2166,11 @@ def _reconcile_finding_reports(
         existing = previous.get(finding.finding_id)
         if existing is not None and finding_report_completed(existing):
             existing["finding_status"] = FINDING_COMPLETED
+            reports.append(existing)
+        elif existing is not None:
+            existing["finding_id"] = finding.finding_id
+            existing["rule_id"] = finding.rule_id
+            existing["finding_status"] = FINDING_PENDING
             reports.append(existing)
         else:
             reports.append(_pending_report(finding))
