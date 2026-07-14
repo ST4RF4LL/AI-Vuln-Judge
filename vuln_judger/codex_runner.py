@@ -147,6 +147,7 @@ class CodexTmuxSession:
         self.current_event_path = self.logs_dir / "current.ndjson"
         self._sequence = _last_log_sequence(self.logs_dir, "prompt-")
         self._current_prompt_path: Optional[Path] = None
+        self._current_started_path: Optional[Path] = None
         self._current_event_path: Optional[Path] = None
         self._current_exit_path: Optional[Path] = None
 
@@ -241,10 +242,12 @@ class CodexTmuxSession:
         self._sequence += 1
         prompt_path = self.logs_dir / f"prompt-{self._sequence:04d}.txt"
         event_path = self.logs_dir / f"events-{self._sequence:04d}.ndjson"
+        started_path = self.logs_dir / f"started-{self._sequence:04d}.txt"
         exit_path = self.logs_dir / f"exit-{self._sequence:04d}.txt"
         raw_exit_path = self.logs_dir / f"exit-{self._sequence:04d}.raw"
         prompt_path.write_text(text, encoding="utf-8")
         event_path.unlink(missing_ok=True)
+        started_path.unlink(missing_ok=True)
         exit_path.unlink(missing_ok=True)
         raw_exit_path.unlink(missing_ok=True)
         self.current_event_path.write_text("", encoding="utf-8")
@@ -276,12 +279,20 @@ class CodexTmuxSession:
         args.append("-")
         invocation = shlex.join(args)
         shell = (
-            f"set +e; ({invocation} < {shlex.quote(str(prompt_path))}; "
+            f"set +e; printf '%s\\n' \"$$\" > {shlex.quote(str(started_path))}; "
+            f"({invocation} < {shlex.quote(str(prompt_path))}; "
             f"printf '%s\\n' \"$?\" > {shlex.quote(str(raw_exit_path))}) 2>&1 "
             f"| tee {shlex.quote(str(event_path))} {shlex.quote(str(self.current_event_path))}; "
             f"status=$(cat {shlex.quote(str(raw_exit_path))}); "
             f"printf '%s\\n' \"$status\" > {shlex.quote(str(exit_path))}; exit \"$status\""
         )
+        # Register the task before tmux can start and finish the short-lived window.
+        # Otherwise the pipeline waiter can observe neither the completed task nor its
+        # exit marker and leave the stage incorrectly displayed as running forever.
+        self._current_prompt_path = prompt_path
+        self._current_started_path = started_path
+        self._current_event_path = event_path
+        self._current_exit_path = exit_path
         LOG.info(
             "Codex prompt 发送",
             extra={
@@ -310,9 +321,13 @@ class CodexTmuxSession:
             ],
             timeout=15,
         )
-        self._current_prompt_path = prompt_path
-        self._current_event_path = event_path
-        self._current_exit_path = exit_path
+        _wait_for_cli_task_start(
+            label=f"Codex {self.role}",
+            started_path=started_path,
+            event_path=event_path,
+            exit_path=exit_path,
+            is_running=lambda: _tmux_window_live(self.session_name, "run"),
+        )
 
     def capture(self, lines: int = 240) -> str:
         if self._current_event_path:
@@ -327,7 +342,15 @@ class CodexTmuxSession:
         return token, _tmux_window_live(self.session_name, "run")
 
     def failure_message(self) -> Optional[str]:
-        if not self.task_finished() or self._current_exit_path is None:
+        if _tmux_window_live(self.session_name, "run"):
+            return None
+        if (
+            self._current_started_path
+            and self._current_started_path.exists()
+            and (self._current_exit_path is None or not self._current_exit_path.exists())
+        ):
+            return f"Codex exec 异常终止，未写入退出码；{self.capture(30)}"
+        if self._current_exit_path is None or not self._current_exit_path.exists():
             return None
         try:
             exit_code = int(self._current_exit_path.read_text(encoding="utf-8").strip())
@@ -339,9 +362,11 @@ class CodexTmuxSession:
 
     def task_finished(self) -> bool:
         return bool(
-            self._current_exit_path
-            and self._current_exit_path.exists()
-            and not _tmux_window_live(self.session_name, "run")
+            not _tmux_window_live(self.session_name, "run")
+            and (
+                (self._current_exit_path and self._current_exit_path.exists())
+                or (self._current_started_path and self._current_started_path.exists())
+            )
         )
 
 
@@ -734,7 +759,7 @@ class CliDrivenRunner:
                     _clear_pipeline_from(item, role)
                     attempt_id = uuid.uuid4().hex
                     stage = item.stages[role]
-                    stage["status"] = "running"
+                    stage["status"] = "dispatching"
                     stage["attempt"] = int(stage.get("attempt") or 0) + 1
                     stage["attempt_id"] = attempt_id
                     stage["started_at"] = _now()
@@ -751,6 +776,7 @@ class CliDrivenRunner:
                         stage["status"] = "failed"
                         stage["completed_at"] = _now()
                         raise
+                    stage["status"] = "running"
                     future = executor.submit(execute_stage, role, item, prompt, attempt_id)
                     active[role] = _ActivePipelineStage(role, item, attempt_id, future)
                     changed = True
@@ -1177,6 +1203,36 @@ def _tmux_window_live(session_name: str, window_name: str) -> bool:
         check=False,
     )
     return result.returncode == 0 and window_name in (result.stdout or "").splitlines()
+
+
+def _wait_for_cli_task_start(
+    *,
+    label: str,
+    started_path: Path,
+    event_path: Path,
+    exit_path: Path,
+    is_running: Callable[[], bool],
+) -> None:
+    """Wait until the detached tmux shell proves it actually started."""
+
+    try:
+        timeout = float(os.environ.get("VULN_JUDGER_CLI_START_TIMEOUT", "5"))
+    except ValueError:
+        timeout = 5.0
+    deadline = time.monotonic() + max(timeout, 0.1)
+    running = False
+    while time.monotonic() < deadline:
+        if started_path.exists() or exit_path.exists():
+            return
+        try:
+            if event_path.exists() and event_path.stat().st_size > 0:
+                return
+        except OSError:
+            pass
+        running = is_running()
+        time.sleep(0.05)
+    state = "run 窗口仍存在" if running or is_running() else "run 窗口已退出"
+    raise CodexRunnerError(f"{label} 任务未确认启动（{state}）：{started_path}")
 
 
 def _tail_file(path: Path, lines: int) -> str:

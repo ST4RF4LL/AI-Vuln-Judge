@@ -40,6 +40,7 @@ from vuln_judger.codex_runner import (
     _ensure_codex_project_trust,
     _prepare_codex_agent_dirs,
     _validate_pipeline_output,
+    _wait_for_cli_task_start,
     _wait_json,
 )
 from vuln_judger.agents import AgentDirectoryStore
@@ -2269,8 +2270,17 @@ for raw in sys.stdin.buffer:
                 command="codex",
             )
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+            def run_tmux(args, **_kwargs):
+                if "new-window" in args:
+                    self.assertIsNotNone(session._current_started_path)
+                    self.assertIsNotNone(session._current_event_path)
+                    self.assertIsNotNone(session._current_exit_path)
+                    session._current_started_path.write_text("123\n", encoding="utf-8")
+                return completed
+
             with patch.object(session, "is_live", return_value=True), patch(
-                "vuln_judger.codex_runner._run_tmux", return_value=completed
+                "vuln_judger.codex_runner._run_tmux", side_effect=run_tmux
             ) as run_tmux:
                 session.send("line one\r\nline two")
 
@@ -2283,8 +2293,49 @@ for raw in sys.stdin.buffer:
             self.assertIn("--json", shell)
             self.assertIn("--skip-git-repo-check", shell)
             self.assertIn("--dangerously-bypass-approvals-and-sandbox", shell)
+            self.assertIn("started-0001.txt", shell)
             self.assertNotIn("paste-buffer", shell)
             self.assertNotIn("send-keys", shell)
+
+    def test_cli_launch_without_start_marker_fails_instead_of_stalling_pipeline(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"VULN_JUDGER_CLI_START_TIMEOUT": "0.01"},
+        ):
+            root = Path(tmp)
+            with self.assertRaisesRegex(CodexRunnerError, "正方 任务未确认启动"):
+                _wait_for_cli_task_start(
+                    label="Codex 正方",
+                    started_path=root / "started.txt",
+                    event_path=root / "events.ndjson",
+                    exit_path=root / "exit.txt",
+                    is_running=lambda: False,
+                )
+
+    def test_codex_missing_exit_marker_is_reported_as_finished_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = CodexTmuxSession(
+                role="affirmative",
+                run_id="run-1",
+                cwd=root,
+                source_path=root,
+                run_dir=root,
+                command="codex",
+            )
+            session.logs_dir.mkdir()
+            session._current_started_path = session.logs_dir / "started-0001.txt"
+            session._current_started_path.write_text("123\n", encoding="utf-8")
+            session._current_event_path = session.logs_dir / "events-0001.ndjson"
+            session._current_event_path.write_text("partial output\n", encoding="utf-8")
+            session._current_exit_path = session.logs_dir / "exit-0001.txt"
+
+            with patch("vuln_judger.codex_runner._tmux_window_live", return_value=False):
+                self.assertTrue(session.task_finished())
+                failure = session.failure_message()
+
+            self.assertIn("异常终止", failure)
+            self.assertIn("partial output", failure)
 
     def test_pipeline_output_identity_rejects_cross_finding_or_attempt(self):
         valid = {
@@ -5874,6 +5925,8 @@ class OpenCodeRunnerTests(unittest.TestCase):
             ) as create_session, patch(
                 "vuln_judger.opencode_runner._wait_for_opencode_tui"
             ), patch(
+                "vuln_judger.opencode_runner._wait_for_cli_task_start"
+            ), patch(
                 "vuln_judger.opencode_runner._run_tmux", return_value=completed
             ) as run_tmux:
                 session.send("first prompt")
@@ -5891,6 +5944,8 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertIn("--dangerously-skip-permissions", shell)
             self.assertIn("--session ses-2", shell)
             self.assertIn("--model openai/gpt-5", shell)
+            self.assertIn("'second prompt'", shell)
+            self.assertNotIn("< ", shell)
             self.assertNotIn("paste-buffer", shell)
             self.assertNotIn("send-keys", shell)
             self.assertEqual(create_session.call_count, 2)
@@ -5951,6 +6006,8 @@ class OpenCodeRunnerTests(unittest.TestCase):
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
             with patch("vuln_judger.opencode_runner._tmux_target_live", return_value=False), patch(
                 "vuln_judger.opencode_runner._create_opencode_session", return_value="ses-new"
+            ), patch(
+                "vuln_judger.opencode_runner._wait_for_cli_task_start"
             ), patch(
                 "vuln_judger.opencode_runner._run_tmux", return_value=completed
             ) as run_tmux:

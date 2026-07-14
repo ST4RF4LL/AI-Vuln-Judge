@@ -26,6 +26,7 @@ from .codex_runner import (
     _cli_agent_file_text,
     _run_tmux,
     _safe_tmux_name,
+    _wait_for_cli_task_start,
 )
 from .logging_config import logger
 from .models import AgentConfig, RunConfig
@@ -93,6 +94,7 @@ class OpenCodeTmuxSession:
         self.state_path = self.logs_dir / "session.json"
         self._sequence = 0
         self._current_prompt_path: Optional[Path] = None
+        self._current_started_path: Optional[Path] = None
         self._current_event_path: Optional[Path] = None
         self._current_exit_path: Optional[Path] = None
         self._provider_session_id: Optional[str] = None
@@ -207,9 +209,11 @@ class OpenCodeTmuxSession:
         self._sequence += 1
         prompt_path = self.logs_dir / f"prompt-{self._sequence:04d}.txt"
         event_path = self.logs_dir / f"events-{self._sequence:04d}.ndjson"
+        started_path = self.logs_dir / f"started-{self._sequence:04d}.txt"
         exit_path = self.logs_dir / f"exit-{self._sequence:04d}.txt"
         prompt_path.write_text(text, encoding="utf-8")
         event_path.unlink(missing_ok=True)
+        started_path.unlink(missing_ok=True)
         exit_path.unlink(missing_ok=True)
 
         args = [
@@ -232,12 +236,20 @@ class OpenCodeTmuxSession:
         if self._provider_session_id:
             args.extend(["--session", self._provider_session_id])
 
-        invocation = _shell_command(args)
+        # OpenCode defines the task as a positional `message`. Passing it explicitly
+        # avoids a detached tmux process treating stdin as received input without
+        # reliably submitting it to the agent loop.
+        invocation = _shell_command([*args, "--", text])
         shell = (
-            f"set +e; {invocation} < {shlex.quote(str(prompt_path))} "
+            f"set +e; printf '%s\\n' \"$$\" > {shlex.quote(str(started_path))}; "
+            f"{invocation} "
             f"> {shlex.quote(str(event_path))} 2>&1; status=$?; "
             f"printf '%s\\n' \"$status\" > {shlex.quote(str(exit_path))}; exit \"$status\""
         )
+        self._current_event_path = event_path
+        self._current_exit_path = exit_path
+        self._current_prompt_path = prompt_path
+        self._current_started_path = started_path
         _run_tmux(
             [
                 "tmux",
@@ -255,9 +267,13 @@ class OpenCodeTmuxSession:
             ],
             timeout=15,
         )
-        self._current_event_path = event_path
-        self._current_exit_path = exit_path
-        self._current_prompt_path = prompt_path
+        _wait_for_cli_task_start(
+            label=f"OpenCode {self.role}",
+            started_path=started_path,
+            event_path=event_path,
+            exit_path=exit_path,
+            is_running=lambda: _tmux_target_live(self.run_target),
+        )
         self._save_state()
         LOG.info(
             "OpenCode prompt sent",
@@ -288,7 +304,16 @@ class OpenCodeTmuxSession:
         return token, _tmux_target_live(self.run_target)
 
     def failure_message(self) -> Optional[str]:
-        if _tmux_target_live(self.run_target) or self._current_exit_path is None:
+        if _tmux_target_live(self.run_target):
+            return None
+        if (
+            self._current_started_path
+            and self._current_started_path.exists()
+            and (self._current_exit_path is None or not self._current_exit_path.exists())
+        ):
+            detail = _tail_text(self._current_event_path, 30) if self._current_event_path else ""
+            return f"OpenCode run 异常终止，未写入退出码；{detail}"
+        if self._current_exit_path is None or not self._current_exit_path.exists():
             return None
         try:
             exit_code = int(self._current_exit_path.read_text(encoding="utf-8").strip())
@@ -312,6 +337,7 @@ class OpenCodeTmuxSession:
                     _run_tmux(["tmux", "kill-window", "-t", self.target], timeout=10, check=False)
                 self._provider_session_id = None
                 self._current_prompt_path = None
+                self._current_started_path = None
                 self._current_event_path = None
                 self._current_exit_path = None
                 self._ensure_provider_session()
@@ -322,9 +348,11 @@ class OpenCodeTmuxSession:
 
     def task_finished(self) -> bool:
         return bool(
-            self._current_exit_path
-            and self._current_exit_path.exists()
-            and not _tmux_target_live(self.run_target)
+            not _tmux_target_live(self.run_target)
+            and (
+                (self._current_exit_path and self._current_exit_path.exists())
+                or (self._current_started_path and self._current_started_path.exists())
+            )
         )
 
     def _load_state(self) -> None:
@@ -343,9 +371,11 @@ class OpenCodeTmuxSession:
         if isinstance(port, int) and 0 < port < 65536:
             self._port = port
         event_log = _text(state.get("event_log"))
+        started_log = _text(state.get("started_log"))
         exit_log = _text(state.get("exit_log"))
         prompt_log = _text(state.get("prompt_log"))
         self._current_prompt_path = Path(prompt_log) if prompt_log else None
+        self._current_started_path = Path(started_log) if started_log else None
         self._current_event_path = Path(event_log) if event_log else None
         self._current_exit_path = Path(exit_log) if exit_log else None
 
@@ -357,6 +387,7 @@ class OpenCodeTmuxSession:
             "server_url": self.server_url,
             "provider_session_id": self._provider_session_id,
             "prompt_log": str(self._current_prompt_path) if self._current_prompt_path else None,
+            "started_log": str(self._current_started_path) if self._current_started_path else None,
             "event_log": str(self._current_event_path) if self._current_event_path else None,
             "exit_log": str(self._current_exit_path) if self._current_exit_path else None,
             "version": self.capabilities.version,
