@@ -2194,6 +2194,7 @@ for raw in sys.stdin.buffer:
             "moderator",
             {
                 "backend": "codex",
+                "transport": "exec-ephemeral-json",
                 "target": "vj-run-1-moderator:slot",
                 "session_name": "vj-run-1-moderator",
             },
@@ -2208,6 +2209,25 @@ for raw in sys.stdin.buffer:
         self.assertNotIn('new TerminalCtor(', html)
         self.assertNotIn('new WebSocket(', html)
         self.assertNotIn('id="message-form"', html)
+
+    def test_codex_terminal_page_uses_bidirectional_native_tui(self):
+        html = _codex_terminal_page(
+            "run-1",
+            "affirmative",
+            {
+                "backend": "codex",
+                "transport": "tmux-tui",
+                "target": "vj-run-1-affirmative:codex",
+                "session_name": "vj-run-1-affirmative",
+            },
+        )
+
+        self.assertIn('/runs/run-1/cli-sessions/affirmative/ws', html)
+        self.assertIn('/static/vendor/xterm/xterm.js', html)
+        self.assertIn('new WebSocket(', html)
+        self.assertIn('term.onData(data =>', html)
+        self.assertIn('原生 tmux TUI', html)
+        self.assertNotIn('data-log-mode="readable"', html)
 
     def test_codex_ndjson_is_rendered_as_readable_execution_log(self):
         raw = "\n".join(
@@ -2298,6 +2318,7 @@ for raw in sys.stdin.buffer:
                     "cli_sessions": [
                         {
                             "backend": "codex",
+                            "transport": "exec-ephemeral-json",
                             "role": "moderator",
                             "session_name": "vj-run-log-moderator",
                             "target": "vj-run-log-moderator:slot",
@@ -2373,7 +2394,7 @@ for raw in sys.stdin.buffer:
         self.assertEqual(sessions.call_count, 2)
         stop.assert_called_once()
 
-    def test_codex_start_creates_persistent_observer_slot(self):
+    def test_codex_start_creates_native_tui_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "source"
@@ -2389,20 +2410,27 @@ for raw in sys.stdin.buffer:
                 command="codex",
             )
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
-            with patch.object(session, "is_live", return_value=False), patch(
+            with patch.object(session, "is_live", return_value=False), patch.object(
+                session, "_accept_trust_prompt"
+            ), patch.object(
+                session, "_wait_until_input_ready"
+            ), patch(
                 "vuln_judger.codex_runner._run_tmux", return_value=completed
             ) as run_tmux:
                 session.start()
 
             launch_args = run_tmux.call_args.args[0]
             self.assertIn("new-session", launch_args)
-            self.assertIn("slot", launch_args)
-            self.assertIn("tail -n 200 -F", launch_args[-1])
-            self.assertNotIn("codex", launch_args)
-            self.assertEqual(session.info().transport, "exec-ephemeral-json")
-            self.assertEqual(Path(session.info().event_log), session.current_event_path)
+            self.assertIn("codex", launch_args)
+            self.assertIn("--no-alt-screen", launch_args)
+            self.assertIn("--dangerously-bypass-approvals-and-sandbox", launch_args)
+            self.assertNotIn("exec", launch_args)
+            self.assertNotIn("--json", launch_args)
+            self.assertEqual(session.target, "vj-run-1-moderator:codex")
+            self.assertEqual(session.info().transport, "tmux-tui")
+            self.assertIsNone(session.info().event_log)
 
-    def test_codex_send_uses_ephemeral_exec_with_prompt_file(self):
+    def test_codex_send_respawns_native_tui_and_uses_bracketed_paste(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "source"
@@ -2419,32 +2447,49 @@ for raw in sys.stdin.buffer:
             )
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
 
-            def run_tmux(args, **_kwargs):
-                if "new-window" in args:
-                    self.assertIsNotNone(session._current_started_path)
-                    self.assertIsNotNone(session._current_event_path)
-                    self.assertIsNotNone(session._current_exit_path)
-                    session._current_started_path.write_text("123\n", encoding="utf-8")
-                return completed
-
             with patch.object(session, "is_live", return_value=True), patch(
-                "vuln_judger.codex_runner._run_tmux", side_effect=run_tmux
-            ) as run_tmux:
+                "vuln_judger.codex_runner._tmux_target_live", return_value=True
+            ), patch.object(
+                session, "_accept_trust_prompt"
+            ), patch.object(
+                session, "_wait_until_input_ready"
+            ), patch.object(
+                session, "_wait_until_task_started"
+            ) as wait_started, patch(
+                "vuln_judger.codex_runner.subprocess.run", return_value=completed
+            ) as run, patch(
+                "vuln_judger.codex_runner._run_tmux", return_value=completed
+            ) as run_tmux, patch.dict(
+                os.environ,
+                {"VULN_JUDGER_CODEX_PASTE_SETTLE": "0", "VULN_JUDGER_CODEX_SUBMIT_KEY": "C-m"},
+                clear=False,
+            ):
                 session.send("line one\r\nline two")
 
-            self.assertEqual(session._current_prompt_path.read_text(encoding="utf-8"), "line one\nline two")
-            self.assertNotIn(b"\r", session._current_prompt_path.read_bytes())
-            launch = run_tmux.call_args_list[-1].args[0]
-            self.assertIn("new-window", launch)
-            shell = launch[-1]
-            self.assertIn("codex exec", shell)
-            self.assertIn("--ephemeral", shell)
-            self.assertIn("--json", shell)
-            self.assertIn("--skip-git-repo-check", shell)
-            self.assertIn("--dangerously-bypass-approvals-and-sandbox", shell)
-            self.assertIn("started-0001.txt", shell)
-            self.assertNotIn("paste-buffer", shell)
-            self.assertNotIn("send-keys", shell)
+            self.assertEqual(run.call_args.kwargs["input"], "line one\nline two")
+            tmux_calls = [call.args[0] for call in run_tmux.call_args_list]
+            respawn = next(args for args in tmux_calls if "respawn-pane" in args)
+            self.assertIn("-k", respawn)
+            self.assertIn(session.target, respawn)
+            self.assertIn("codex", respawn)
+            self.assertIn("--no-alt-screen", respawn)
+            self.assertNotIn("exec", respawn)
+            self.assertIn(
+                [
+                    "tmux",
+                    "paste-buffer",
+                    "-d",
+                    "-p",
+                    "-r",
+                    "-b",
+                    "vj-run-1-moderator-input",
+                    "-t",
+                    session.target,
+                ],
+                tmux_calls,
+            )
+            self.assertIn(["tmux", "send-keys", "-t", session.target, "C-m"], tmux_calls)
+            wait_started.assert_called_once()
 
     def test_cli_launch_without_start_marker_fails_instead_of_stalling_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -2461,7 +2506,7 @@ for raw in sys.stdin.buffer:
                     is_running=lambda: False,
                 )
 
-    def test_codex_missing_exit_marker_is_reported_as_finished_failure(self):
+    def test_codex_tui_exit_during_task_is_reported_as_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             session = CodexTmuxSession(
@@ -2472,19 +2517,14 @@ for raw in sys.stdin.buffer:
                 run_dir=root,
                 command="codex",
             )
-            session.logs_dir.mkdir()
-            session._current_started_path = session.logs_dir / "started-0001.txt"
-            session._current_started_path.write_text("123\n", encoding="utf-8")
-            session._current_event_path = session.logs_dir / "events-0001.ndjson"
-            session._current_event_path.write_text("partial output\n", encoding="utf-8")
-            session._current_exit_path = session.logs_dir / "exit-0001.txt"
+            session._task_started = True
 
-            with patch("vuln_judger.codex_runner._tmux_window_live", return_value=False):
-                self.assertTrue(session.task_finished())
+            with patch("vuln_judger.codex_runner._tmux_target_live", return_value=False):
+                self.assertFalse(session.task_finished())
                 failure = session.failure_message()
 
-            self.assertIn("异常终止", failure)
-            self.assertIn("partial output", failure)
+            self.assertIn("任务执行期间退出", failure)
+            self.assertIn(session.target, failure)
 
     def test_pipeline_output_identity_rejects_cross_finding_or_attempt(self):
         valid = {
@@ -2688,7 +2728,7 @@ for raw in sys.stdin.buffer:
 
             self.assertEqual(session.sent, [])
 
-    def test_wait_json_redelivers_full_prompt_when_session_exited(self):
+    def test_wait_json_does_not_redeliver_prompt_when_session_exited(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "findings.json"
             events = []
@@ -2712,23 +2752,23 @@ for raw in sys.stdin.buffer:
                     output.write_text('{"findings":[]}\n', encoding="utf-8")
 
             session = ExitedSession()
-            result = _wait_json(
-                output,
-                should_stop=None,
-                timeout_seconds=1,
-                reminder_session=session,
-                stage_prompt="full moderator prompt",
-                silence_reminder_seconds=0.02,
-                watchdog_callback=events.append,
-                poll_interval_seconds=0.002,
-                activity_poll_seconds=0.01,
-            )
+            with self.assertRaises(CodexRunnerError):
+                _wait_json(
+                    output,
+                    should_stop=None,
+                    timeout_seconds=0.06,
+                    reminder_session=session,
+                    stage_prompt="full moderator prompt",
+                    silence_reminder_seconds=0.02,
+                    watchdog_callback=events.append,
+                    poll_interval_seconds=0.002,
+                    activity_poll_seconds=0.01,
+                )
 
-            self.assertEqual(result, {"findings": []})
-            self.assertEqual(session.sent, ["full moderator prompt"])
-            self.assertEqual(events[0]["kind"], "prompt_redelivered")
+            self.assertEqual(session.sent, [])
+            self.assertEqual(events, [])
 
-    def test_wait_json_redelivers_full_prompt_for_idle_isolated_transport(self):
+    def test_wait_json_only_sends_silence_reminder_for_idle_isolated_transport(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             previous = root / "previous.json"
@@ -2770,8 +2810,56 @@ for raw in sys.stdin.buffer:
             )
 
             self.assertEqual(result, {"summary": "recovered"})
-            self.assertEqual(session.sent, ["full isolated stage prompt"])
-            self.assertEqual(events[0]["kind"], "prompt_redelivered")
+            self.assertEqual(session.sent, [SILENCE_REMINDER_PROMPT])
+            self.assertEqual(events[0]["kind"], "reminder")
+
+    def test_wait_json_accepts_valid_pipeline_output_while_opencode_is_retrying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            expected = {
+                "finding_id": "finding-1",
+                "role": "affirmative",
+                "attempt_id": "attempt-1",
+                "position": "TRUE_POSITIVE",
+                "confidence": 0.9,
+            }
+            output.write_text(json.dumps(expected), encoding="utf-8")
+
+            class RetryingSession:
+                role = "affirmative"
+
+                def __init__(self):
+                    self.accepted = 0
+
+                def task_finished(self):
+                    return False
+
+                def accept_output(self):
+                    self.accepted += 1
+
+            session = RetryingSession()
+
+            def validate(data):
+                _validate_pipeline_output(
+                    data,
+                    finding_id="finding-1",
+                    role="affirmative",
+                    attempt_id="attempt-1",
+                    strict_identity=True,
+                )
+
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                validator=validate,
+                complete_on_valid=True,
+                poll_interval_seconds=0.002,
+            )
+
+            self.assertEqual(result, expected)
+            self.assertEqual(session.accepted, 1)
 
     def test_codex_project_trust_is_written_for_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6181,7 +6269,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
         self.assertIn("退出码 1", failure)
         self.assertIn("authentication failed", failure)
 
-    def test_opencode_invalid_session_retries_without_session_id(self):
+    def test_opencode_invalid_session_is_reported_without_prompt_redelivery(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             cwd = root / "role"
@@ -6207,22 +6295,53 @@ class OpenCodeRunnerTests(unittest.TestCase):
             session._current_prompt_path = prompt_path
             session._current_event_path = event_path
             session._current_exit_path = exit_path
-            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
             with patch("vuln_judger.opencode_runner._tmux_target_live", return_value=False), patch(
-                "vuln_judger.opencode_runner._create_opencode_session", return_value="ses-new"
-            ), patch(
-                "vuln_judger.opencode_runner._wait_for_cli_task_start"
-            ), patch(
-                "vuln_judger.opencode_runner._run_tmux", return_value=completed
-            ) as run_tmux:
+                "vuln_judger.opencode_runner._create_opencode_session"
+            ) as create_session, patch.object(session, "_launch_prompt") as launch_prompt:
                 failure = session.failure_message()
 
-            self.assertIsNone(failure)
-            self.assertEqual(session._provider_session_id, "ses-new")
-            shell = run_tmux.call_args.args[0][-1]
-            self.assertNotIn("--session-id ses-old", shell)
-            self.assertIn("--session-id ses-new", shell)
-            self.assertEqual(session._current_prompt_path.read_text(encoding="utf-8"), "resume this stage")
+            self.assertIn("退出码 1", failure)
+            self.assertIn("Session not found", failure)
+            self.assertEqual(session._provider_session_id, "ses-old")
+            create_session.assert_not_called()
+            launch_prompt.assert_not_called()
+
+    def test_opencode_accept_output_aborts_turn_and_releases_worker_slot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "role"
+            cwd.mkdir()
+            session = OpenCodeTmuxSession(
+                role="negative",
+                run_id="run-1",
+                cwd=cwd,
+                source_path=root,
+                run_dir=root,
+                command="opencode",
+                capabilities=OpenCodeCapabilities("1.17.15"),
+            )
+            session.logs_dir.mkdir()
+            session._provider_session_id = "ses-active"
+            session._current_exit_path = session.logs_dir / "exit-0001.txt"
+
+            def target_live(target):
+                return target in {session.server_target, session.run_target}
+
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+            with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
+                "vuln_judger.opencode_runner._abort_opencode_session"
+            ) as abort, patch(
+                "vuln_judger.opencode_runner._run_tmux", return_value=completed
+            ) as run_tmux:
+                session.accept_output()
+
+            abort.assert_called_once_with(session.server_url, "ses-active", session.cwd)
+            run_tmux.assert_called_once_with(
+                ["tmux", "kill-window", "-t", session.run_target],
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(session._current_exit_path.read_text(encoding="utf-8"), "0\n")
 
     def test_opencode_tui_session_rotation_respawns_stable_pane(self):
         with tempfile.TemporaryDirectory() as tmp:

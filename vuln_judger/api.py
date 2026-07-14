@@ -462,7 +462,8 @@ def make_handler(
                     if parts[4] == "terminal-ui":
                         self._html(_codex_terminal_page(parts[1], parts[3], session))
                         return
-                    if backend != OPENCODE_ENGINE:
+                    accepts_input = _cli_session_accepts_input(terminal_payload, session)
+                    if backend == CODEX_ENGINE and not accepts_input:
                         self._json(
                             {"error": "Codex 使用持久化执行日志，不提供 tmux WebSocket"},
                             HTTPStatus.CONFLICT,
@@ -471,7 +472,7 @@ def make_handler(
                     attach_session_websocket(
                         self,
                         target,
-                        read_only=True,
+                        read_only=backend == OPENCODE_ENGINE,
                     )
                     return
                 if len(parts) == 3 and parts[2] == "export":
@@ -1141,21 +1142,28 @@ def _cli_session_accepts_input(payload: dict, session: dict) -> bool:
     return str(session.get("transport") or "tmux-tui") == "tmux-tui"
 
 
+def _codex_uses_event_log(session: dict) -> bool:
+    return str(session.get("transport") or "tmux-tui") == "exec-ephemeral-json"
+
+
 def _codex_session_terminal(payload: dict, role: str) -> dict:
     session = _codex_session_for_role(payload, role)
     if session is None:
         return {"error": "Codex session 未找到", "role": role, "live": False, "output": ""}
     target = str(session.get("target") or session.get("session_name") or "")
-    output = _codex_event_log(session)
-    return {
+    event_log = _codex_uses_event_log(session)
+    output = _codex_event_log(session) if event_log else capture_session(target)
+    result = {
         "role": session.get("role"),
         "session_name": session.get("session_name"),
         "window_name": session.get("window_name"),
         "target": target,
         "live": session_live(target),
         "output": output,
-        "formatted_output": format_codex_ndjson(output),
     }
+    if event_log:
+        result["formatted_output"] = format_codex_ndjson(output)
+    return result
 
 
 def _cli_session_terminal(payload: dict, role: str) -> dict:
@@ -1164,7 +1172,8 @@ def _cli_session_terminal(payload: dict, role: str) -> dict:
         return {"error": "CLI session 未找到", "role": role, "live": False, "output": ""}
     target = str(session.get("target") or session.get("session_name") or "")
     backend = str(session.get("backend") or payload.get("engine") or "")
-    output = _codex_event_log(session) if backend == CODEX_ENGINE else capture_session(target)
+    event_log = backend == CODEX_ENGINE and _codex_uses_event_log(session)
+    output = _codex_event_log(session) if event_log else capture_session(target)
     result = {
         "role": session.get("role"),
         "backend": backend,
@@ -1174,7 +1183,7 @@ def _cli_session_terminal(payload: dict, role: str) -> dict:
         "live": session_live(target),
         "output": output,
     }
-    if backend == CODEX_ENGINE:
+    if event_log:
         result["formatted_output"] = format_codex_ndjson(output)
     return result
 
@@ -1253,7 +1262,99 @@ def _codex_terminal_page(run_id: str, role: str, session: dict) -> str:
     backend = str(session.get("backend") or CODEX_ENGINE)
     if backend == OPENCODE_ENGINE:
         return _opencode_terminal_page(run_id, role, label, target)
+    if not _codex_uses_event_log(session):
+        return _codex_native_terminal_page(run_id, role, label, target)
     return _codex_log_page(run_id, role, label, target)
+
+
+def _codex_native_terminal_page(run_id: str, role: str, label: str, target: str) -> str:
+    websocket_path = f"/runs/{run_id}/cli-sessions/{role}/ws"
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(label)} · Codex TUI</title>
+  <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
+  <style>
+    html, body {{ height: 100%; margin: 0; background: #0d1117; color: #c9d1d9; }}
+    body {{ display: grid; grid-template-rows: auto minmax(0, 1fr); font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    header {{ display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #30363d; background: #161b22; }}
+    h1 {{ margin: 0; font-size: 14px; font-weight: 650; }}
+    .meta {{ color: #8b949e; font-size: 12px; overflow-wrap: anywhere; }}
+    #terminal {{ min-height: 0; height: 100%; padding: 8px; box-sizing: border-box; }}
+    .xterm {{ height: 100%; }}
+    .error {{ color: #ff7b72; padding: 12px; white-space: pre-wrap; }}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>{escape(label)} Codex TUI</h1>
+      <div class="meta">{escape(run_id)} · {escape(target)}</div>
+    </div>
+    <div class="meta">原生 tmux TUI · stage 切换时重置上下文</div>
+  </header>
+  <div id="terminal"></div>
+  <script src="/static/vendor/xterm/xterm.js"></script>
+  <script src="/static/vendor/xterm/addon-fit.js"></script>
+  <script>
+    const websocketPath = {json.dumps(websocket_path)};
+    const terminalNode = document.getElementById('terminal');
+    const TerminalCtor = window.Terminal;
+    const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
+    function websocketURL(path) {{
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${{protocol}}//${{window.location.host}}${{path}}`;
+    }}
+    if (!TerminalCtor || !FitAddonCtor) {{
+      terminalNode.innerHTML = '<div class="error">xterm.js 未加载，无法打开 Codex TUI。</div>';
+    }} else {{
+      const term = new TerminalCtor({{
+        cursorBlink: true,
+        fontSize: 14,
+        fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
+        scrollback: 10000,
+        theme: {{
+          background: '#0d1117',
+          foreground: '#c9d1d9',
+          cursor: '#58a6ff',
+          selectionBackground: '#264f78'
+        }}
+      }});
+      const fitAddon = new FitAddonCtor();
+      term.loadAddon(fitAddon);
+      term.open(terminalNode);
+      const ws = new WebSocket(websocketURL(websocketPath));
+      ws.binaryType = 'arraybuffer';
+      function sendResize() {{
+        if (ws.readyState !== WebSocket.OPEN) return;
+        fitAddon.fit();
+        ws.send(JSON.stringify({{ type: 'resize', rows: term.rows, cols: term.cols }}));
+      }}
+      ws.onopen = () => {{
+        sendResize();
+        term.focus();
+      }};
+      ws.onmessage = event => {{
+        if (event.data instanceof ArrayBuffer) term.write(new Uint8Array(event.data));
+        else if (event.data instanceof Blob) {{
+          event.data.arrayBuffer().then(buffer => term.write(new Uint8Array(buffer)));
+        }}
+      }};
+      ws.onclose = () => term.write('\\r\\n\\x1b[33m[tmux connection closed]\\x1b[0m\\r\\n');
+      ws.onerror = () => term.write('\\r\\n\\x1b[31m[websocket error]\\x1b[0m\\r\\n');
+      term.onData(data => {{
+        if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({{ type: 'input', data }}));
+      }});
+      const resizeObserver = new ResizeObserver(() => setTimeout(sendResize, 50));
+      resizeObserver.observe(terminalNode);
+      window.addEventListener('beforeunload', () => ws.close());
+      requestAnimationFrame(sendResize);
+    }}
+  </script>
+</body>
+</html>"""
 
 
 def _opencode_terminal_page(run_id: str, role: str, label: str, target: str) -> str:
@@ -4710,13 +4811,18 @@ def app_html() -> str:
       if (!sessions.length) return '';
       const liveCount = sessions.filter(session => session.live).length;
       const backend = run.engine === 'opencode' ? 'OpenCode' : 'Codex';
-      const labels = backend === 'Codex'
-        ? {{ moderator: 'Moderator 日志', affirmative: '正方日志', negative: '反方日志' }}
-        : {{ moderator: 'Moderator 终端', affirmative: '正方终端', negative: '反方终端' }};
+      const roleLabels = {{ moderator: 'Moderator', affirmative: '正方', negative: '反方' }};
       return `<div><strong>CLI Sessions：</strong><div class="codex-session-buttons">
-        ${{sessions.map(session => `<button type="button" title="${{backend === 'Codex' ? '在当前页面打开 Codex 隔离执行日志' : '在当前页面打开 OpenCode 隔离任务会话'}}" data-run-id="${{esc(run.run_id)}}" data-codex-terminal-role="${{esc(session.role || '')}}" data-cli-backend="${{esc(session.backend || run.engine || '')}}">
-          ${{esc(labels[session.role] || session.role || backend)}}${{session.live ? ' · live' : ''}}
-        </button>`).join('')}}
+        ${{sessions.map(session => {{
+          const codexLog = backend === 'Codex' && session.transport === 'exec-ephemeral-json';
+          const kind = backend === 'OpenCode' || !codexLog ? '终端' : '日志';
+          const title = backend === 'OpenCode'
+            ? '在当前页面打开 OpenCode 隔离任务会话'
+            : (codexLog ? '在当前页面打开 Codex 隔离执行日志' : '在当前页面打开原生 Codex TUI');
+          return `<button type="button" title="${{title}}" data-run-id="${{esc(run.run_id)}}" data-codex-terminal-role="${{esc(session.role || '')}}" data-cli-backend="${{esc(session.backend || run.engine || '')}}">
+            ${{esc(roleLabels[session.role] || session.role || backend)}}${{kind}}${{session.live ? ' · live' : ''}}
+          </button>`;
+        }}).join('')}}
         <button type="button" class="danger-button" title="${{backend === 'Codex' ? '关闭当前任务的全部 Codex tmux session' : '关闭当前任务的全部 OpenCode tmux session'}}" data-run-id="${{esc(run.run_id)}}" data-codex-stop-sessions="true" ${{liveCount ? '' : 'disabled'}}>
           ${{backend === 'Codex' ? '关闭全部 Codex Sessions' : '关闭全部 OpenCode Sessions'}}${{liveCount ? ` · ${{liveCount}} live` : ''}}
         </button>
@@ -4808,7 +4914,11 @@ def app_html() -> str:
       const url = `/runs/${{encodeURIComponent(runId)}}/cli-sessions/${{encodeURIComponent(role)}}/terminal-ui`;
       const labels = {{ moderator: 'Moderator', affirmative: '正方', negative: '反方' }};
       const run = state.runs.find(item => item.run_id === runId) || {{}};
-      const backend = run.engine === 'opencode' ? 'OpenCode 任务会话' : 'Codex 执行日志';
+      const sessions = Array.isArray(run.cli_sessions) ? run.cli_sessions : (Array.isArray(run.codex_sessions) ? run.codex_sessions : []);
+      const session = sessions.find(item => item.role === role) || {{}};
+      const backend = run.engine === 'opencode'
+        ? 'OpenCode 任务会话'
+        : (session.transport === 'exec-ephemeral-json' ? 'Codex 执行日志' : 'Codex TUI');
       el.codexTerminalFrameTitle.textContent = `${{labels[role] || role}} ${{backend}}`;
       el.codexTerminalFrameMeta.textContent = `${{runId}} · ${{role}}`;
       el.codexTerminalFrame.src = url;

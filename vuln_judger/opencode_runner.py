@@ -101,7 +101,6 @@ class OpenCodeTmuxSession:
         self._current_event_path: Optional[Path] = None
         self._current_exit_path: Optional[Path] = None
         self._provider_session_id: Optional[str] = None
-        self._session_recovery_attempted = False
         self._port = _free_local_port()
         self._load_state()
 
@@ -204,7 +203,6 @@ class OpenCodeTmuxSession:
             raise CodexRunnerError(f"OpenCode session 正在执行任务：{self.role}")
         self._rotate_provider_session()
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self._session_recovery_attempted = False
         self._launch_prompt(text)
 
     def _launch_prompt(self, text: str) -> None:
@@ -336,28 +334,6 @@ class OpenCodeTmuxSession:
         if exit_code == 0:
             return None
         detail = _tail_text(self._current_event_path, 30) if self._current_event_path else ""
-        lowered = detail.lower()
-        invalid_session = self._provider_session_id and "session" in lowered and any(
-            marker in lowered for marker in ("not found", "does not exist", "invalid session", "unknown session")
-        )
-        if invalid_session and not self._session_recovery_attempted and self._current_prompt_path:
-            try:
-                prompt = self._current_prompt_path.read_text(encoding="utf-8")
-            except OSError:
-                prompt = ""
-            if prompt:
-                self._session_recovery_attempted = True
-                self._provider_session_id = None
-                self._current_prompt_path = None
-                self._current_request_path = None
-                self._current_started_path = None
-                self._current_event_path = None
-                self._current_exit_path = None
-                self._ensure_provider_session()
-                self._ensure_tui(restart=True)
-                self._save_state()
-                self._launch_prompt(prompt)
-                return None
         return f"OpenCode prompt 退出码 {exit_code}；{detail}"
 
     def task_finished(self) -> bool:
@@ -367,6 +343,39 @@ class OpenCodeTmuxSession:
                 (self._current_exit_path and self._current_exit_path.exists())
                 or (self._current_started_path and self._current_started_path.exists())
             )
+        )
+
+    def accept_output(self) -> None:
+        """Stop the completed turn once the pipeline accepts its JSON artifact."""
+
+        session_id = self._provider_session_id
+        if session_id and self.is_live():
+            try:
+                _abort_opencode_session(self.server_url, session_id, self.cwd)
+            except CodexRunnerError as exc:
+                LOG.warning(
+                    "OpenCode stage 输出已接收，但中止旧 turn 失败",
+                    extra={
+                        "event": "opencode.prompt.abort_failed",
+                        "run_id": self.run_id,
+                        "role": self.role,
+                        "provider_session_id": session_id,
+                        "error": str(exc),
+                    },
+                )
+        if _tmux_target_live(self.run_target):
+            _run_tmux(["tmux", "kill-window", "-t", self.run_target], timeout=10, check=False)
+        if self._current_exit_path is not None:
+            self._current_exit_path.write_text("0\n", encoding="utf-8")
+        self._save_state()
+        LOG.info(
+            "OpenCode stage 输出已接收",
+            extra={
+                "event": "opencode.prompt.output_accepted",
+                "run_id": self.run_id,
+                "role": self.role,
+                "provider_session_id": session_id,
+            },
         )
 
     def _load_state(self) -> None:
@@ -795,6 +804,25 @@ def _opencode_session_exists(url: str, session_id: str) -> bool:
         raise CodexRunnerError(f"OpenCode session 校验失败：HTTP {exc.code}") from exc
     except (OSError, urllib.error.URLError) as exc:
         raise CodexRunnerError(f"OpenCode session 校验失败：{exc}") from exc
+
+
+def _abort_opencode_session(url: str, session_id: str, directory: Path) -> None:
+    encoded_id = urllib.parse.quote(session_id, safe="")
+    query = urllib.parse.urlencode({"directory": str(directory)})
+    request = urllib.request.Request(
+        f"{url}/session/{encoded_id}/abort?{query}",
+        data=b"",
+        headers={"accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if not 200 <= response.status < 300:
+                raise CodexRunnerError(f"OpenCode session 中止失败：HTTP {response.status}")
+    except urllib.error.HTTPError as exc:
+        raise CodexRunnerError(f"OpenCode session 中止失败：HTTP {exc.code}") from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise CodexRunnerError(f"OpenCode session 中止失败：{exc}") from exc
 
 
 def _split_opencode_model(model: Optional[str]) -> Optional[tuple[str, str]]:

@@ -141,18 +141,22 @@ uv run vuln-judger mcp \
 `response_mode: full` 返回完整 run/report 内容。
 
 `judge_report` 的 Codex/OpenCode 引擎会启动 Moderator、Affirmative、Negative 三个独立
-CLI 执行槽，并按 `Affirmative -> Negative -> Moderator` 组成三级流水线。同一 finding 仍严格按
+CLI 角色槽，并按 `Affirmative -> Negative -> Moderator` 组成三级流水线。同一 finding 仍严格按
 阶段顺序推进，不同 finding 可以同时占用三个角色槽；两个阶段间各保留一个待处理缓冲，避免上游
 无限堆积。任务进度持续写入 `--records-dir`，因此 CLI 引擎要求 `save: true`。通常不要设置
 `wait_for_completion: true`，否则长任务可能触发 MCP 客户端工具超时。
 
 任务管理器只通过 `brief.json`、正方 `result.json`、反方 `result.json` 和 Moderator `final.json`
-向下游交付材料。每个 `(finding, stage)` 都使用独立上下文：Codex 通过新的
-`codex exec --ephemeral --json` 执行，OpenCode 在保留本地 server 的同时为每个阶段创建新的
-provider session。输出携带 `finding_id`、`role` 和 `attempt_id`，调度器会在接收时校验，防止并发
-任务串线或误读旧文件。Codex 的 Web 视图直接读取持久化 NDJSON 执行日志，不依赖存活的 tmux
-窗口，也不提供交互式 prompt 注入。页面默认把 JSONL 事件整理为消息、命令、工具调用和错误，仍可
-切换到原始事件用于排障；这不是 Codex TUI，因为 `codex exec --json` 本身只输出事件流。
+向下游交付材料。每个 `(finding, stage)` 都使用独立上下文：Codex 为每个角色保留稳定的 tmux
+target，并在投递新阶段前通过 `respawn-pane -k` 启动全新的原生 Codex TUI；OpenCode 保留本地
+server，但为每个阶段创建新的 provider session。输出携带 `finding_id`、`role` 和 `attempt_id`，
+调度器只在完整校验通过后接收，防止并发任务串线或误读旧文件。
+
+Codex 的 Web 终端通过双向 WebSocket 直接附着原生 tmux TUI，可以查看完整界面并发送键盘输入。
+OpenCode 的 TUI 保持只读，自动 prompt 和 Web 手动消息统一走 `prompt_async` HTTP API。对 OpenCode，
+一旦阶段 JSON 已通过身份与 schema 校验，调度器会立即提交该阶段并调用 session abort 停止已经完成
+产物的旧 turn，避免 provider 自身后续 retry 阻塞角色转换；下一阶段仍使用新的 provider session。
+历史记录若使用旧的 `exec-ephemeral-json` transport，Web 端仍可回退显示持久化 NDJSON 日志。
 
 ### OpenCode 驱动引擎
 

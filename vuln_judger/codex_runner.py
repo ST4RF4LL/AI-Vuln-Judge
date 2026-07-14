@@ -9,7 +9,6 @@ import pty
 import queue
 import re
 import select
-import shlex
 import shutil
 import signal
 import socket
@@ -78,6 +77,10 @@ CODEX_BACKGROUND_RUNNING_RE = re.compile(
     r"\b\d+\s+background terminals?\s+running\b",
     re.IGNORECASE,
 )
+CODEX_STARTUP_MARKERS = (
+    "Starting MCP server",
+    "Starting MCP servers",
+)
 
 
 class CodexRunnerError(RuntimeError):
@@ -109,6 +112,8 @@ class CliSession(Protocol):
 
     def task_finished(self) -> bool: ...
 
+    def accept_output(self) -> None: ...
+
 
 @dataclass
 class CodexSessionInfo:
@@ -118,7 +123,7 @@ class CodexSessionInfo:
     target: str
     cwd: str
     backend: str = CODEX_ENGINE
-    transport: str = "exec-ephemeral-json"
+    transport: str = "tmux-tui"
     event_log: Optional[str] = None
 
 
@@ -140,16 +145,9 @@ class CodexTmuxSession:
         self.run_dir = run_dir.resolve()
         self.command = command
         self.session_name = _safe_tmux_name(f"vj-{run_id}-{role}")
-        self.window_name = "slot"
+        self.window_name = "codex"
         self.target = f"{self.session_name}:{self.window_name}"
-        self.run_target = f"{self.session_name}:run"
-        self.logs_dir = self.cwd / ".vuln-judger-codex"
-        self.current_event_path = self.logs_dir / "current.ndjson"
-        self._sequence = _last_log_sequence(self.logs_dir, "prompt-")
-        self._current_prompt_path: Optional[Path] = None
-        self._current_started_path: Optional[Path] = None
-        self._current_event_path: Optional[Path] = None
-        self._current_exit_path: Optional[Path] = None
+        self._task_started = False
 
     def info(self) -> CodexSessionInfo:
         return CodexSessionInfo(
@@ -158,20 +156,16 @@ class CodexTmuxSession:
             window_name=self.window_name,
             target=self.target,
             cwd=str(self.cwd),
-            event_log=str(self.current_event_path),
         )
 
     def start(self) -> None:
         if self.is_live():
             if _tmux_window_live(self.session_name, self.window_name):
-                if _tmux_window_live(self.session_name, "run"):
-                    _run_tmux(["tmux", "kill-window", "-t", self.run_target], timeout=10, check=False)
                 return
             _run_tmux(["tmux", "kill-session", "-t", self.session_name], timeout=10, check=False)
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self.current_event_path.touch(exist_ok=True)
+        yolo = _env_flag("VULN_JUDGER_CODEX_YOLO", default=True)
         LOG.info(
-            "Codex execution slot 启动",
+            "Codex session 启动",
             extra={
                 "event": "codex.session.start",
                 "run_id": self.run_id,
@@ -180,11 +174,8 @@ class CodexTmuxSession:
                 "cwd": str(self.cwd),
                 "source_path": str(self.source_path),
                 "run_dir": str(self.run_dir),
+                "yolo": yolo,
             },
-        )
-        observer = (
-            f"touch {shlex.quote(str(self.current_event_path))}; "
-            f"exec tail -n 200 -F {shlex.quote(str(self.current_event_path))}"
         )
         args = [
             "tmux",
@@ -196,13 +187,13 @@ class CodexTmuxSession:
             self.window_name,
             "-c",
             str(self.cwd),
-            "sh",
-            "-lc",
-            observer,
+            *self._codex_args(),
         ]
         _run_tmux(args, timeout=30)
+        self._accept_trust_prompt()
+        self._wait_until_input_ready()
         LOG.info(
-            "Codex execution slot ready",
+            "Codex session ready",
             extra={
                 "event": "codex.session.ready",
                 "run_id": self.run_id,
@@ -235,65 +226,13 @@ class CodexTmuxSession:
         text = _normalize_cli_prompt(text)
         if not text:
             raise CodexRunnerError("Codex prompt 不能为空")
-        if not self.is_live():
+        started = not self.is_live()
+        if started:
             self.start()
-        if _tmux_window_live(self.session_name, "run"):
-            raise CodexRunnerError(f"Codex execution slot 正在执行任务：{self.role}")
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        self._sequence += 1
-        prompt_path = self.logs_dir / f"prompt-{self._sequence:04d}.txt"
-        event_path = self.logs_dir / f"events-{self._sequence:04d}.ndjson"
-        started_path = self.logs_dir / f"started-{self._sequence:04d}.txt"
-        exit_path = self.logs_dir / f"exit-{self._sequence:04d}.txt"
-        raw_exit_path = self.logs_dir / f"exit-{self._sequence:04d}.raw"
-        prompt_path.write_text(text, encoding="utf-8")
-        event_path.unlink(missing_ok=True)
-        started_path.unlink(missing_ok=True)
-        exit_path.unlink(missing_ok=True)
-        raw_exit_path.unlink(missing_ok=True)
-        self.current_event_path.write_text("", encoding="utf-8")
-
-        args = [
-            self.command,
-            "exec",
-            "--ephemeral",
-            "--json",
-            "--cd",
-            str(self.cwd),
-            "--add-dir",
-            str(REPO_ROOT),
-            "--add-dir",
-            str(self.source_path),
-            "--add-dir",
-            str(self.run_dir),
-            "--skip-git-repo-check",
-        ]
-        if _env_flag("VULN_JUDGER_CODEX_YOLO", default=True):
-            args.append("--dangerously-bypass-approvals-and-sandbox")
         else:
-            args.extend(
-                [
-                    "--sandbox",
-                    os.environ.get("VULN_JUDGER_CODEX_SANDBOX", "workspace-write"),
-                ]
-            )
-        args.append("-")
-        invocation = shlex.join(args)
-        shell = (
-            f"set +e; printf '%s\\n' \"$$\" > {shlex.quote(str(started_path))}; "
-            f"({invocation} < {shlex.quote(str(prompt_path))}; "
-            f"printf '%s\\n' \"$?\" > {shlex.quote(str(raw_exit_path))}) 2>&1 "
-            f"| tee {shlex.quote(str(event_path))} {shlex.quote(str(self.current_event_path))}; "
-            f"status=$(cat {shlex.quote(str(raw_exit_path))}); "
-            f"printf '%s\\n' \"$status\" > {shlex.quote(str(exit_path))}; exit \"$status\""
-        )
-        # Register the task before tmux can start and finish the short-lived window.
-        # Otherwise the pipeline waiter can observe neither the completed task nor its
-        # exit marker and leave the stage incorrectly displayed as running forever.
-        self._current_prompt_path = prompt_path
-        self._current_started_path = started_path
-        self._current_event_path = event_path
-        self._current_exit_path = exit_path
+            self._restart_tui()
+        baseline = self.capture(lines=120)
+        self._task_started = False
         LOG.info(
             "Codex prompt 发送",
             extra={
@@ -305,70 +244,149 @@ class CodexTmuxSession:
                 "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
             },
         )
+        buffer_name = _safe_tmux_name(f"{self.session_name}-input")
+        _send_text_to_tmux_target(self.target, buffer_name, text)
+        self._wait_until_task_started(baseline)
+
+    def capture(self, lines: int = 240) -> str:
+        if not _tmux_target_live(self.target):
+            return ""
+        result = _run_tmux(
+            ["tmux", "capture-pane", "-p", "-S", f"-{max(1, min(lines, 2000))}", "-t", self.target],
+            timeout=10,
+            check=False,
+        )
+        return result.stdout or ""
+
+    def activity_snapshot(self) -> tuple[str, bool]:
+        capture = self.capture()
+        return capture, _session_busy(capture)
+
+    def failure_message(self) -> Optional[str]:
+        if self._task_started and not _tmux_target_live(self.target):
+            return f"Codex TUI 在任务执行期间退出：{self.target}"
+        return None
+
+    def task_finished(self) -> bool:
+        if not self._task_started:
+            return False
+        capture = self.capture(lines=160)
+        return bool(capture.strip() and not _session_busy(capture) and self._input_ready(capture))
+
+    def accept_output(self) -> None:
+        return None
+
+    def _codex_args(self) -> List[str]:
+        args = [
+            self.command,
+            "--cd",
+            str(self.cwd),
+            "--add-dir",
+            str(REPO_ROOT),
+            "--add-dir",
+            str(self.source_path),
+            "--add-dir",
+            str(self.run_dir),
+            "--no-alt-screen",
+        ]
+        if _env_flag("VULN_JUDGER_CODEX_YOLO", default=True):
+            args.append("--dangerously-bypass-approvals-and-sandbox")
+        else:
+            args.extend(
+                [
+                    "--sandbox",
+                    os.environ.get("VULN_JUDGER_CODEX_SANDBOX", "workspace-write"),
+                    "--ask-for-approval",
+                    os.environ.get("VULN_JUDGER_CODEX_APPROVAL", "never"),
+                ]
+            )
+        return args
+
+    def _restart_tui(self) -> None:
+        if not _tmux_target_live(self.target):
+            if self.is_live():
+                _run_tmux(["tmux", "kill-session", "-t", self.session_name], timeout=10, check=False)
+            self.start()
         _run_tmux(
             [
                 "tmux",
-                "new-window",
-                "-d",
+                "respawn-pane",
+                "-k",
                 "-t",
-                self.session_name,
-                "-n",
-                "run",
+                self.target,
                 "-c",
                 str(self.cwd),
-                "sh",
-                "-lc",
-                shell,
+                *self._codex_args(),
             ],
-            timeout=15,
+            timeout=30,
         )
-        _wait_for_cli_task_start(
-            label=f"Codex {self.role}",
-            started_path=started_path,
-            event_path=event_path,
-            exit_path=exit_path,
-            is_running=lambda: _tmux_window_live(self.session_name, "run"),
-        )
+        _run_tmux(["tmux", "clear-history", "-t", self.target], timeout=10, check=False)
+        self._accept_trust_prompt()
+        self._wait_until_input_ready()
 
-    def capture(self, lines: int = 240) -> str:
-        if self._current_event_path:
-            return _tail_file(self._current_event_path, lines)
-        return ""
+    def _accept_trust_prompt(self) -> None:
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            text = self.capture(lines=80)
+            if self._accept_trust_prompt_if_visible(text):
+                return
+            if text.strip():
+                return
+            time.sleep(0.25)
 
-    def activity_snapshot(self) -> tuple[str, bool]:
-        token = ""
-        if self._current_event_path and self._current_event_path.exists():
-            stat = self._current_event_path.stat()
-            token = f"{stat.st_size}:{stat.st_mtime_ns}"
-        return token, _tmux_window_live(self.session_name, "run")
+    def _wait_until_input_ready(self) -> None:
+        deadline = time.monotonic() + float(os.environ.get("VULN_JUDGER_CODEX_READY_TIMEOUT", "120"))
+        stable_samples = 0
+        last_text = ""
+        while time.monotonic() < deadline:
+            text = self.capture(lines=120)
+            last_text = text
+            if self._accept_trust_prompt_if_visible(text):
+                stable_samples = 0
+                time.sleep(0.5)
+                continue
+            if self._input_ready(text):
+                stable_samples += 1
+                if stable_samples >= 3:
+                    return
+            else:
+                stable_samples = 0
+            time.sleep(0.5)
+        startup = next((marker for marker in CODEX_STARTUP_MARKERS if marker in last_text), "none")
+        raise CodexRunnerError(f"Codex session did not become input-ready: {self.target}; startup_marker={startup}")
 
-    def failure_message(self) -> Optional[str]:
-        if _tmux_window_live(self.session_name, "run"):
-            return None
-        if (
-            self._current_started_path
-            and self._current_started_path.exists()
-            and (self._current_exit_path is None or not self._current_exit_path.exists())
-        ):
-            return f"Codex exec 异常终止，未写入退出码；{self.capture(30)}"
-        if self._current_exit_path is None or not self._current_exit_path.exists():
-            return None
-        try:
-            exit_code = int(self._current_exit_path.read_text(encoding="utf-8").strip())
-        except (OSError, ValueError):
-            return None
-        if exit_code == 0:
-            return None
-        return f"Codex exec 退出码 {exit_code}；{self.capture(30)}"
+    def _wait_until_task_started(self, baseline: str) -> None:
+        deadline = time.monotonic() + float(os.environ.get("VULN_JUDGER_CODEX_TASK_START_TIMEOUT", "30"))
+        last_text = baseline
+        while time.monotonic() < deadline:
+            text = self.capture(lines=160)
+            last_text = text
+            if _session_busy(text):
+                self._task_started = True
+                return
+            if not _tmux_target_live(self.target):
+                raise CodexRunnerError(f"Codex TUI 提交 prompt 后退出：{self.target}")
+            time.sleep(0.1)
+        raise CodexRunnerError(f"Codex TUI 未启动任务：{self.target}；{last_text[-1200:]}")
 
-    def task_finished(self) -> bool:
+    def _input_ready(self, text: str) -> bool:
         return bool(
-            not _tmux_window_live(self.session_name, "run")
-            and (
-                (self._current_exit_path and self._current_exit_path.exists())
-                or (self._current_started_path and self._current_started_path.exists())
-            )
+            text.strip()
+            and not _session_busy(text)
+            and not any(marker in text for marker in CODEX_STARTUP_MARKERS)
         )
+
+    def _accept_trust_prompt_if_visible(self, text: str) -> bool:
+        markers = (
+            "allow codex to work in this folder",
+            "do you trust the contents of this directory",
+            "do you trust the files in this folder",
+            "2. no, quit",
+        )
+        if any(marker in text.lower() for marker in markers):
+            _run_tmux(["tmux", "send-keys", "-t", self.target, _codex_submit_key()], timeout=5)
+            return True
+        return False
 
 
 @dataclass
@@ -393,7 +411,7 @@ class _ActivePipelineStage:
 class CliDrivenRunner:
     engine = CODEX_ENGINE
     cli_name = "Codex"
-    session_description = "Codex execution slot"
+    session_description = "Codex TUI"
 
     def __init__(
         self,
@@ -460,16 +478,11 @@ class CliDrivenRunner:
             kind = str(event.get("kind") or "")
             if kind == "reminder":
                 watchdog["reminder_count"] = int(watchdog.get("reminder_count") or 0) + 1
-            elif kind == "prompt_redelivered":
-                watchdog["prompt_redelivery_count"] = int(watchdog.get("prompt_redelivery_count") or 0) + 1
             watchdog["last_event"] = dict(event)
             workflow["watchdog"] = watchdog
             role = str(event.get("role") or "")
             role_label = ROLE_LABELS.get(role, role)
-            if kind == "reminder":
-                diagnostic = f"{role_label} session 达到静默提醒时间，已发送继续任务提醒。"
-            else:
-                diagnostic = f"{role_label} session 已退出，已重启并重发当前阶段 prompt。"
+            diagnostic = f"{role_label} session 达到静默提醒时间，已发送继续任务提醒。"
             emit(
                 "running",
                 cli_workflow=workflow,
@@ -685,6 +698,15 @@ class CliDrivenRunner:
                 if role == "negative"
                 else item.result_paths["negative"]
             )
+            def validate(result: Dict[str, Any]) -> None:
+                _validate_pipeline_output(
+                    result,
+                    finding_id=item.finding.finding_id,
+                    role=role,
+                    attempt_id=attempt_id,
+                    strict_identity=True,
+                )
+
             result = _wait_json(
                 item.result_paths[role],
                 should_stop=stopped,
@@ -693,13 +715,8 @@ class CliDrivenRunner:
                 stage_prompt=prompt,
                 silence_reminder_seconds=config.silence_reminder_minutes * 60,
                 watchdog_callback=watchdog_events.put,
-            )
-            _validate_pipeline_output(
-                result,
-                finding_id=item.finding.finding_id,
-                role=role,
-                attempt_id=attempt_id,
-                strict_identity=True,
+                validator=validate,
+                complete_on_valid=self.engine == OPENCODE_ENGINE,
             )
             return result
 
@@ -1218,6 +1235,14 @@ def _tmux_window_live(session_name: str, window_name: str) -> bool:
     return result.returncode == 0 and window_name in (result.stdout or "").splitlines()
 
 
+def _tmux_target_live(target: str) -> bool:
+    return _run_tmux(
+        ["tmux", "list-panes", "-t", target],
+        timeout=5,
+        check=False,
+    ).returncode == 0
+
+
 def _wait_for_cli_task_start(
     *,
     label: str,
@@ -1246,14 +1271,6 @@ def _wait_for_cli_task_start(
         time.sleep(0.05)
     state = "run 窗口仍存在" if running or is_running() else "run 窗口已退出"
     raise CodexRunnerError(f"{label} 任务未确认启动（{state}）：{started_path}")
-
-
-def _tail_file(path: Path, lines: int) -> str:
-    try:
-        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
-    return "\n".join(content[-max(1, lines) :])
 
 
 def _env_flag(name: str, *, default: bool = False) -> bool:
@@ -1295,6 +1312,8 @@ def _wait_json(
     stage_prompt: Optional[str] = None,
     silence_reminder_seconds: Optional[float] = None,
     watchdog_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    validator: Optional[Callable[[Dict[str, Any]], None]] = None,
+    complete_on_valid: bool = False,
     poll_interval_seconds: float = 1.0,
     activity_poll_seconds: float = 30.0,
 ) -> Dict[str, Any]:
@@ -1327,8 +1346,16 @@ def _wait_json(
         if should_stop is not None and should_stop():
             raise CodexRunnerStopped("Codex-driven task stopped")
         data, last_error = _read_json_object(path)
+        if data is not None and validator is not None:
+            try:
+                validator(data)
+            except (CodexRunnerError, TypeError, ValueError) as exc:
+                data = None
+                last_error = str(exc)
         task_finished = _cli_task_finished(reminder_session)
-        if data is not None and task_finished is not False:
+        if data is not None and (complete_on_valid or task_finished is not False):
+            if complete_on_valid:
+                _accept_cli_output(reminder_session)
             LOG.info(
                 "Codex JSON 输出就绪",
                 extra={"event": "codex.output.ready", "output_path": str(path)},
@@ -1369,7 +1396,15 @@ def _wait_json(
 
             if now >= silence_deadline:
                 data, last_error = _read_json_object(path)
-                if data is not None and _cli_task_finished(reminder_session) is not False:
+                if data is not None and validator is not None:
+                    try:
+                        validator(data)
+                    except (CodexRunnerError, TypeError, ValueError) as exc:
+                        data = None
+                        last_error = str(exc)
+                if data is not None and (complete_on_valid or _cli_task_finished(reminder_session) is not False):
+                    if complete_on_valid:
+                        _accept_cli_output(reminder_session)
                     LOG.info(
                         "Codex JSON 输出就绪",
                         extra={"event": "codex.output.ready", "output_path": str(path)},
@@ -1399,6 +1434,14 @@ def _cli_task_finished(session: Optional[CliSession]) -> Optional[bool]:
     return bool(method())
 
 
+def _accept_cli_output(session: Optional[CliSession]) -> None:
+    if session is None:
+        return
+    method = getattr(session, "accept_output", None)
+    if callable(method):
+        method()
+
+
 def _handle_silence_deadline(
     *,
     path: Path,
@@ -1412,29 +1455,11 @@ def _handle_silence_deadline(
         return
     event: Optional[Dict[str, Any]] = None
     try:
-        if not session.is_live():
-            if stage_prompt:
-                session.send(stage_prompt)
-                event = {
-                    "kind": "prompt_redelivered",
-                    "role": session.role,
-                    "output_path": str(path),
-                    "at": _now(),
-                }
-        else:
+        if session.is_live():
             previous_data, _ = _read_json_object(previous_output_path)
             _, busy = _cli_activity_snapshot(session)
             current_data, _ = _read_json_object(path)
-            transport = _cli_session_transport(session)
-            if current_data is None and not busy and stage_prompt and transport != "tmux-tui":
-                session.send(stage_prompt)
-                event = {
-                    "kind": "prompt_redelivered",
-                    "role": session.role,
-                    "output_path": str(path),
-                    "at": _now(),
-                }
-            elif current_data is None and previous_data is not None and not busy:
+            if current_data is None and previous_data is not None and not busy:
                 session.send(SILENCE_REMINDER_PROMPT)
                 event = {
                     "kind": "reminder",
@@ -1475,17 +1500,6 @@ def _handle_silence_deadline(
     )
     if watchdog_callback is not None:
         watchdog_callback(event)
-
-
-def _cli_session_transport(session: CliSession) -> str:
-    info_method = getattr(session, "info", None)
-    if not callable(info_method):
-        return "tmux-tui"
-    try:
-        info = to_jsonable(info_method())
-    except Exception:
-        return "tmux-tui"
-    return str(info.get("transport") or "tmux-tui") if isinstance(info, dict) else "tmux-tui"
 
 
 def _session_busy(text: str) -> bool:
@@ -2146,17 +2160,6 @@ def _integer(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
-
-
-def _last_log_sequence(logs_dir: Path, prefix: str) -> int:
-    highest = 0
-    for path in logs_dir.glob(f"{prefix}*.txt"):
-        suffix = path.stem.removeprefix(prefix)
-        try:
-            highest = max(highest, int(suffix))
-        except ValueError:
-            continue
-    return highest
 
 
 def _final_report(
