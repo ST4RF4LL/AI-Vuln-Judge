@@ -58,7 +58,7 @@ CLI_ENGINES = frozenset({CODEX_ENGINE, OPENCODE_ENGINE})
 CODEX_ROLES = ("moderator", "affirmative", "negative")
 CODEX_AGENT_FILE_NAMES = ("AGENTS.md", "AGENT.md")
 LOCAL_SARIF_FINDINGS_ORIGIN = "local_sarif"
-SILENCE_REMINDER_PROMPT = "上一个agent已完成输出，请确认并继续任务"
+SILENCE_REMINDER_PROMPT = "静默看门狗发现当前阶段尚未交付可接受的 JSON，请检查交付件并继续完成原任务。"
 LOG = logger("codex_runner")
 ROLE_LABELS = {
     "moderator": "Moderator",
@@ -477,13 +477,26 @@ class CliDrivenRunner:
             workflow = dict(payload.get("cli_workflow") or payload.get("codex_workflow") or {})
             watchdog = dict(workflow.get("watchdog") or {})
             kind = str(event.get("kind") or "")
-            if kind == "reminder":
+            if kind in {"reminder", "delivery_correction"}:
                 watchdog["reminder_count"] = int(watchdog.get("reminder_count") or 0) + 1
+            if kind == "delivery_correction":
+                watchdog["delivery_correction_count"] = int(
+                    watchdog.get("delivery_correction_count") or 0
+                ) + 1
             watchdog["last_event"] = dict(event)
             workflow["watchdog"] = watchdog
             role = str(event.get("role") or "")
             role_label = ROLE_LABELS.get(role, role)
-            diagnostic = f"{role_label} session 达到静默提醒时间，已发送继续任务提醒。"
+            if kind == "delivery_correction":
+                validation_error = str(event.get("validation_error") or "未知校验错误")
+                if len(validation_error) > 500:
+                    validation_error = f"{validation_error[:500]}…"
+                diagnostic = (
+                    f"{role_label} 交付件未通过验收，已发送定向修正提示："
+                    f"{validation_error}"
+                )
+            else:
+                diagnostic = f"{role_label} session 达到静默提醒时间，已发送带完整任务上下文的继续提醒。"
             emit(
                 "running",
                 cli_workflow=workflow,
@@ -1354,13 +1367,7 @@ def _wait_json(
     while True:
         if should_stop is not None and should_stop():
             raise CodexRunnerStopped("Codex-driven task stopped")
-        data, last_error = _read_json_object(path)
-        if data is not None and validator is not None:
-            try:
-                validator(data)
-            except (CodexRunnerError, TypeError, ValueError) as exc:
-                data = None
-                last_error = str(exc)
+        data, last_error = _read_validated_json_object(path, validator)
         task_finished = _cli_task_finished(reminder_session)
         if data is not None and (complete_on_valid or task_finished is not False):
             if complete_on_valid:
@@ -1404,13 +1411,7 @@ def _wait_json(
                 next_activity_check = now + max(float(activity_poll_seconds), 0.01)
 
             if now >= silence_deadline:
-                data, last_error = _read_json_object(path)
-                if data is not None and validator is not None:
-                    try:
-                        validator(data)
-                    except (CodexRunnerError, TypeError, ValueError) as exc:
-                        data = None
-                        last_error = str(exc)
+                data, last_error = _read_validated_json_object(path, validator)
                 if data is not None and (complete_on_valid or _cli_task_finished(reminder_session) is not False):
                     if complete_on_valid:
                         _accept_cli_output(reminder_session)
@@ -1425,6 +1426,7 @@ def _wait_json(
                     previous_output_path=previous_output_path,
                     stage_prompt=stage_prompt,
                     watchdog_callback=watchdog_callback,
+                    validator=validator,
                 )
                 now = time.monotonic()
                 silence_deadline = now + silence_interval
@@ -1458,23 +1460,36 @@ def _handle_silence_deadline(
     previous_output_path: Optional[Path],
     stage_prompt: Optional[str],
     watchdog_callback: Optional[Callable[[Dict[str, Any]], None]],
+    validator: Optional[Callable[[Dict[str, Any]], None]],
 ) -> None:
-    current_data, _ = _read_json_object(path)
+    current_data, validation_error = _read_validated_json_object(path, validator)
     if current_data is not None:
         return
     event: Optional[Dict[str, Any]] = None
     try:
         if session.is_live():
             previous_data, _ = _read_json_object(previous_output_path)
+            upstream_ready = previous_output_path is None or previous_data is not None
             _, busy = _cli_activity_snapshot(session)
-            current_data, _ = _read_json_object(path)
-            if current_data is None and previous_data is not None and not busy:
-                session.send(SILENCE_REMINDER_PROMPT)
+            current_data, validation_error = _read_validated_json_object(path, validator)
+            if current_data is None and upstream_ready and not busy:
+                artifact_state = "invalid" if path.exists() else "missing"
+                session.send(
+                    _silence_watchdog_prompt(
+                        path=path,
+                        previous_output_path=previous_output_path,
+                        stage_prompt=stage_prompt,
+                        artifact_state=artifact_state,
+                        validation_error=validation_error,
+                    )
+                )
                 event = {
-                    "kind": "reminder",
+                    "kind": "delivery_correction" if artifact_state == "invalid" else "reminder",
                     "role": session.role,
                     "output_path": str(path),
-                    "previous_output_path": str(previous_output_path),
+                    "previous_output_path": str(previous_output_path) if previous_output_path else None,
+                    "artifact_state": artifact_state,
+                    "validation_error": validation_error,
                     "at": _now(),
                 }
     except (CodexRunnerError, OSError, subprocess.SubprocessError) as exc:
@@ -1511,6 +1526,45 @@ def _handle_silence_deadline(
         watchdog_callback(event)
 
 
+def _silence_watchdog_prompt(
+    *,
+    path: Path,
+    previous_output_path: Optional[Path],
+    stage_prompt: Optional[str],
+    artifact_state: str,
+    validation_error: str,
+) -> str:
+    error = validation_error.strip() or "未知错误"
+    if len(error) > 2000:
+        error = f"{error[:2000]}…"
+    lines = [
+        SILENCE_REMINDER_PROMPT,
+        "",
+        f"目标输出文件：{path}",
+    ]
+    if artifact_state == "invalid":
+        lines.extend(
+            [
+                "交付状态：文件已经存在，但未通过 JSON 解析或阶段语义验收。",
+                f"最近一次验收错误：{error}",
+                "处理要求：读取现有文件，修正错误后覆盖写回同一路径；不要只在终端解释。",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "交付状态：目标输出文件尚不存在。",
+                f"最近一次验收错误：{error}",
+                "处理要求：继续完成原阶段，并把最终 JSON 写入目标路径；不要只在终端解释。",
+            ]
+        )
+    if previous_output_path is not None:
+        lines.append(f"上游交付件：{previous_output_path}")
+    if stage_prompt:
+        lines.extend(["", "原始阶段任务（所有约束继续有效）：", stage_prompt])
+    return "\n".join(lines)
+
+
 def _session_busy(text: str) -> bool:
     return bool(CODEX_ACTIVE_PROGRESS_RE.search(text) or CODEX_BACKGROUND_RUNNING_RE.search(text))
 
@@ -1534,6 +1588,20 @@ def _read_json_object(path: Optional[Path]) -> tuple[Optional[Dict[str, Any]], s
         return None, str(exc)
     if not isinstance(data, dict):
         return None, "JSON root is not an object"
+    return data, ""
+
+
+def _read_validated_json_object(
+    path: Optional[Path],
+    validator: Optional[Callable[[Dict[str, Any]], None]],
+) -> tuple[Optional[Dict[str, Any]], str]:
+    data, error = _read_json_object(path)
+    if data is None or validator is None:
+        return data, error
+    try:
+        validator(data)
+    except (CodexRunnerError, TypeError, ValueError) as exc:
+        return None, str(exc)
     return data, ""
 
 
@@ -1854,6 +1922,7 @@ def _base_payload(
         "watchdog": {
             "silence_reminder_minutes": config.silence_reminder_minutes,
             "reminder_count": 0,
+            "delivery_correction_count": 0,
             "prompt_redelivery_count": 0,
         },
     }

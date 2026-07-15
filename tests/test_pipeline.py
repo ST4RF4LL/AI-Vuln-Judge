@@ -2678,9 +2678,15 @@ for raw in sys.stdin.buffer:
             )
 
             self.assertEqual(result["position"], "FALSE_POSITIVE")
-            self.assertEqual(session.sent, [SILENCE_REMINDER_PROMPT])
+            self.assertEqual(len(session.sent), 1)
+            self.assertTrue(session.sent[0].startswith(SILENCE_REMINDER_PROMPT))
+            self.assertIn(f"目标输出文件：{output}", session.sent[0])
+            self.assertIn(f"上游交付件：{previous}", session.sent[0])
+            self.assertIn("最近一次验收错误：文件不存在", session.sent[0])
+            self.assertIn("full negative prompt", session.sent[0])
             self.assertEqual(events[0]["kind"], "reminder")
             self.assertEqual(events[0]["role"], "negative")
+            self.assertEqual(events[0]["artifact_state"], "missing")
 
     def test_wait_json_resets_silence_timer_while_agent_is_active(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2802,6 +2808,106 @@ for raw in sys.stdin.buffer:
             self.assertEqual(session.sent, [])
             self.assertEqual(events, [])
 
+    def test_wait_json_reminds_moderator_without_upstream_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "findings.json"
+            events = []
+
+            class IdleModeratorSession:
+                role = "moderator"
+
+                def __init__(self):
+                    self.sent = []
+
+                def is_live(self):
+                    return True
+
+                def capture(self):
+                    return "idle prompt"
+
+                def send(self, text):
+                    self.sent.append(text)
+                    output.write_text('{"findings":[]}\n', encoding="utf-8")
+
+            session = IdleModeratorSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                stage_prompt="full report split prompt",
+                silence_reminder_seconds=0.02,
+                watchdog_callback=events.append,
+                poll_interval_seconds=0.002,
+                activity_poll_seconds=0.005,
+            )
+
+            self.assertEqual(result, {"findings": []})
+            self.assertEqual(len(session.sent), 1)
+            self.assertIn("full report split prompt", session.sent[0])
+            self.assertNotIn("上游交付件：", session.sent[0])
+            self.assertEqual(events[0]["kind"], "reminder")
+
+    def test_wait_json_watchdog_explains_semantically_invalid_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "affirmative.json"
+            output = root / "negative.json"
+            previous.write_text('{"position":"TRUE_POSITIVE"}\n', encoding="utf-8")
+            output.write_text('{"position":"FALSE_POSITIVE"}\n', encoding="utf-8")
+            events = []
+
+            def validate(data):
+                if "confidence" not in data:
+                    raise CodexRunnerError("negative 输出缺少 confidence")
+
+            class IdleSession:
+                role = "negative"
+
+                def __init__(self):
+                    self.sent = []
+
+                def is_live(self):
+                    return True
+
+                def capture(self):
+                    return "idle prompt"
+
+                def send(self, text):
+                    self.sent.append(text)
+                    output.write_text(
+                        '{"position":"FALSE_POSITIVE","confidence":0.9}\n',
+                        encoding="utf-8",
+                    )
+
+            session = IdleSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                previous_output_path=previous,
+                stage_prompt="full negative correction prompt",
+                silence_reminder_seconds=0.02,
+                watchdog_callback=events.append,
+                validator=validate,
+                poll_interval_seconds=0.002,
+                activity_poll_seconds=0.005,
+            )
+
+            self.assertEqual(result["confidence"], 0.9)
+            self.assertEqual(len(session.sent), 1)
+            correction = session.sent[0]
+            self.assertTrue(correction.startswith(SILENCE_REMINDER_PROMPT))
+            self.assertIn("交付状态：文件已经存在", correction)
+            self.assertIn("negative 输出缺少 confidence", correction)
+            self.assertIn(f"目标输出文件：{output}", correction)
+            self.assertIn(f"上游交付件：{previous}", correction)
+            self.assertIn("full negative correction prompt", correction)
+            self.assertEqual(events[0]["kind"], "delivery_correction")
+            self.assertEqual(events[0]["artifact_state"], "invalid")
+            self.assertEqual(events[0]["validation_error"], "negative 输出缺少 confidence")
+
     def test_wait_json_only_sends_silence_reminder_for_idle_isolated_transport(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2844,7 +2950,10 @@ for raw in sys.stdin.buffer:
             )
 
             self.assertEqual(result, {"summary": "recovered"})
-            self.assertEqual(session.sent, [SILENCE_REMINDER_PROMPT])
+            self.assertEqual(len(session.sent), 1)
+            self.assertTrue(session.sent[0].startswith(SILENCE_REMINDER_PROMPT))
+            self.assertIn("full isolated stage prompt", session.sent[0])
+            self.assertIn(f"目标输出文件：{output}", session.sent[0])
             self.assertEqual(events[0]["kind"], "reminder")
 
     def test_wait_json_accepts_valid_pipeline_output_while_opencode_is_retrying(self):
