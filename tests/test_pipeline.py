@@ -40,11 +40,13 @@ from vuln_judger.codex_runner import (
     CodexRunnerError,
     CodexRunnerStopped,
     CodexTmuxSession,
+    _base_payload,
     _ensure_codex_project_trust,
     _finalize_markdown_findings,
     _moderator_report_prompt,
     _prepare_codex_agent_dirs,
     session_live,
+    _validate_report_findings_output,
     _validate_pipeline_output,
     _wait_for_cli_task_start,
     _wait_json,
@@ -69,6 +71,7 @@ from vuln_judger.models import (
     RunConfig,
     SourceLocation,
     Verdict,
+    run_config_snapshot,
     to_jsonable,
 )
 from vuln_judger.opencode_runner import (
@@ -2861,6 +2864,153 @@ for raw in sys.stdin.buffer:
             self.assertEqual(result, expected)
             self.assertEqual(session.accepted, 1)
 
+    def test_wait_json_accepts_valid_moderator_findings_while_opencode_is_retrying(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report.md"
+            report.write_text("# report\n", encoding="utf-8")
+            output = root / "findings.json"
+            expected = {
+                "findings": [
+                    {
+                        "finding_id": "finding-1",
+                        "rule_id": "rule-1",
+                        "message": "demo finding",
+                        "level": "warning",
+                    }
+                ]
+            }
+            output.write_text(json.dumps(expected), encoding="utf-8")
+
+            class RetryingSession:
+                role = "moderator"
+
+                def __init__(self):
+                    self.accepted = 0
+
+                def task_finished(self):
+                    return False
+
+                def accept_output(self):
+                    self.accepted += 1
+
+            session = RetryingSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                validator=lambda data: _validate_report_findings_output(data, report),
+                complete_on_valid=True,
+                poll_interval_seconds=0.002,
+            )
+
+            self.assertEqual(result, expected)
+            self.assertEqual(session.accepted, 1)
+
+    def test_report_findings_validator_rejects_duplicate_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "report.md"
+            duplicate = {
+                "findings": [
+                    {"finding_id": "same", "rule_id": "rule-1", "message": "first"},
+                    {"finding_id": "same", "rule_id": "rule-2", "message": "second"},
+                ]
+            }
+
+            with self.assertRaisesRegex(CodexRunnerError, "重复 finding_id"):
+                _validate_report_findings_output(duplicate, report)
+
+    def test_opencode_runner_accepts_valid_report_split_before_moderator_turn_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            (source / "app.py").write_text("print('demo')\n", encoding="utf-8")
+            report = root / "report.md"
+            report.write_text("# Demo report\n", encoding="utf-8")
+            records = RunRecordStore(root / "records")
+            findings_data = {
+                "findings": [
+                    {
+                        "finding_id": "finding-1",
+                        "rule_id": "rule-1",
+                        "message": "demo finding",
+                        "level": "warning",
+                    }
+                ]
+            }
+            wait_calls = []
+
+            class FakeSession:
+                def __init__(self, role):
+                    self.role = role
+                    self.sent = []
+
+                def info(self):
+                    return {"role": self.role, "target": f"vj-run-opencode-split-{self.role}:tui"}
+
+                def start(self):
+                    return None
+
+                def send(self, prompt):
+                    self.sent.append(prompt)
+
+            sessions = {role: FakeSession(role) for role in ("moderator", "affirmative", "negative")}
+
+            def stage_result(path, **kwargs):
+                wait_calls.append((path, kwargs))
+                if str(path).endswith("findings.json"):
+                    return findings_data
+                prompt = kwargs["stage_prompt"]
+
+                def field(name):
+                    return prompt.split(f'"{name}": "', 1)[1].split('"', 1)[0]
+
+                role = field("role")
+                identity = {
+                    "role": role,
+                    "finding_id": field("finding_id"),
+                    "attempt_id": field("attempt_id"),
+                    "confidence": 0.8,
+                }
+                if role == "moderator":
+                    return {
+                        **identity,
+                        "verdict": "TRUE_POSITIVE",
+                        "reasoning_summary": "final",
+                        "final_conclusion": "final",
+                    }
+                return {**identity, "position": "TRUE_POSITIVE", "summary": role}
+
+            runner = CodexDrivenRunner(
+                records_dir=records.root,
+                codex_runs_dir=root / ".workspaces" / "runs",
+                codex_command="codex",
+            )
+            runner.engine = OPENCODE_ENGINE
+            runner.cli_name = "OpenCode"
+            config = RunConfig(
+                sarif_path=report,
+                source_path=source,
+                engine=OPENCODE_ENGINE,
+                run_id="run-opencode-split",
+            )
+
+            with patch("vuln_judger.codex_runner._ensure_codex_project_trust"), patch.object(
+                runner,
+                "_sessions",
+                return_value=sessions,
+            ), patch("vuln_judger.codex_runner._wait_json", side_effect=stage_result):
+                completed = runner.run(config, store=records)
+
+            findings_wait = next(kwargs for path, kwargs in wait_calls if str(path).endswith("findings.json"))
+            self.assertTrue(findings_wait["complete_on_valid"])
+            self.assertIsNotNone(findings_wait["validator"])
+            findings_wait["validator"](findings_data)
+            self.assertEqual(completed["finding_count"], 1)
+            self.assertEqual([role for role, session in sessions.items() if session.sent], ["moderator", "affirmative", "negative"])
+
     def test_codex_project_trust_is_written_for_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2879,6 +3029,58 @@ for raw in sys.stdin.buffer:
         self.assertEqual(DEFAULT_CODEX_WORKSPACES_DIR.name, "runs")
         self.assertEqual(DEFAULT_CODEX_WORKSPACES_DIR.parent.name, ".workspaces")
         self.assertNotIn(".vuln_judger", str(DEFAULT_CODEX_WORKSPACES_DIR))
+
+    def test_cli_payload_preserves_opencode_model_for_history_and_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agents = {
+                role: AgentConfig(role.title(), role=role, profile_id=f"{role}-profile")
+                for role in ("affirmative", "negative", "moderator")
+            }
+
+            class FakeSession:
+                def __init__(self, role):
+                    self.role = role
+
+                def info(self):
+                    return {"role": self.role, "target": f"vj-run-model-{self.role}:tui"}
+
+            config = RunConfig(
+                sarif_path=root / "report.md",
+                source_path=root / "source",
+                engine=OPENCODE_ENGINE,
+                run_id="run-model",
+                llm_model="subapis/grok-4.5-latest",
+                reuse_findings_from_run_id="run-source",
+                affirmative_agent=agents["affirmative"],
+                negative_agent=agents["negative"],
+                moderator_agent=agents["moderator"],
+            )
+            payload = _base_payload(
+                config,
+                "run-model",
+                "2026-07-15T00:00:00Z",
+                [],
+                root / ".workspaces" / "runs" / "run-model",
+                {role: FakeSession(role) for role in ("affirmative", "negative", "moderator")},
+                agents,
+                "web",
+                engine=OPENCODE_ENGINE,
+            )
+
+            self.assertEqual(payload["config"], run_config_snapshot(config))
+            self.assertEqual(payload["config"]["llm_model"], "subapis/grok-4.5-latest")
+            copied = _config_from_payload(payload["config"], root / "providers.json")
+            resumed = _config_from_paused_payload(
+                {**payload, "status": "paused"},
+                root / "providers.json",
+                AgentDirectoryStore(root / "agents"),
+                root / "mcp.json",
+                SkillSourceStore(root / "skills.json"),
+            )
+
+            self.assertEqual(copied.llm_model, "subapis/grok-4.5-latest")
+            self.assertEqual(resumed.llm_model, "subapis/grok-4.5-latest")
 
     def test_codex_config_ignores_legacy_llm_and_mcp_payload(self):
         with tempfile.TemporaryDirectory() as tmp:

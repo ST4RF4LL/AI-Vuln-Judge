@@ -265,3 +265,28 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): to_jsonable(item) for key, item in value.items()}
     return str(value)
+
+
+def run_config_snapshot(config: RunConfig) -> Dict[str, Any]:
+    """Return the stable, user-visible portion of a run configuration."""
+
+    return {
+        "engine": config.engine,
+        "report_path": str(config.sarif_path),
+        "source_path": str(config.source_path),
+        "skills_path": str(config.skills_path) if config.skills_path is not None else None,
+        "max_rounds": config.max_rounds,
+        "silence_reminder_minutes": config.silence_reminder_minutes,
+        "auto_index_tools": config.auto_index_tools,
+        "enable_external_tools": config.enable_external_tools,
+        "enable_llm": config.enable_llm,
+        "llm_model": config.llm_model,
+        "llm_endpoint": config.llm_endpoint,
+        "affirmative_provider_id": config.affirmative_provider_id,
+        "negative_provider_id": config.negative_provider_id,
+        "moderator_provider_id": config.moderator_provider_id,
+        "reuse_findings_from_run_id": config.reuse_findings_from_run_id,
+        "affirmative_agent": to_jsonable(config.affirmative_agent) if config.affirmative_agent else None,
+        "negative_agent": to_jsonable(config.negative_agent) if config.negative_agent else None,
+        "moderator_agent": to_jsonable(config.moderator_agent) if config.moderator_agent else None,
+    }

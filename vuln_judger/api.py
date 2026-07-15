@@ -33,7 +33,7 @@ from .evidence_graph import build_evidence_graph, graph_to_markdown
 from .llm import test_provider_connection
 from .logging_config import DEFAULT_LOG_FILE, DEFAULT_LOG_RETENTION_DAYS, configure_logging, logger
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE, MCPServerStore
-from .models import DEFAULT_SILENCE_REMINDER_MINUTES, AgentConfig, RunConfig, to_jsonable
+from .models import DEFAULT_SILENCE_REMINDER_MINUTES, AgentConfig, RunConfig, run_config_snapshot, to_jsonable
 from .opencode_runner import (
     OpenCodeDrivenRunner,
     ensure_opencode_tui,
@@ -1622,26 +1622,7 @@ def _send_codex_session_input(
 
 
 def _config_task_snapshot(config: RunConfig) -> dict:
-    return {
-        "engine": config.engine,
-        "report_path": str(config.sarif_path),
-        "source_path": str(config.source_path),
-        "skills_path": str(config.skills_path) if config.skills_path is not None else None,
-        "max_rounds": config.max_rounds,
-        "silence_reminder_minutes": config.silence_reminder_minutes,
-        "auto_index_tools": config.auto_index_tools,
-        "enable_external_tools": config.enable_external_tools,
-        "enable_llm": config.enable_llm,
-        "llm_model": config.llm_model,
-        "llm_endpoint": config.llm_endpoint,
-        "affirmative_provider_id": config.affirmative_provider_id,
-        "negative_provider_id": config.negative_provider_id,
-        "moderator_provider_id": config.moderator_provider_id,
-        "reuse_findings_from_run_id": config.reuse_findings_from_run_id,
-        "affirmative_agent": to_jsonable(config.affirmative_agent) if config.affirmative_agent else None,
-        "negative_agent": to_jsonable(config.negative_agent) if config.negative_agent else None,
-        "moderator_agent": to_jsonable(config.moderator_agent) if config.moderator_agent else None,
-    }
+    return run_config_snapshot(config)
 
 
 def _pause_payload(config: RunConfig, last_payload: Optional[dict], reason: str) -> dict:

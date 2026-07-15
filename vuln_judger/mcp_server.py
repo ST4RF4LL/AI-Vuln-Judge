@@ -18,7 +18,7 @@ from .codex_runner import CLI_ENGINES, CODEX_ENGINE, OPENCODE_ENGINE, CodexDrive
 from .debate import DebateOrchestrator
 from .evidence import EvidenceCollector
 from .mcp_config import DEFAULT_MCP_SERVERS_FILE
-from .models import DEFAULT_SILENCE_REMINDER_MINUTES, RunConfig, SourceLocation, to_jsonable
+from .models import DEFAULT_SILENCE_REMINDER_MINUTES, RunConfig, SourceLocation, run_config_snapshot, to_jsonable
 from .opencode_runner import OpenCodeDrivenRunner
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
@@ -1150,21 +1150,7 @@ def _dedupe_missing(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _config_snapshot(config: RunConfig) -> Dict[str, Any]:
-    return {
-        "engine": config.engine,
-        "report_path": str(config.sarif_path),
-        "source_path": str(config.source_path),
-        "skills_path": str(config.skills_path) if config.skills_path is not None else None,
-        "max_rounds": config.max_rounds,
-        "silence_reminder_minutes": config.silence_reminder_minutes,
-        "auto_index_tools": config.auto_index_tools,
-        "enable_external_tools": config.enable_external_tools,
-        "enable_llm": config.enable_llm,
-        "llm_model": config.llm_model,
-        "affirmative_provider_id": config.affirmative_provider_id,
-        "negative_provider_id": config.negative_provider_id,
-        "moderator_provider_id": config.moderator_provider_id,
-    }
+    return run_config_snapshot(config)
 
 
 def _queued_codex_payload(config: RunConfig) -> Dict[str, Any]:

@@ -34,6 +34,7 @@ from .models import (
     Finding,
     RunConfig,
     SourceLocation,
+    run_config_snapshot,
     to_jsonable,
 )
 from .records import RunRecordStore
@@ -527,6 +528,10 @@ class CliDrivenRunner:
         resume_findings = config.created_at is not None and findings_path.exists()
         copied_findings = bool(config.reused_findings_payload) and not resume_findings
         moderator_report_prompt = _moderator_report_prompt(input_payload, findings_path)
+
+        def validate_report_findings(data: Dict[str, Any]) -> None:
+            _validate_report_findings_output(data, report_path)
+
         if resume_findings:
             findings_data = _wait_json(
                 findings_path,
@@ -535,6 +540,8 @@ class CliDrivenRunner:
                 stage_prompt=moderator_report_prompt,
                 silence_reminder_seconds=config.silence_reminder_minutes * 60,
                 watchdog_callback=watchdog_event,
+                validator=validate_report_findings,
+                complete_on_valid=self.engine == OPENCODE_ENGINE,
             )
         elif copied_findings:
             findings_data = _persist_findings_payload(findings_path, config.reused_findings_payload)
@@ -550,6 +557,8 @@ class CliDrivenRunner:
                 stage_prompt=moderator_report_prompt,
                 silence_reminder_seconds=config.silence_reminder_minutes * 60,
                 watchdog_callback=watchdog_event,
+                validator=validate_report_findings,
+                complete_on_valid=self.engine == OPENCODE_ENGINE,
             )
         if moderation_reason == "markdown" and not copied_findings:
             findings_data = _finalize_markdown_findings(findings_path, findings_data, report_text)
@@ -1752,6 +1761,20 @@ def _findings_from_persisted(data: Dict[str, Any], report_path: Path) -> List[Fi
     return findings
 
 
+def _validate_report_findings_output(data: Dict[str, Any], report_path: Path) -> None:
+    """Require a complete, reusable report-split artifact before advancing the pipeline."""
+
+    findings = _findings_from_persisted(data, report_path)
+    seen_ids: set[str] = set()
+    duplicate_ids: set[str] = set()
+    for finding in findings:
+        if finding.finding_id in seen_ids:
+            duplicate_ids.add(finding.finding_id)
+        seen_ids.add(finding.finding_id)
+    if duplicate_ids:
+        raise CodexRunnerError(f"Moderator findings.json 包含重复 finding_id：{', '.join(sorted(duplicate_ids))}")
+
+
 def _finding_from_local_payload(item: Dict[str, Any]) -> Finding:
     return Finding(
         finding_id=str(item.get("finding_id") or "finding"),
@@ -1858,16 +1881,7 @@ def _base_payload(
             resume_reports[resume_index].get("finding_id") if resume_index < len(resume_reports) else None
         ),
         "resume_from_finding_index": resume_index,
-        "config": {
-            "engine": engine,
-            "report_path": str(config.sarif_path),
-            "source_path": str(config.source_path),
-            "skills_path": str(config.skills_path) if config.skills_path else None,
-            "max_rounds": config.max_rounds,
-            "silence_reminder_minutes": config.silence_reminder_minutes,
-            "enable_external_tools": True,
-            "reuse_findings_from_run_id": config.reuse_findings_from_run_id,
-        },
+        "config": {**run_config_snapshot(config), "engine": engine},
         "cli_sessions": session_payload,
         "cli_workflow": workflow,
     }
