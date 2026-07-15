@@ -46,6 +46,7 @@ from vuln_judger.codex_runner import (
     _moderator_report_prompt,
     _prepare_codex_agent_dirs,
     session_live,
+    _validate_and_stamp_pipeline_output,
     _validate_report_findings_output,
     _validate_pipeline_output,
     _wait_for_cli_task_start,
@@ -2561,6 +2562,36 @@ for raw in sys.stdin.buffer:
                 strict_identity=True,
             )
 
+    def test_pipeline_output_stamps_only_a_missing_attempt_id(self):
+        result = {
+            "role": "negative",
+            "finding_id": "finding-1",
+            "position": "TRUE_POSITIVE",
+            "confidence": 0.8,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+            output.write_text(json.dumps(result), encoding="utf-8")
+
+            _validate_and_stamp_pipeline_output(
+                result,
+                output_path=output,
+                finding_id="finding-1",
+                role="negative",
+                attempt_id="attempt-current",
+            )
+
+            self.assertEqual(result["attempt_id"], "attempt-current")
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["attempt_id"], "attempt-current")
+            with self.assertRaisesRegex(CodexRunnerError, "attempt_id 不匹配"):
+                _validate_and_stamp_pipeline_output(
+                    {**result, "attempt_id": "attempt-stale"},
+                    output_path=output,
+                    finding_id="finding-1",
+                    role="negative",
+                    attempt_id="attempt-current",
+                )
+
     def test_wait_json_reports_missing_output_file(self):
         class FinishedSession:
             role = "affirmative"
@@ -2818,11 +2849,11 @@ for raw in sys.stdin.buffer:
 
     def test_wait_json_accepts_valid_pipeline_output_while_opencode_is_retrying(self):
         with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp) / "result.json"
+            root = Path(tmp)
+            output = root / "result.json"
             expected = {
                 "finding_id": "finding-1",
                 "role": "affirmative",
-                "attempt_id": "attempt-1",
                 "position": "TRUE_POSITIVE",
                 "confidence": 0.9,
             }
@@ -2843,12 +2874,12 @@ for raw in sys.stdin.buffer:
             session = RetryingSession()
 
             def validate(data):
-                _validate_pipeline_output(
+                _validate_and_stamp_pipeline_output(
                     data,
+                    output_path=output,
                     finding_id="finding-1",
                     role="affirmative",
                     attempt_id="attempt-1",
-                    strict_identity=True,
                 )
 
             result = _wait_json(
@@ -2861,7 +2892,8 @@ for raw in sys.stdin.buffer:
                 poll_interval_seconds=0.002,
             )
 
-            self.assertEqual(result, expected)
+            self.assertEqual(result, {**expected, "attempt_id": "attempt-1"})
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["attempt_id"], "attempt-1")
             self.assertEqual(session.accepted, 1)
 
     def test_wait_json_accepts_valid_moderator_findings_while_opencode_is_retrying(self):
@@ -6530,10 +6562,20 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 return target in {session.server_target, session.run_target}
 
             completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+            order = []
+
+            def abort_turn(*_args):
+                order.append("abort")
+
+            def run_tmux(args, **_kwargs):
+                if args[:2] == ["tmux", "kill-window"]:
+                    order.append("kill")
+                return completed
+
             with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
-                "vuln_judger.opencode_runner._abort_opencode_session"
+                "vuln_judger.opencode_runner._abort_opencode_session", side_effect=abort_turn
             ) as abort, patch(
-                "vuln_judger.opencode_runner._run_tmux", return_value=completed
+                "vuln_judger.opencode_runner._run_tmux", side_effect=run_tmux
             ) as run_tmux:
                 session.accept_output()
 
@@ -6543,6 +6585,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 timeout=10,
                 check=False,
             )
+            self.assertEqual(order, ["kill", "abort"])
             self.assertEqual(session._current_exit_path.read_text(encoding="utf-8"), "0\n")
 
     def test_opencode_tui_session_rotation_respawns_stable_pane(self):

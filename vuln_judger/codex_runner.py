@@ -708,12 +708,12 @@ class CliDrivenRunner:
                 else item.result_paths["negative"]
             )
             def validate(result: Dict[str, Any]) -> None:
-                _validate_pipeline_output(
+                _validate_and_stamp_pipeline_output(
                     result,
+                    output_path=item.result_paths[role],
                     finding_id=item.finding.finding_id,
                     role=role,
                     attempt_id=attempt_id,
-                    strict_identity=True,
                 )
 
             result = _wait_json(
@@ -2157,6 +2157,42 @@ def _validate_pipeline_output(
             raise CodexRunnerError("stage 输出 confidence 必须位于 0 到 1")
     elif strict_identity:
         raise CodexRunnerError("stage 输出缺少 confidence")
+
+
+def _validate_and_stamp_pipeline_output(
+    data: Dict[str, Any],
+    *,
+    output_path: Path,
+    finding_id: str,
+    role: str,
+    attempt_id: str,
+) -> None:
+    """Validate the stage identity and backfill only an omitted scheduler attempt ID.
+
+    The result path is deleted before dispatch, so a newly-created JSON with the
+    expected finding and role belongs to the current stage.  Some OpenCode
+    versions nevertheless omit the mechanical ``attempt_id`` field even when
+    every substantive result field is complete.  Treating that omission as a
+    non-completion leaves the prompt worker alive and lets it keep responding.
+    A supplied but mismatched ID remains a hard failure, which preserves stale
+    output protection.
+    """
+
+    _validate_pipeline_output(
+        data,
+        finding_id=finding_id,
+        role=role,
+        attempt_id=None,
+        strict_identity=True,
+    )
+    actual_attempt = str(data.get("attempt_id") or "")
+    if actual_attempt and actual_attempt != attempt_id:
+        raise CodexRunnerError(
+            f"stage 输出 attempt_id 不匹配：期望 {attempt_id}，实际 {actual_attempt}"
+        )
+    if not actual_attempt:
+        data["attempt_id"] = attempt_id
+        _write_json_object(output_path, data)
 
 
 def _write_json_object(path: Path, data: Dict[str, Any]) -> None:

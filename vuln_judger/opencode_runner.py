@@ -349,6 +349,12 @@ class OpenCodeTmuxSession:
         """Stop the completed turn once the pipeline accepts its JSON artifact."""
 
         session_id = self._provider_session_id
+        # The local prompt worker is the source of repeated terminal output.
+        # Release this pipeline slot before the HTTP abort request, because a
+        # slow or version-incompatible abort endpoint must not keep the worker
+        # alive after a validated result has been accepted.
+        if _tmux_target_live(self.run_target):
+            _run_tmux(["tmux", "kill-window", "-t", self.run_target], timeout=10, check=False)
         if session_id and self.is_live():
             try:
                 _abort_opencode_session(self.server_url, session_id, self.cwd)
@@ -363,8 +369,6 @@ class OpenCodeTmuxSession:
                         "error": str(exc),
                     },
                 )
-        if _tmux_target_live(self.run_target):
-            _run_tmux(["tmux", "kill-window", "-t", self.run_target], timeout=10, check=False)
         if self._current_exit_path is not None:
             self._current_exit_path.write_text("0\n", encoding="utf-8")
         self._save_state()
