@@ -155,7 +155,9 @@ server，但为每个阶段创建新的 provider session。输出携带 `finding
 Codex 的 Web 终端通过双向 WebSocket 直接附着原生 tmux TUI，可以查看完整界面并发送键盘输入。
 OpenCode 的 TUI 保持只读，自动 prompt 和 Web 手动消息统一走 `prompt_async` HTTP API。对 OpenCode，
 一旦阶段 JSON 已通过身份与 schema 校验，调度器会立即提交该阶段并调用 session abort 停止已经完成
-产物的旧 turn，避免 provider 自身后续 retry 阻塞角色转换；下一阶段仍使用新的 provider session。
+产物的旧 turn，并确认 session 已离开 busy/retry；若 abort 未生效，会停止该角色的本地 server，
+下一阶段再创建全新 server/session，避免 provider 自身后续 retry 或复读阻塞角色转换。
+整条流水线完成后会关闭三个角色 session。
 历史记录若使用旧的 `exec-ephemeral-json` transport，Web 端仍可回退显示持久化 NDJSON 日志。
 
 ### OpenCode 驱动引擎
@@ -400,8 +402,12 @@ Markdown 只拆出一个 finding 时，调度器会直接从源报告补齐完�
 启动 CLI 任务时可设置“静默提醒时间”，默认 30 分钟。等待下一阶段 JSON 输出期间，如果
 目标 session 仍有输出或处于执行状态，静默计时器会重新开始；如果上一阶段已经交付而
 下一 Agent 持续静默，看门狗会发送包含原始阶段任务、目标输出路径和上游交付件的定向提醒。
-目标文件存在但未通过 JSON 解析或阶段语义验收时，提醒还会包含最近一次验收错误并要求覆盖修正；
-报告拆分阶段即使没有上游交付件也会受到同样监控。默认不再用一小时硬超时终止阶段；需要绝对步骤超时时可显式设置
+目标文件存在但未通过 JSON 解析或阶段语义验收时，提醒首屏会明确声明交付件被拒绝，并包含
+具体 validator 错误、被拒绝文件路径、当前文件内容摘录，随后附上原始阶段 prompt/schema 并要求覆盖修正；
+OpenCode 一旦写出可解析的 JSON，就会先结束当前 turn：语义验收通过则立即推进流水线，验收失败则
+立即在隔离的新 session 中发送带具体错误的纠偏任务，不等待静默期限。如果始终没有可解析交付件且
+turn 持续 busy、没有新活动直到静默期限，看门狗才会中止旧 turn并执行兜底纠偏。报告拆分阶段即使
+没有上游交付件也会受到同样监控。默认不再用一小时硬超时终止阶段；需要绝对步骤超时时可显式设置
 `VULN_JUDGER_CLI_STEP_TIMEOUT`（秒）；旧的 `VULN_JUDGER_CODEX_STEP_TIMEOUT` 仍兼容。
 
 默认日志按天写入 `.vuln-judger/logs/vuln-judger-YYYY-MM-DD.log`，会记录 API 启动、任务创建、

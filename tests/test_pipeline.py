@@ -2679,10 +2679,10 @@ for raw in sys.stdin.buffer:
 
             self.assertEqual(result["position"], "FALSE_POSITIVE")
             self.assertEqual(len(session.sent), 1)
-            self.assertTrue(session.sent[0].startswith(SILENCE_REMINDER_PROMPT))
-            self.assertIn(f"目标输出文件：{output}", session.sent[0])
+            self.assertTrue(session.sent[0].startswith("调度器没有找到当前阶段要求的交付文件"))
+            self.assertIn(f"缺失的目标输出文件：{output}", session.sent[0])
             self.assertIn(f"上游交付件：{previous}", session.sent[0])
-            self.assertIn("最近一次验收错误：文件不存在", session.sent[0])
+            self.assertIn("拒绝原因：文件不存在", session.sent[0])
             self.assertIn("full negative prompt", session.sent[0])
             self.assertEqual(events[0]["kind"], "reminder")
             self.assertEqual(events[0]["role"], "negative")
@@ -2900,13 +2900,122 @@ for raw in sys.stdin.buffer:
             correction = session.sent[0]
             self.assertTrue(correction.startswith(SILENCE_REMINDER_PROMPT))
             self.assertIn("交付状态：文件已经存在", correction)
-            self.assertIn("negative 输出缺少 confidence", correction)
-            self.assertIn(f"目标输出文件：{output}", correction)
+            self.assertIn("拒绝原因：negative 输出缺少 confidence", correction)
+            self.assertIn(f"被拒绝的输出文件：{output}", correction)
             self.assertIn(f"上游交付件：{previous}", correction)
             self.assertIn("full negative correction prompt", correction)
+            self.assertIn('"position":"FALSE_POSITIVE"', correction)
             self.assertEqual(events[0]["kind"], "delivery_correction")
             self.assertEqual(events[0]["artifact_state"], "invalid")
             self.assertEqual(events[0]["validation_error"], "negative 输出缺少 confidence")
+
+    def test_wait_json_watchdog_shows_malformed_artifact_and_parse_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "affirmative.json"
+            output = root / "negative.json"
+            previous.write_text('{"position":"TRUE_POSITIVE"}\n', encoding="utf-8")
+            output.write_text('{"position": invalid}', encoding="utf-8")
+            events = []
+
+            class IdleSession:
+                role = "negative"
+
+                def __init__(self):
+                    self.sent = []
+
+                def is_live(self):
+                    return True
+
+                def capture(self):
+                    return "idle prompt"
+
+                def send(self, text):
+                    self.sent.append(text)
+                    output.write_text('{"position":"FALSE_POSITIVE"}\n', encoding="utf-8")
+
+            session = IdleSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                previous_output_path=previous,
+                stage_prompt="full malformed correction prompt",
+                silence_reminder_seconds=0.02,
+                watchdog_callback=events.append,
+                poll_interval_seconds=0.002,
+                activity_poll_seconds=0.005,
+            )
+
+            self.assertEqual(result["position"], "FALSE_POSITIVE")
+            self.assertEqual(len(session.sent), 1)
+            correction = session.sent[0]
+            self.assertTrue(correction.startswith(SILENCE_REMINDER_PROMPT))
+            self.assertIn("拒绝原因：", correction)
+            self.assertIn("Expecting value", correction)
+            self.assertIn('{"position": invalid}', correction)
+            self.assertIn("full malformed correction prompt", correction)
+            self.assertEqual(events[0]["kind"], "delivery_correction")
+
+    def test_wait_json_watchdog_interrupts_stuck_busy_opencode_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "affirmative.json"
+            output = root / "negative.json"
+            previous.write_text('{"position":"TRUE_POSITIVE"}\n', encoding="utf-8")
+            output.write_text('{"position":"FALSE_POSITIVE"}\n', encoding="utf-8")
+            events = []
+
+            def validate(data):
+                if "confidence" not in data:
+                    raise CodexRunnerError("negative 输出缺少 confidence")
+
+            class BusyOpenCodeSession:
+                role = "negative"
+
+                def __init__(self):
+                    self.busy = True
+                    self.interrupt_count = 0
+                    self.sent = []
+
+                def is_live(self):
+                    return True
+
+                def activity_snapshot(self):
+                    return "unchanged-provider-turn", self.busy
+
+                def interrupt(self):
+                    self.interrupt_count += 1
+                    self.busy = False
+
+                def send(self, text):
+                    self.sent.append(text)
+                    output.write_text(
+                        '{"position":"FALSE_POSITIVE","confidence":0.9}\n',
+                        encoding="utf-8",
+                    )
+
+            session = BusyOpenCodeSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                previous_output_path=previous,
+                stage_prompt="full negative correction prompt",
+                silence_reminder_seconds=0.02,
+                watchdog_callback=events.append,
+                validator=validate,
+                poll_interval_seconds=0.002,
+                activity_poll_seconds=0.005,
+            )
+
+            self.assertEqual(result["confidence"], 0.9)
+            self.assertEqual(session.interrupt_count, 1)
+            self.assertEqual(len(session.sent), 1)
+            self.assertIn("negative 输出缺少 confidence", session.sent[0])
+            self.assertTrue(events[0]["preempted_busy_turn"])
 
     def test_wait_json_only_sends_silence_reminder_for_idle_isolated_transport(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2951,9 +3060,9 @@ for raw in sys.stdin.buffer:
 
             self.assertEqual(result, {"summary": "recovered"})
             self.assertEqual(len(session.sent), 1)
-            self.assertTrue(session.sent[0].startswith(SILENCE_REMINDER_PROMPT))
+            self.assertTrue(session.sent[0].startswith("调度器没有找到当前阶段要求的交付文件"))
             self.assertIn("full isolated stage prompt", session.sent[0])
-            self.assertIn(f"目标输出文件：{output}", session.sent[0])
+            self.assertIn(f"缺失的目标输出文件：{output}", session.sent[0])
             self.assertEqual(events[0]["kind"], "reminder")
 
     def test_wait_json_accepts_valid_pipeline_output_while_opencode_is_retrying(self):
@@ -3004,6 +3113,100 @@ for raw in sys.stdin.buffer:
             self.assertEqual(result, {**expected, "attempt_id": "attempt-1"})
             self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["attempt_id"], "attempt-1")
             self.assertEqual(session.accepted, 1)
+
+    def test_wait_json_stops_invalid_opencode_delivery_and_corrects_immediately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            previous = root / "affirmative.json"
+            output = root / "negative.json"
+            previous.write_text('{"position":"TRUE_POSITIVE"}\n', encoding="utf-8")
+            output.write_text(
+                json.dumps(
+                    {
+                        "finding_id": "finding-1",
+                        "role": "negative",
+                        "position": "FALSE_POSITIVE",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events = []
+
+            class BusySession:
+                role = "negative"
+
+                def __init__(self):
+                    self.busy = True
+                    self.interrupted = 0
+                    self.accepted = 0
+                    self.sent = []
+
+                def is_live(self):
+                    return True
+
+                def task_finished(self):
+                    return False
+
+                def activity_snapshot(self):
+                    return "provider-turn", self.busy
+
+                def interrupt(self):
+                    self.interrupted += 1
+                    self.busy = False
+
+                def send(self, text):
+                    self.sent.append(text)
+                    self.busy = True
+                    output.write_text(
+                        json.dumps(
+                            {
+                                "finding_id": "finding-1",
+                                "role": "negative",
+                                "position": "FALSE_POSITIVE",
+                                "confidence": 0.9,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+
+                def accept_output(self):
+                    self.accepted += 1
+                    self.busy = False
+
+            session = BusySession()
+
+            def validate(data):
+                _validate_and_stamp_pipeline_output(
+                    data,
+                    output_path=output,
+                    finding_id="finding-1",
+                    role="negative",
+                    attempt_id="attempt-1",
+                )
+
+            started = time.monotonic()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                previous_output_path=previous,
+                stage_prompt="full negative correction prompt",
+                silence_reminder_seconds=600,
+                watchdog_callback=events.append,
+                validator=validate,
+                complete_on_valid=True,
+                poll_interval_seconds=0.002,
+            )
+
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(result["confidence"], 0.9)
+            self.assertEqual(session.interrupted, 1)
+            self.assertEqual(session.accepted, 1)
+            self.assertEqual(len(session.sent), 1)
+            self.assertIn("stage 输出缺少 confidence", session.sent[0])
+            self.assertEqual(events[0]["trigger"], "artifact_validation")
+            self.assertTrue(events[0]["preempted_busy_turn"])
 
     def test_wait_json_accepts_valid_moderator_findings_while_opencode_is_retrying(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3087,6 +3290,7 @@ for raw in sys.stdin.buffer:
                 def __init__(self, role):
                     self.role = role
                     self.sent = []
+                    self.stopped = False
 
                 def info(self):
                     return {"role": self.role, "target": f"vj-run-opencode-split-{self.role}:tui"}
@@ -3096,6 +3300,9 @@ for raw in sys.stdin.buffer:
 
                 def send(self, prompt):
                     self.sent.append(prompt)
+
+                def stop(self):
+                    self.stopped = True
 
             sessions = {role: FakeSession(role) for role in ("moderator", "affirmative", "negative")}
 
@@ -3151,6 +3358,7 @@ for raw in sys.stdin.buffer:
             findings_wait["validator"](findings_data)
             self.assertEqual(completed["finding_count"], 1)
             self.assertEqual([role for role, session in sessions.items() if session.sent], ["moderator", "affirmative", "negative"])
+            self.assertTrue(all(session.stopped for session in sessions.values()))
 
     def test_codex_project_trust_is_written_for_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6675,6 +6883,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
 
             def abort_turn(*_args):
                 order.append("abort")
+                return True
 
             def run_tmux(args, **_kwargs):
                 if args[:2] == ["tmux", "kill-window"]:
@@ -6684,17 +6893,60 @@ class OpenCodeRunnerTests(unittest.TestCase):
             with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
                 "vuln_judger.opencode_runner._abort_opencode_session", side_effect=abort_turn
             ) as abort, patch(
+                "vuln_judger.opencode_runner._wait_for_opencode_session_idle", return_value=True
+            ) as wait_idle, patch(
                 "vuln_judger.opencode_runner._run_tmux", side_effect=run_tmux
             ) as run_tmux:
                 session.accept_output()
 
             abort.assert_called_once_with(session.server_url, "ses-active", session.cwd)
+            wait_idle.assert_called_once_with(
+                session.server_url,
+                "ses-active",
+                session.cwd,
+                timeout=5.0,
+            )
             run_tmux.assert_called_once_with(
                 ["tmux", "kill-window", "-t", session.run_target],
                 timeout=10,
                 check=False,
             )
             self.assertEqual(order, ["kill", "abort"])
+            self.assertEqual(session._current_exit_path.read_text(encoding="utf-8"), "0\n")
+
+    def test_opencode_accept_output_stops_server_when_abort_does_not_finish_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "role"
+            cwd.mkdir()
+            session = OpenCodeTmuxSession(
+                role="negative",
+                run_id="run-1",
+                cwd=cwd,
+                source_path=root,
+                run_dir=root,
+                command="opencode",
+                capabilities=OpenCodeCapabilities("1.17.15"),
+            )
+            session.logs_dir.mkdir()
+            session._provider_session_id = "ses-stuck"
+            session._current_exit_path = session.logs_dir / "exit-0001.txt"
+
+            def target_live(target):
+                return target in {session.server_target, session.run_target}
+
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+            with patch("vuln_judger.opencode_runner._tmux_target_live", side_effect=target_live), patch(
+                "vuln_judger.opencode_runner._abort_opencode_session", return_value=True
+            ), patch(
+                "vuln_judger.opencode_runner._wait_for_opencode_session_idle", return_value=False
+            ), patch(
+                "vuln_judger.opencode_runner._run_tmux", return_value=completed
+            ), patch.object(session, "stop") as stop:
+                session.accept_output()
+
+            stop.assert_called_once_with()
+            self.assertIsNone(session._provider_session_id)
             self.assertEqual(session._current_exit_path.read_text(encoding="utf-8"), "0\n")
 
     def test_opencode_tui_session_rotation_respawns_stable_pane(self):

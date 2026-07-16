@@ -58,7 +58,7 @@ CLI_ENGINES = frozenset({CODEX_ENGINE, OPENCODE_ENGINE})
 CODEX_ROLES = ("moderator", "affirmative", "negative")
 CODEX_AGENT_FILE_NAMES = ("AGENTS.md", "AGENT.md")
 LOCAL_SARIF_FINDINGS_ORIGIN = "local_sarif"
-SILENCE_REMINDER_PROMPT = "静默看门狗发现当前阶段尚未交付可接受的 JSON，请检查交付件并继续完成原任务。"
+SILENCE_REMINDER_PROMPT = "调度器拒绝了当前交付件，因此阶段尚未结束；请按下面的验收错误修正文件。"
 LOG = logger("codex_runner")
 ROLE_LABELS = {
     "moderator": "Moderator",
@@ -114,6 +114,8 @@ class CliSession(Protocol):
     def task_finished(self) -> bool: ...
 
     def accept_output(self) -> None: ...
+
+    def interrupt(self) -> None: ...
 
 
 @dataclass
@@ -635,6 +637,7 @@ class CliDrivenRunner:
         payload["resume_from_finding_id"] = None
         payload["resume_from_finding_index"] = len(findings)
         emit("completed")
+        _stop_cli_session_objects(sessions)
         return payload
 
     def _run_finding_pipeline(
@@ -1364,10 +1367,12 @@ def _wait_json(
     next_activity_check = now
     last_capture: Optional[str] = None
     last_error = ""
+    last_corrected_artifact: Optional[tuple[int, int]] = None
     while True:
         if should_stop is not None and should_stop():
             raise CodexRunnerStopped("Codex-driven task stopped")
         data, last_error = _read_validated_json_object(path, validator)
+        parsed_data, _ = _read_json_object(path)
         task_finished = _cli_task_finished(reminder_session)
         if data is not None and (complete_on_valid or task_finished is not False):
             if complete_on_valid:
@@ -1377,6 +1382,36 @@ def _wait_json(
                 extra={"event": "codex.output.ready", "output_path": str(path)},
             )
             return data
+
+        # For OpenCode, a parseable JSON artifact is the end of the current
+        # provider turn even when semantic validation fails. Keeping that turn
+        # alive lets provider retry/repetition continue indefinitely while the
+        # scheduler waits for a correction the agent cannot see. Stop it once
+        # per artifact revision and submit an isolated correction immediately.
+        artifact_signature = _artifact_signature(path)
+        if (
+            complete_on_valid
+            and parsed_data is not None
+            and data is None
+            and artifact_signature is not None
+            and artifact_signature != last_corrected_artifact
+            and reminder_session is not None
+        ):
+            _handle_silence_deadline(
+                path=path,
+                session=reminder_session,
+                previous_output_path=previous_output_path,
+                stage_prompt=stage_prompt,
+                watchdog_callback=watchdog_callback,
+                validator=validator,
+                trigger="artifact_validation",
+            )
+            last_corrected_artifact = artifact_signature
+            now = time.monotonic()
+            silence_deadline = now + silence_interval if silence_interval > 0 else None
+            next_activity_check = now
+            last_capture = None
+            continue
 
         if reminder_session is not None:
             failure_method = getattr(reminder_session, "failure_message", None)
@@ -1405,7 +1440,7 @@ def _wait_json(
         if reminder_session is not None and silence_deadline is not None:
             if now >= next_activity_check:
                 activity, busy = _cli_activity_snapshot(reminder_session) if reminder_session.is_live() else ("", False)
-                if last_capture is not None and (activity != last_capture or busy):
+                if last_capture is not None and activity != last_capture:
                     silence_deadline = now + silence_interval
                 last_capture = activity
                 next_activity_check = now + max(float(activity_poll_seconds), 0.01)
@@ -1427,6 +1462,7 @@ def _wait_json(
                     stage_prompt=stage_prompt,
                     watchdog_callback=watchdog_callback,
                     validator=validator,
+                    trigger="silence",
                 )
                 now = time.monotonic()
                 silence_deadline = now + silence_interval
@@ -1461,6 +1497,7 @@ def _handle_silence_deadline(
     stage_prompt: Optional[str],
     watchdog_callback: Optional[Callable[[Dict[str, Any]], None]],
     validator: Optional[Callable[[Dict[str, Any]], None]],
+    trigger: str,
 ) -> None:
     current_data, validation_error = _read_validated_json_object(path, validator)
     if current_data is not None:
@@ -1472,6 +1509,13 @@ def _handle_silence_deadline(
             upstream_ready = previous_output_path is None or previous_data is not None
             _, busy = _cli_activity_snapshot(session)
             current_data, validation_error = _read_validated_json_object(path, validator)
+            preempted_busy_turn = False
+            if current_data is None and upstream_ready and busy:
+                interrupt = getattr(session, "interrupt", None)
+                if callable(interrupt):
+                    interrupt()
+                    preempted_busy_turn = True
+                    _, busy = _cli_activity_snapshot(session)
             if current_data is None and upstream_ready and not busy:
                 artifact_state = "invalid" if path.exists() else "missing"
                 session.send(
@@ -1490,6 +1534,8 @@ def _handle_silence_deadline(
                     "previous_output_path": str(previous_output_path) if previous_output_path else None,
                     "artifact_state": artifact_state,
                     "validation_error": validation_error,
+                    "preempted_busy_turn": preempted_busy_turn,
+                    "trigger": trigger,
                     "at": _now(),
                 }
     except (CodexRunnerError, OSError, subprocess.SubprocessError) as exc:
@@ -1537,27 +1583,32 @@ def _silence_watchdog_prompt(
     error = validation_error.strip() or "未知错误"
     if len(error) > 2000:
         error = f"{error[:2000]}…"
-    lines = [
-        SILENCE_REMINDER_PROMPT,
-        "",
-        f"目标输出文件：{path}",
-    ]
     if artifact_state == "invalid":
-        lines.extend(
-            [
-                "交付状态：文件已经存在，但未通过 JSON 解析或阶段语义验收。",
-                f"最近一次验收错误：{error}",
-                "处理要求：读取现有文件，修正错误后覆盖写回同一路径；不要只在终端解释。",
-            ]
-        )
+        lines = [
+            SILENCE_REMINDER_PROMPT,
+            f"拒绝原因：{error}",
+            f"被拒绝的输出文件：{path}",
+            "交付状态：文件已经存在，但未通过 JSON 解析或阶段语义验收。",
+            "处理要求：读取下面的现有内容，对照原始阶段 schema 修正后覆盖写回同一路径；不要只在终端解释或再次确认已完成。",
+        ]
+        artifact_excerpt = _artifact_text_excerpt(path)
+        if artifact_excerpt:
+            lines.extend(
+                [
+                    "",
+                    "当前被拒绝的交付件内容：",
+                    "```json",
+                    artifact_excerpt,
+                    "```",
+                ]
+            )
     else:
-        lines.extend(
-            [
-                "交付状态：目标输出文件尚不存在。",
-                f"最近一次验收错误：{error}",
-                "处理要求：继续完成原阶段，并把最终 JSON 写入目标路径；不要只在终端解释。",
-            ]
-        )
+        lines = [
+            "调度器没有找到当前阶段要求的交付文件，因此阶段尚未结束。",
+            f"拒绝原因：{error}",
+            f"缺失的目标输出文件：{path}",
+            "处理要求：把符合原始阶段 schema 的最终 JSON 写入该精确路径；不要只在终端解释或确认已完成。",
+        ]
     if previous_output_path is not None:
         lines.append(f"上游交付件：{previous_output_path}")
     if stage_prompt:
@@ -1565,8 +1616,36 @@ def _silence_watchdog_prompt(
     return "\n".join(lines)
 
 
+def _artifact_text_excerpt(path: Path, *, limit: int = 12000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n…（交付件内容已截断，总字符数 {len(text)}）"
+
+
 def _session_busy(text: str) -> bool:
     return bool(CODEX_ACTIVE_PROGRESS_RE.search(text) or CODEX_BACKGROUND_RUNNING_RE.search(text))
+
+
+def _stop_cli_session_objects(sessions: Dict[str, CliSession]) -> None:
+    for session in sessions.values():
+        stop = getattr(session, "stop", None)
+        if not callable(stop):
+            continue
+        try:
+            stop()
+        except (CodexRunnerError, OSError, subprocess.SubprocessError) as exc:
+            LOG.warning(
+                "CLI 任务完成后清理 session 失败",
+                extra={
+                    "event": "cli.session.cleanup_failed",
+                    "role": session.role,
+                    "error": str(exc),
+                },
+            )
 
 
 def _cli_activity_snapshot(session: CliSession) -> tuple[str, bool]:
@@ -1589,6 +1668,14 @@ def _read_json_object(path: Optional[Path]) -> tuple[Optional[Dict[str, Any]], s
     if not isinstance(data, dict):
         return None, "JSON root is not an object"
     return data, ""
+
+
+def _artifact_signature(path: Path) -> Optional[tuple[int, int]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
 
 
 def _read_validated_json_object(

@@ -348,27 +348,7 @@ class OpenCodeTmuxSession:
     def accept_output(self) -> None:
         """Stop the completed turn once the pipeline accepts its JSON artifact."""
 
-        session_id = self._provider_session_id
-        # The local prompt worker is the source of repeated terminal output.
-        # Release this pipeline slot before the HTTP abort request, because a
-        # slow or version-incompatible abort endpoint must not keep the worker
-        # alive after a validated result has been accepted.
-        if _tmux_target_live(self.run_target):
-            _run_tmux(["tmux", "kill-window", "-t", self.run_target], timeout=10, check=False)
-        if session_id and self.is_live():
-            try:
-                _abort_opencode_session(self.server_url, session_id, self.cwd)
-            except CodexRunnerError as exc:
-                LOG.warning(
-                    "OpenCode stage 输出已接收，但中止旧 turn 失败",
-                    extra={
-                        "event": "opencode.prompt.abort_failed",
-                        "run_id": self.run_id,
-                        "role": self.role,
-                        "provider_session_id": session_id,
-                        "error": str(exc),
-                    },
-                )
+        self._terminate_current_turn(reason="output_accepted")
         if self._current_exit_path is not None:
             self._current_exit_path.write_text("0\n", encoding="utf-8")
         self._save_state()
@@ -378,9 +358,52 @@ class OpenCodeTmuxSession:
                 "event": "opencode.prompt.output_accepted",
                 "run_id": self.run_id,
                 "role": self.role,
-                "provider_session_id": session_id,
+                "provider_session_id": self._provider_session_id,
             },
         )
+
+    def interrupt(self) -> None:
+        """Stop a silent busy turn before the watchdog submits a correction."""
+
+        self._terminate_current_turn(reason="watchdog")
+
+    def _terminate_current_turn(self, *, reason: str) -> None:
+        session_id = self._provider_session_id
+        # The tmux worker only polls the local server; killing it does not stop
+        # the provider turn. Abort the provider session as well and verify that
+        # it really left busy/retry state.
+        if _tmux_target_live(self.run_target):
+            _run_tmux(["tmux", "kill-window", "-t", self.run_target], timeout=10, check=False)
+        if session_id and self.is_live():
+            try:
+                aborted = _abort_opencode_session(self.server_url, session_id, self.cwd)
+                if not _wait_for_opencode_session_idle(
+                    self.server_url,
+                    session_id,
+                    self.cwd,
+                    timeout=float(os.environ.get("VULN_JUDGER_OPENCODE_ABORT_TIMEOUT", "5")),
+                ):
+                    raise CodexRunnerError(
+                        f"OpenCode session {session_id} abort 后仍处于 busy/retry；abort 返回 {aborted}"
+                    )
+            except CodexRunnerError as exc:
+                LOG.warning(
+                    "OpenCode 中止旧 turn 未得到确认，正在停止角色 server",
+                    extra={
+                        "event": "opencode.prompt.abort_failed",
+                        "run_id": self.run_id,
+                        "role": self.role,
+                        "provider_session_id": session_id,
+                        "reason": reason,
+                        "error": str(exc),
+                    },
+                )
+                # A live provider turn is worse than losing the observation TUI:
+                # stop the local server so the turn cannot keep consuming tokens
+                # or writing the accepted artifact. The next send() recreates it.
+                self.stop()
+                self._provider_session_id = None
+                self._save_state()
 
     def _load_state(self) -> None:
         try:
@@ -810,7 +833,7 @@ def _opencode_session_exists(url: str, session_id: str) -> bool:
         raise CodexRunnerError(f"OpenCode session 校验失败：{exc}") from exc
 
 
-def _abort_opencode_session(url: str, session_id: str, directory: Path) -> None:
+def _abort_opencode_session(url: str, session_id: str, directory: Path) -> bool:
     encoded_id = urllib.parse.quote(session_id, safe="")
     query = urllib.parse.urlencode({"directory": str(directory)})
     request = urllib.request.Request(
@@ -823,10 +846,48 @@ def _abort_opencode_session(url: str, session_id: str, directory: Path) -> None:
         with urllib.request.urlopen(request, timeout=5) as response:
             if not 200 <= response.status < 300:
                 raise CodexRunnerError(f"OpenCode session 中止失败：HTTP {response.status}")
+            raw = response.read().decode("utf-8", errors="replace").strip()
+            if not raw:
+                return True
+            try:
+                result = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise CodexRunnerError(f"OpenCode session 中止响应不是合法 JSON：{exc}") from exc
+            if not isinstance(result, bool):
+                raise CodexRunnerError("OpenCode session 中止响应不是 boolean")
+            return result
     except urllib.error.HTTPError as exc:
         raise CodexRunnerError(f"OpenCode session 中止失败：HTTP {exc.code}") from exc
     except (OSError, urllib.error.URLError) as exc:
         raise CodexRunnerError(f"OpenCode session 中止失败：{exc}") from exc
+
+
+def _wait_for_opencode_session_idle(
+    url: str,
+    session_id: str,
+    directory: Path,
+    *,
+    timeout: float,
+) -> bool:
+    encoded_directory = urllib.parse.urlencode({"directory": str(directory)})
+    endpoint = f"{url}/session/status?{encoded_directory}"
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        request = urllib.request.Request(endpoint, headers={"accept": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=min(max(timeout, 0.1), 3.0)) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise CodexRunnerError(f"OpenCode session 状态确认失败：HTTP {exc.code}") from exc
+        except (OSError, urllib.error.URLError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CodexRunnerError(f"OpenCode session 状态确认失败：{exc}") from exc
+        status = payload.get(session_id) if isinstance(payload, dict) else None
+        status_type = str(status.get("type") or "idle") if isinstance(status, dict) else "idle"
+        if status_type not in {"busy", "retry"}:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _split_opencode_model(model: Optional[str]) -> Optional[tuple[str, str]]:
