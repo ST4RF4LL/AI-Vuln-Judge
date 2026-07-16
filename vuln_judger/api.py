@@ -2333,6 +2333,7 @@ def app_html() -> str:
     .chip.status-in_progress {{ color: #0d4f6f; border-color: #74bdd8; background: #e8f6fb; }}
     .chip.run-delete {{ cursor: pointer; color: var(--bad); }}
     .chip.run-delete:hover {{ border-color: var(--bad); background: #fff1f0; }}
+    .chip.run-delete.confirming {{ color: #fff; border-color: var(--bad); background: var(--bad); }}
     .chip.run-stop, .chip.run-pause, .chip.run-resume {{ cursor: pointer; color: var(--accent); }}
     .chip.run-stop:hover, .chip.run-pause:hover, .chip.run-resume:hover {{ border-color: var(--accent); background: #edf7fb; }}
     .content {{ padding: 16px; display: grid; gap: 16px; }}
@@ -3056,7 +3057,7 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, reuseFindingsFromRunId: null }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, reuseFindingsFromRunId: null, deleteConfirmRunId: null }};
     const el = {{
       list: document.getElementById('run-list'),
       count: document.getElementById('run-count'),
@@ -4378,12 +4379,13 @@ def app_html() -> str:
         const stopButton = status === 'running' || status === 'stopping' || status === 'pausing'
           ? `<span class="chip run-stop" data-run-stop="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="停止该任务">停止</span>`
           : '';
+        const deleteConfirming = state.deleteConfirmRunId === run.run_id;
         return `<button class="run-item ${{state.selectedRun === run.run_id ? 'active' : ''}}" type="button" data-run-id="${{esc(run.run_id)}}">
           <div class="run-item-actions">
             ${{pauseButton}}
             ${{resumeButton}}
             ${{stopButton}}
-            <span class="chip run-delete" data-run-delete="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="删除该任务记录">删除</span>
+            <span class="chip run-delete ${{deleteConfirming ? 'confirming' : ''}}" data-run-delete="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" aria-label="${{deleteConfirming ? '再次点击确认删除' : '删除该任务记录'}}" title="${{deleteConfirming ? '再次点击确认删除' : '删除该任务记录'}}">${{deleteConfirming ? '确认删除？' : '删除'}}</span>
           </div>
           <div class="run-item-headline">
             <div class="run-id">${{esc(run.run_id)}}</div>
@@ -4408,13 +4410,13 @@ def app_html() -> str:
       for (const button of el.list.querySelectorAll('[data-run-delete]')) {{
         button.addEventListener('click', event => {{
           event.stopPropagation();
-          deleteRun(button.dataset.runId);
+          handleDeleteRunClick(button.dataset.runId);
         }});
         button.addEventListener('keydown', event => {{
           if (event.key === 'Enter' || event.key === ' ') {{
             event.preventDefault();
             event.stopPropagation();
-            deleteRun(button.dataset.runId);
+            handleDeleteRunClick(button.dataset.runId);
           }}
         }});
       }}
@@ -4528,6 +4530,29 @@ def app_html() -> str:
       }}
     }}
 
+    function updateDeleteConfirmationUi() {{
+      for (const button of el.list.querySelectorAll('[data-run-delete]')) {{
+        const confirming = state.deleteConfirmRunId === button.dataset.runId;
+        button.classList.toggle('confirming', confirming);
+        button.textContent = confirming ? '确认删除？' : '删除';
+        const label = confirming ? '再次点击确认删除' : '删除该任务记录';
+        button.setAttribute('aria-label', label);
+        button.title = label;
+      }}
+    }}
+
+    function handleDeleteRunClick(runId) {{
+      if (!runId) return;
+      if (state.deleteConfirmRunId !== runId) {{
+        state.deleteConfirmRunId = runId;
+        updateDeleteConfirmationUi();
+        return;
+      }}
+      state.deleteConfirmRunId = null;
+      updateDeleteConfirmationUi();
+      deleteRun(runId);
+    }}
+
     async function deleteRun(runId) {{
       if (!runId) return;
       try {{
@@ -4548,6 +4573,7 @@ def app_html() -> str:
     }}
 
     async function selectRun(runId, resetFinding = true) {{
+      state.deleteConfirmRunId = null;
       state.selectedRun = runId;
       if (resetFinding) state.selectedFinding = null;
       renderRuns();
@@ -5525,6 +5551,14 @@ def app_html() -> str:
       el.subtitle.textContent = '加载记录失败';
       el.detail.innerHTML = `<div class="empty error">${{esc(error.message)}}</div>`;
     }}
+
+    document.addEventListener('click', event => {{
+      const target = event.target instanceof Element ? event.target : null;
+      if (state.deleteConfirmRunId && !target?.closest('[data-run-delete]')) {{
+        state.deleteConfirmRunId = null;
+        updateDeleteConfirmationUi();
+      }}
+    }});
 
     refreshAll();
   </script>
