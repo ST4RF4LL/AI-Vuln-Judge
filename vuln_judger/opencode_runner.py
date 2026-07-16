@@ -279,6 +279,14 @@ class OpenCodeTmuxSession:
             ],
             timeout=15,
         )
+        # `tmux new-window` returning successfully already proves that the worker
+        # pane was created.  Do not rely solely on the detached shell to publish
+        # this marker: on WSL projects under /mnt/* that asynchronous drvfs write
+        # can lag while another run is starting and trigger a false start timeout.
+        # Preserve the pane PID when its shell won the race; otherwise record the
+        # controller-side launch acknowledgement synchronously.
+        if not started_path.exists():
+            started_path.write_text("tmux-window-created\n", encoding="utf-8")
         _wait_for_cli_task_start(
             label=f"OpenCode {self.role}",
             started_path=started_path,

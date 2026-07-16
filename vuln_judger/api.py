@@ -55,6 +55,7 @@ from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore
 DEFAULT_RECORDS_DIR = Path(".vuln-judger") / "runs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 RUN_ORIGIN_WEB = "web"
+RESUMABLE_RUN_STATUSES = {"paused", "failed"}
 LOG = logger("api")
 PROMPT_ECHO_MARKERS = (
     "AGENT.md",
@@ -234,7 +235,7 @@ def make_handler(
                         skill_store,
                     )
                     if result is None:
-                        self._json({"error": "暂停任务未找到或状态不允许恢复"}, HTTPStatus.NOT_FOUND)
+                        self._json({"error": "暂停或失败任务未找到，或当前状态不允许恢复"}, HTTPStatus.NOT_FOUND)
                     else:
                         LOG.info(
                             "收到恢复任务请求",
@@ -1719,25 +1720,73 @@ def _request_resume(
         active_task = tasks.get(run_id)
         if active_task and active_task.get("status") in {"running", "pausing", "stopping"}:
             return dict(active_task)
-        paused_payload = active_task if active_task and active_task.get("status") == "paused" else store.get(run_id)
-        if not paused_payload or paused_payload.get("status") != "paused":
+        stored_payload = store.get(run_id)
+        resumable_payload = (
+            active_task
+            if active_task and active_task.get("status") in RESUMABLE_RUN_STATUSES
+            else stored_payload
+        )
+        if not resumable_payload or resumable_payload.get("status") not in RESUMABLE_RUN_STATUSES:
             return None
-        config = _config_from_paused_payload(paused_payload, providers_file, agent_store, mcp_servers_file, skill_store)
+        checkpoint = _resume_checkpoint_payload(resumable_payload)
+        config = _config_from_paused_payload(checkpoint, providers_file, agent_store, mcp_servers_file, skill_store)
         stop_event = Event()
         pause_event = Event()
-        task = _task_from_report_payload(paused_payload, "running")
+        task = _task_from_report_payload(checkpoint, "running")
         task["status"] = "running"
         task["error"] = None
         tasks[run_id] = task
         stop_events[run_id] = stop_event
         pause_events[run_id] = pause_event
         store.save_payload(task)
+    if config.engine in CLI_ENGINES:
+        stop_sessions(resumable_payload)
     Thread(
         target=_run_task,
         args=(config, store, tasks, stop_events, pause_events, tasks_lock, stop_event, pause_event),
         daemon=True,
     ).start()
     return dict(task)
+
+
+def _resume_checkpoint_payload(payload: dict) -> dict:
+    checkpoint = dict(payload)
+    source_status = str(checkpoint.get("status") or "").strip().lower()
+    reports = mark_incomplete_findings_pending(
+        checkpoint.get("reports") or [],
+        checkpoint.get("completed_finding_count"),
+    )
+    engine = str(checkpoint.get("engine") or (checkpoint.get("config") or {}).get("engine") or "builtin")
+    completed_count = completed_finding_count(reports)
+    if engine not in CLI_ENGINES:
+        reports = reports[:completed_count]
+    finding_count = max(
+        _bounded_int(
+            checkpoint.get("finding_count"),
+            default=len(reports),
+            minimum=0,
+            maximum=1_000_000,
+        ),
+        len(reports),
+    )
+    resume_index = first_incomplete_finding_index(reports, finding_count)
+    resume_report = reports[resume_index] if resume_index < len(reports) else {}
+    resume_id = resume_report.get("finding_id") or checkpoint.get("resume_from_finding_id")
+    checkpoint["reports"] = reports
+    checkpoint["completed_finding_count"] = completed_count
+    checkpoint["current_finding_id"] = None
+    checkpoint["current_finding_index"] = None
+    checkpoint["current_finding_ids"] = {}
+    checkpoint["resume_from_finding_id"] = resume_id
+    checkpoint["resume_from_finding_index"] = resume_index
+    checkpoint["error"] = None
+    diagnostics = list(checkpoint.get("diagnostics") or [])
+    checkpoint_text = f"finding index {resume_index}"
+    if resume_id:
+        checkpoint_text += f" ({resume_id})"
+    diagnostics.append(f"任务从 {source_status or '未知'} 状态恢复，将从 {checkpoint_text} 的首个未完成 stage 继续。")
+    checkpoint["diagnostics"] = diagnostics
+    return checkpoint
 
 
 def _config_from_paused_payload(
@@ -4369,12 +4418,13 @@ def app_html() -> str:
       el.list.innerHTML = state.runs.map(run => {{
         const counts = run.verdict_counts || {{}};
         const status = run.status || 'completed';
+        const resumable = status === 'paused' || status === 'failed';
         const origin = runOriginLabel(run);
         const pauseButton = status === 'running' || status === 'pausing'
           ? `<span class="chip run-pause" data-run-pause="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="暂停该任务">暂停</span>`
           : '';
-        const resumeButton = status === 'paused'
-          ? `<span class="chip run-resume" data-run-resume="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="从当前 finding 恢复任务">恢复</span>`
+        const resumeButton = resumable
+          ? `<span class="chip run-resume" data-run-resume="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="${{status === 'failed' ? '从失败断点恢复任务' : '从当前 finding 恢复任务'}}">恢复</span>`
           : '';
         const stopButton = status === 'running' || status === 'stopping' || status === 'pausing'
           ? `<span class="chip run-stop" data-run-stop="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="停止该任务">停止</span>`
@@ -4593,9 +4643,10 @@ def app_html() -> str:
     function renderRunDetail(run, findings) {{
       state.currentFindings = findings || [];
       const status = run.status || 'completed';
+      const resumable = status === 'paused' || status === 'failed';
       const resumeIndex = run.resume_from_finding_index;
       const resumeFinding = run.resume_from_finding_id || '';
-      const resumeHint = status === 'paused' && resumeIndex !== null && resumeIndex !== undefined
+      const resumeHint = resumable && resumeIndex !== null && resumeIndex !== undefined
         ? '恢复时将从 finding #' + (Number(resumeIndex) + 1) + (resumeFinding ? ' (' + resumeFinding + ')' : '') + ' 重新处理。'
         : '';
       const currentHint = run.current_finding_id
@@ -4605,7 +4656,7 @@ def app_html() -> str:
         status === 'running' || status === 'pausing'
           ? `<button type="button" data-run-pause="true" data-run-id="${{esc(run.run_id)}}">暂停</button>`
           : '',
-        status === 'paused'
+        resumable
           ? `<button type="button" data-run-resume="true" data-run-id="${{esc(run.run_id)}}">恢复</button>`
           : '',
         status === 'running' || status === 'stopping' || status === 'pausing'
@@ -4616,6 +4667,8 @@ def app_html() -> str:
         ? '已请求暂停。当前 LLM 请求结束后会丢弃正在处理的 finding，并从该 finding 保存恢复点。'
         : status === 'paused'
           ? '任务已暂停，当前正在处理的 finding 已丢弃。' + resumeHint
+          : status === 'failed'
+            ? '任务执行失败，可点击“恢复”从断点继续。' + resumeHint
           : status === 'stopping'
         ? '已请求停止。当前 LLM 请求结束后会停止后续回合。'
         : status === 'stopped'
@@ -4633,7 +4686,11 @@ def app_html() -> str:
         runningMessage,
         currentHint,
         resumeHint,
-        status !== 'completed' ? '任务正在运行，尚未生成可展示的漏洞发现详情。' : '暂无漏洞发现记录。'
+        status === 'failed'
+          ? '任务执行失败，恢复后会从首个未完成阶段继续。'
+          : status !== 'completed'
+            ? '任务正在运行，尚未生成可展示的漏洞发现详情。'
+            : '暂无漏洞发现记录。'
       );
       bindRunExportButtons(el.detail);
       bindRunControlButtons(el.detail);

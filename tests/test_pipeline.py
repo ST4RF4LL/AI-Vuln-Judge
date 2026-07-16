@@ -27,6 +27,8 @@ from vuln_judger.api import (
     _config_from_payload,
     _finding_summary,
     _pause_payload,
+    _request_resume,
+    _resume_checkpoint_payload,
     _send_codex_session_input,
     _stop_codex_sessions,
     app_html,
@@ -2106,7 +2108,9 @@ for raw in sys.stdin.buffer:
         self.assertIn("pausing: '正在暂停'", html)
         self.assertIn('function isTerminalStatus(status)', html)
         self.assertIn("stopped: '已停止'", html)
-        self.assertIn("status === 'paused'", html)
+        self.assertIn("status === 'paused' || status === 'failed'", html)
+        self.assertIn("从失败断点恢复任务", html)
+        self.assertIn("任务执行失败，可点击“恢复”从断点继续", html)
         self.assertIn("SOURCE_ROOT: '源码根目录'", html)
         self.assertIn("fetchJson('/mcp-servers')", html)
         self.assertIn("fetchJson('/skill-sources')", html)
@@ -3692,6 +3696,132 @@ for raw in sys.stdin.buffer:
             self.assertEqual(config.resume_from_finding_index, 1)
             self.assertEqual(config.resume_reports[0]["finding_id"], "finding-1")
             self.assertEqual(config.silence_reminder_minutes, 17)
+
+    def test_failed_cli_task_can_resume_from_first_incomplete_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = RunRecordStore(root / "records")
+            failed = {
+                "run_id": "run-failed-resume",
+                "status": "failed",
+                "engine": OPENCODE_ENGINE,
+                "created_at": "2026-07-16T00:00:00Z",
+                "source_path": str(root / "source"),
+                "sarif_path": str(root / "report.sarif"),
+                "finding_count": 2,
+                "completed_finding_count": 1,
+                "current_finding_id": "finding-2",
+                "current_finding_index": 1,
+                "current_finding_ids": {"negative": "finding-2"},
+                "resume_from_finding_id": "finding-2",
+                "resume_from_finding_index": 1,
+                "reports": [
+                    {
+                        "finding_id": "finding-1",
+                        "finding_status": "completed",
+                        "verdict": "TRUE_POSITIVE",
+                    },
+                    {
+                        "finding_id": "finding-2",
+                        "finding_status": "in_progress",
+                        "verdict": None,
+                        "cli_workflow": {
+                            "affirmative": {
+                                "role": "affirmative",
+                                "finding_id": "finding-2",
+                                "position": "TRUE_POSITIVE",
+                            },
+                            "pipeline": {
+                                "stages": {
+                                    "affirmative": {"status": "succeeded", "attempt": 1},
+                                    "negative": {"status": "running", "attempt": 1},
+                                    "moderator": {"status": "pending", "attempt": 0},
+                                }
+                            },
+                        },
+                    },
+                ],
+                "diagnostics": ["OpenCode negative failed"],
+                "error": "OpenCode negative failed",
+                "config": {
+                    "engine": OPENCODE_ENGINE,
+                    "report_path": str(root / "report.sarif"),
+                    "source_path": str(root / "source"),
+                    "silence_reminder_minutes": 30,
+                },
+                "cli_sessions": [
+                    {
+                        "role": "negative",
+                        "session_name": "vj-run-failed-resume-negative",
+                    }
+                ],
+            }
+            store.save_payload(failed)
+            tasks = {}
+            stop_events = {}
+            pause_events = {}
+            tasks_lock = Lock()
+
+            with patch("vuln_judger.api.stop_sessions") as stop_sessions_mock, patch(
+                "vuln_judger.api.Thread"
+            ) as thread_mock:
+                resumed = _request_resume(
+                    store,
+                    tasks,
+                    stop_events,
+                    pause_events,
+                    tasks_lock,
+                    failed["run_id"],
+                    root / "providers.json",
+                    AgentDirectoryStore(root / "agents"),
+                    root / "mcp.json",
+                    SkillSourceStore(root / "skills.json"),
+                )
+
+            self.assertIsNotNone(resumed)
+            self.assertEqual(resumed["run_id"], failed["run_id"])
+            self.assertEqual(resumed["status"], "running")
+            self.assertIsNone(resumed["error"])
+            self.assertEqual(resumed["completed_finding_count"], 1)
+            self.assertEqual(resumed["resume_from_finding_index"], 1)
+            self.assertEqual(resumed["resume_from_finding_id"], "finding-2")
+            self.assertEqual(resumed["current_finding_ids"], {})
+            self.assertEqual(resumed["reports"][1]["finding_status"], "pending")
+            self.assertEqual(
+                resumed["reports"][1]["cli_workflow"]["pipeline"]["stages"]["negative"]["status"],
+                "interrupted",
+            )
+            self.assertIn("任务从 failed 状态恢复", resumed["diagnostics"][-1])
+            self.assertEqual(store.get(failed["run_id"])["status"], "running")
+            self.assertIn(failed["run_id"], stop_events)
+            self.assertIn(failed["run_id"], pause_events)
+            stop_sessions_mock.assert_called_once_with(failed)
+            thread_mock.return_value.start.assert_called_once_with()
+            resume_config = thread_mock.call_args.kwargs["args"][0]
+            self.assertEqual(resume_config.created_at, failed["created_at"])
+            self.assertEqual(resume_config.resume_from_finding_index, 1)
+            self.assertEqual(len(resume_config.resume_reports), 2)
+
+    def test_failed_builtin_resume_discards_partial_finding_report(self):
+        checkpoint = _resume_checkpoint_payload(
+            {
+                "run_id": "run-failed-builtin",
+                "status": "failed",
+                "engine": "builtin",
+                "finding_count": 2,
+                "completed_finding_count": 1,
+                "resume_from_finding_id": "finding-2",
+                "reports": [
+                    {"finding_id": "finding-1", "finding_status": "completed", "verdict": "TRUE_POSITIVE"},
+                    {"finding_id": "finding-2", "finding_status": "in_progress", "verdict": "INCONCLUSIVE"},
+                ],
+            }
+        )
+
+        self.assertEqual(len(checkpoint["reports"]), 1)
+        self.assertEqual(checkpoint["completed_finding_count"], 1)
+        self.assertEqual(checkpoint["resume_from_finding_index"], 1)
+        self.assertEqual(checkpoint["resume_from_finding_id"], "finding-2")
 
     def test_codex_agent_profile_files_are_written_per_session(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6799,6 +6929,46 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertEqual(create_session.call_args.kwargs["model"], "openai/gpt-5")
             self.assertEqual(session.info().provider_session_id, "ses-2")
             self.assertEqual(session.info().transport, "serve+prompt-api")
+
+    def test_opencode_prompt_records_tmux_launch_without_waiting_for_worker_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cwd = root / "role"
+            cwd.mkdir()
+            session = OpenCodeTmuxSession(
+                role="negative",
+                run_id="run-concurrent",
+                cwd=cwd,
+                source_path=root,
+                run_dir=root,
+                command="opencode",
+                capabilities=OpenCodeCapabilities("1.17.20"),
+            )
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+            def target_live(target):
+                return str(target).endswith(":server")
+
+            with patch(
+                "vuln_judger.opencode_runner._tmux_target_live",
+                side_effect=target_live,
+            ), patch(
+                "vuln_judger.opencode_runner._create_opencode_session",
+                return_value="ses-concurrent",
+            ), patch(
+                "vuln_judger.opencode_runner._wait_for_opencode_tui"
+            ), patch(
+                "vuln_judger.opencode_runner._run_tmux",
+                return_value=completed,
+            ):
+                session.send("review this finding")
+
+            self.assertIsNotNone(session._current_started_path)
+            self.assertEqual(
+                session._current_started_path.read_text(encoding="utf-8"),
+                "tmux-window-created\n",
+            )
+            self.assertFalse(session._current_exit_path.exists())
 
     def test_opencode_nonzero_run_exit_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
