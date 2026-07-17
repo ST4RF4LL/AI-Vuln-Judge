@@ -8,6 +8,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -47,6 +48,7 @@ from vuln_judger.codex_runner import (
     _finalize_markdown_findings,
     _moderator_report_prompt,
     _prepare_codex_agent_dirs,
+    _safe_tmux_name,
     session_live,
     _validate_and_stamp_pipeline_output,
     _validate_report_findings_output,
@@ -2505,6 +2507,155 @@ for raw in sys.stdin.buffer:
             self.assertIn(["tmux", "send-keys", "-t", session.target, "C-m"], tmux_calls)
             wait_started.assert_called_once()
 
+    def test_codex_accept_output_resets_turn_and_reuses_fresh_tui(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = CodexTmuxSession(
+                role="negative",
+                run_id="run-1",
+                cwd=root,
+                source_path=root,
+                run_dir=root,
+                command="codex",
+            )
+            session._task_started = True
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+
+            with patch(
+                "vuln_judger.codex_runner._tmux_target_live", return_value=True
+            ), patch(
+                "vuln_judger.codex_runner._run_tmux", return_value=completed
+            ) as run_tmux:
+                session.accept_output()
+
+            tmux_calls = [call.args[0] for call in run_tmux.call_args_list]
+            self.assertTrue(any("respawn-pane" in args and "-k" in args for args in tmux_calls))
+            self.assertFalse(session._task_started)
+            self.assertTrue(session._fresh_tui)
+
+            with patch.object(session, "is_live", return_value=True), patch.object(
+                session, "_accept_trust_prompt"
+            ), patch.object(
+                session, "_wait_until_input_ready"
+            ), patch.object(
+                session, "_capture_visible", return_value="fresh Codex prompt"
+            ), patch.object(
+                session, "_restart_tui"
+            ) as restart, patch.object(
+                session, "_wait_until_task_started"
+            ), patch(
+                "vuln_judger.codex_runner._send_text_to_tmux_target"
+            ):
+                session.send("next isolated stage")
+
+            restart.assert_not_called()
+            self.assertFalse(session._fresh_tui)
+
+    def test_codex_restart_missing_target_does_not_respawn_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = CodexTmuxSession(
+                role="moderator",
+                run_id="run-1",
+                cwd=root,
+                source_path=root,
+                run_dir=root,
+                command="codex",
+            )
+            with patch(
+                "vuln_judger.codex_runner._tmux_target_live", return_value=False
+            ), patch.object(
+                session, "is_live", return_value=False
+            ), patch.object(
+                session, "start"
+            ) as start, patch(
+                "vuln_judger.codex_runner._run_tmux"
+            ) as run_tmux:
+                session._restart_tui()
+
+            start.assert_called_once_with()
+            run_tmux.assert_not_called()
+
+    def test_codex_task_start_accepts_fast_completed_screen_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = CodexTmuxSession(
+                role="affirmative",
+                run_id="run-1",
+                cwd=root,
+                source_path=root,
+                run_dir=root,
+                command="codex",
+            )
+            with patch.object(
+                session,
+                "_capture_visible",
+                return_value="Codex\n› submitted task\n• wrote result.json\n›",
+            ), patch(
+                "vuln_judger.codex_runner._tmux_target_live", return_value=True
+            ):
+                session._wait_until_task_started("Codex\n›")
+
+            self.assertTrue(session._task_started)
+
+    def test_codex_trust_prompt_uses_visible_pane_and_dedicated_enter_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = CodexTmuxSession(
+                role="moderator",
+                run_id="run-1",
+                cwd=root,
+                source_path=root,
+                run_dir=root,
+                command="codex",
+            )
+            modal = "Do you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, quit"
+            completed = subprocess.CompletedProcess(["tmux"], 0, "", "")
+            with patch.object(
+                session, "_capture_visible", side_effect=[modal, "Codex ready\n›"]
+            ), patch(
+                "vuln_judger.codex_runner._run_tmux", return_value=completed
+            ) as run_tmux, patch(
+                "vuln_judger.codex_runner.time.sleep"
+            ):
+                session._accept_trust_prompt()
+
+            run_tmux.assert_called_once_with(
+                ["tmux", "send-keys", "-t", session.target, "Enter"], timeout=5
+            )
+
+    def test_codex_activity_snapshot_ignores_elapsed_timer_only_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = CodexTmuxSession(
+                role="affirmative",
+                run_id="run-1",
+                cwd=root,
+                source_path=root,
+                run_dir=root,
+                command="codex",
+            )
+            captures = [
+                "working\n(12s • esc to interrupt)",
+                "working\n(13s • esc to interrupt)",
+            ]
+            with patch.object(session, "capture", side_effect=captures):
+                first = session.activity_snapshot()
+                second = session.activity_snapshot()
+
+            self.assertEqual(first[0], second[0])
+            self.assertTrue(first[1])
+            self.assertTrue(second[1])
+
+    def test_long_tmux_names_keep_distinct_hash_suffixes(self):
+        common = "run-" + "a" * 100
+        first = _safe_tmux_name(f"{common}-one")
+        second = _safe_tmux_name(f"{common}-two")
+
+        self.assertLessEqual(len(first), 80)
+        self.assertLessEqual(len(second), 80)
+        self.assertNotEqual(first, second)
+
     def test_cli_launch_without_start_marker_fails_instead_of_stalling_pipeline(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
@@ -3124,6 +3275,126 @@ for raw in sys.stdin.buffer:
             self.assertEqual(json.loads(output.read_text(encoding="utf-8"))["attempt_id"], "attempt-1")
             self.assertEqual(session.accepted, 1)
 
+    def test_wait_json_accepts_existing_codex_artifact_without_started_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "findings.json"
+            expected = {"findings": []}
+            output.write_text(json.dumps(expected), encoding="utf-8")
+            session = CodexTmuxSession(
+                role="moderator",
+                run_id="run-resume",
+                cwd=root,
+                source_path=root,
+                run_dir=root,
+                command="codex",
+            )
+
+            with patch.object(session, "_reset_tui_after_turn") as reset:
+                result = _wait_json(
+                    output,
+                    should_stop=None,
+                    timeout_seconds=0.1,
+                    reminder_session=session,
+                    complete_on_valid=True,
+                    poll_interval_seconds=0.002,
+                )
+
+            self.assertEqual(result, expected)
+            reset.assert_not_called()
+
+    def test_wait_json_corrects_completed_malformed_turn_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "result.json"
+            output.write_text('{"position": invalid}', encoding="utf-8")
+            events = []
+
+            class CompletedSession:
+                role = "negative"
+
+                def __init__(self):
+                    self.sent = []
+                    self.accepted = 0
+
+                def is_live(self):
+                    return True
+
+                def task_finished(self):
+                    return True
+
+                def activity_snapshot(self):
+                    return "idle", False
+
+                def send(self, text):
+                    self.sent.append(text)
+                    output.write_text(
+                        '{"position":"FALSE_POSITIVE","confidence":0.9}\n',
+                        encoding="utf-8",
+                    )
+
+                def accept_output(self):
+                    self.accepted += 1
+
+            def validate(data):
+                if "confidence" not in data:
+                    raise CodexRunnerError("negative 输出缺少 confidence")
+
+            session = CompletedSession()
+            result = _wait_json(
+                output,
+                should_stop=None,
+                timeout_seconds=1,
+                reminder_session=session,
+                stage_prompt="full correction context",
+                watchdog_callback=events.append,
+                validator=validate,
+                complete_on_valid=True,
+                poll_interval_seconds=0.002,
+            )
+
+            self.assertEqual(result["confidence"], 0.9)
+            self.assertEqual(len(session.sent), 1)
+            self.assertEqual(session.accepted, 1)
+            self.assertIn("Expecting value", session.sent[0])
+            self.assertEqual(events[0]["trigger"], "turn_completed_without_valid_artifact")
+
+    def test_wait_json_does_not_loop_completed_missing_turn_corrections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "result.json"
+
+            class CompletedSession:
+                role = "negative"
+
+                def __init__(self):
+                    self.sent = []
+
+                def is_live(self):
+                    return True
+
+                def task_finished(self):
+                    return True
+
+                def activity_snapshot(self):
+                    return "idle", False
+
+                def send(self, text):
+                    self.sent.append(text)
+
+            session = CompletedSession()
+            with self.assertRaisesRegex(CodexRunnerError, "已结束但未生成合法 JSON"):
+                _wait_json(
+                    output,
+                    should_stop=None,
+                    timeout_seconds=1,
+                    reminder_session=session,
+                    stage_prompt="full correction context",
+                    complete_on_valid=True,
+                    poll_interval_seconds=0.002,
+                )
+
+            self.assertEqual(len(session.sent), 1)
+
     def test_wait_json_stops_invalid_opencode_delivery_and_corrects_immediately(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3383,6 +3654,48 @@ for raw in sys.stdin.buffer:
             config = config_path.read_text(encoding="utf-8")
             self.assertEqual(config.count(f'[projects."{workspace.resolve()}"]'), 1)
             self.assertIn('trust_level = "trusted"', config)
+
+    def test_codex_project_trust_preserves_concurrent_workspace_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            workspaces = [root / "runs" / f"run-{index}" for index in range(24)]
+            for workspace in workspaces:
+                workspace.mkdir(parents=True)
+
+            with ThreadPoolExecutor(max_workers=12) as executor:
+                list(
+                    executor.map(
+                        lambda workspace: _ensure_codex_project_trust(
+                            workspace, config_path=config_path
+                        ),
+                        workspaces,
+                    )
+                )
+
+            config = config_path.read_text(encoding="utf-8")
+            for workspace in workspaces:
+                self.assertEqual(config.count(f'[projects."{workspace.resolve()}"]'), 1)
+            self.assertEqual(config.count('trust_level = "trusted"'), len(workspaces))
+
+    def test_codex_project_trust_preserves_symlinked_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            actual_config = root / "dotfiles" / "codex-config.toml"
+            actual_config.parent.mkdir()
+            actual_config.write_text("model = \"demo\"\n", encoding="utf-8")
+            config_link = root / "config.toml"
+            config_link.symlink_to(actual_config)
+            workspace = root / "workspace"
+            workspace.mkdir()
+
+            _ensure_codex_project_trust(workspace, config_path=config_link)
+
+            self.assertTrue(config_link.is_symlink())
+            self.assertIn(
+                f'[projects."{workspace.resolve()}"]',
+                actual_config.read_text(encoding="utf-8"),
+            )
 
     def test_codex_default_workspaces_dir_uses_dot_workspaces_runs(self):
         self.assertEqual(DEFAULT_CODEX_WORKSPACES_DIR.name, "runs")
@@ -4254,8 +4567,10 @@ for raw in sys.stdin.buffer:
 
             resumed_sent = []
             resumed_progress = []
+            resumed_wait_options = []
 
             def resumed_wait(path, **_kwargs):
+                resumed_wait_options.append(_kwargs["complete_on_valid"])
                 value = str(path)
                 if value.endswith("findings.json"):
                     return findings_data
@@ -4285,6 +4600,8 @@ for raw in sys.stdin.buffer:
                 )
 
             self.assertTrue(resumed_progress)
+            self.assertTrue(resumed_wait_options)
+            self.assertTrue(all(resumed_wait_options))
             self.assertTrue(all(len(payload["reports"]) == 3 for payload in resumed_progress))
             self.assertTrue(all(payload["reports"][0]["final_conclusion"] == "final-1" for payload in resumed_progress))
             resumed_roles = [role for role, _ in resumed_sent]

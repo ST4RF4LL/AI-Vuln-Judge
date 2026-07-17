@@ -151,6 +151,10 @@ class CodexTmuxSession:
         self.window_name = "codex"
         self.target = f"{self.session_name}:{self.window_name}"
         self._task_started = False
+        # A freshly spawned pane has no conversation context and can accept the
+        # next pipeline turn without another respawn.  Keeping the tmux target
+        # stable lets the dashboard remain attached to the native Codex TUI.
+        self._fresh_tui = False
 
     def info(self) -> CodexSessionInfo:
         return CodexSessionInfo(
@@ -195,6 +199,8 @@ class CodexTmuxSession:
         _run_tmux(args, timeout=30)
         self._accept_trust_prompt()
         self._wait_until_input_ready()
+        self._task_started = False
+        self._fresh_tui = True
         LOG.info(
             "Codex session ready",
             extra={
@@ -232,9 +238,13 @@ class CodexTmuxSession:
         started = not self.is_live()
         if started:
             self.start()
+        elif self._fresh_tui:
+            self._accept_trust_prompt()
+            self._wait_until_input_ready()
         else:
             self._restart_tui()
-        baseline = self.capture(lines=120)
+        self._fresh_tui = False
+        baseline = self._capture_visible()
         self._task_started = False
         LOG.info(
             "Codex prompt 发送",
@@ -261,9 +271,21 @@ class CodexTmuxSession:
         )
         return result.stdout or ""
 
+    def _capture_visible(self) -> str:
+        """Capture only the current pane, excluding stale startup scrollback."""
+
+        if not _tmux_target_live(self.target):
+            return ""
+        result = _run_tmux(
+            ["tmux", "capture-pane", "-p", "-t", self.target],
+            timeout=10,
+            check=False,
+        )
+        return result.stdout or ""
+
     def activity_snapshot(self) -> tuple[str, bool]:
         capture = self.capture()
-        return capture, _session_busy(capture)
+        return _codex_activity_token(capture), _session_busy(capture)
 
     def failure_message(self) -> Optional[str]:
         if self._task_started and not _tmux_target_live(self.target):
@@ -273,11 +295,41 @@ class CodexTmuxSession:
     def task_finished(self) -> bool:
         if not self._task_started:
             return False
-        capture = self.capture(lines=160)
+        capture = self._capture_visible()
         return bool(capture.strip() and not _session_busy(capture) and self._input_ready(capture))
 
     def accept_output(self) -> None:
-        return None
+        """End the accepted turn without destroying the dashboard tmux target."""
+
+        if not self._task_started:
+            return
+        try:
+            self._reset_tui_after_turn()
+        except (CodexRunnerError, OSError, subprocess.SubprocessError) as exc:
+            # A valid artifact is authoritative.  Cleanup failure must not
+            # reject it or hold the downstream stage forever; the next send()
+            # can recreate a stopped session.
+            LOG.warning(
+                "Codex 输出已接收，但重置 TUI 失败",
+                extra={
+                    "event": "codex.prompt.output_cleanup_failed",
+                    "run_id": self.run_id,
+                    "role": self.role,
+                    "session_name": self.session_name,
+                    "error": str(exc),
+                },
+            )
+            self._task_started = False
+            self._fresh_tui = False
+            try:
+                self.stop()
+            except (CodexRunnerError, OSError, subprocess.SubprocessError):
+                pass
+
+    def interrupt(self) -> None:
+        """Terminate a stuck turn before the watchdog submits a correction."""
+
+        self._reset_tui_after_turn()
 
     def _codex_args(self) -> List[str]:
         args = [
@@ -310,6 +362,7 @@ class CodexTmuxSession:
             if self.is_live():
                 _run_tmux(["tmux", "kill-session", "-t", self.session_name], timeout=10, check=False)
             self.start()
+            return
         _run_tmux(
             [
                 "tmux",
@@ -326,13 +379,41 @@ class CodexTmuxSession:
         _run_tmux(["tmux", "clear-history", "-t", self.target], timeout=10, check=False)
         self._accept_trust_prompt()
         self._wait_until_input_ready()
+        self._task_started = False
+        self._fresh_tui = False
+
+    def _reset_tui_after_turn(self) -> None:
+        """Replace the Codex process while preserving its tmux pane and target."""
+
+        if not _tmux_target_live(self.target):
+            if self.is_live():
+                _run_tmux(["tmux", "kill-session", "-t", self.session_name], timeout=10, check=False)
+            self.start()
+            return
+        _run_tmux(
+            [
+                "tmux",
+                "respawn-pane",
+                "-k",
+                "-t",
+                self.target,
+                "-c",
+                str(self.cwd),
+                *self._codex_args(),
+            ],
+            timeout=30,
+        )
+        _run_tmux(["tmux", "clear-history", "-t", self.target], timeout=10, check=False)
+        self._task_started = False
+        self._fresh_tui = True
 
     def _accept_trust_prompt(self) -> None:
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline:
-            text = self.capture(lines=80)
+            text = self._capture_visible()
             if self._accept_trust_prompt_if_visible(text):
-                return
+                time.sleep(0.5)
+                continue
             if text.strip():
                 return
             time.sleep(0.25)
@@ -342,7 +423,7 @@ class CodexTmuxSession:
         stable_samples = 0
         last_text = ""
         while time.monotonic() < deadline:
-            text = self.capture(lines=120)
+            text = self._capture_visible()
             last_text = text
             if self._accept_trust_prompt_if_visible(text):
                 stable_samples = 0
@@ -361,10 +442,12 @@ class CodexTmuxSession:
     def _wait_until_task_started(self, baseline: str) -> None:
         deadline = time.monotonic() + float(os.environ.get("VULN_JUDGER_CODEX_TASK_START_TIMEOUT", "30"))
         last_text = baseline
+        baseline_token = _codex_activity_token(baseline).strip()
         while time.monotonic() < deadline:
-            text = self.capture(lines=160)
+            text = self._capture_visible()
             last_text = text
-            if _session_busy(text):
+            activity_token = _codex_activity_token(text).strip()
+            if _session_busy(text) or (activity_token and activity_token != baseline_token):
                 self._task_started = True
                 return
             if not _tmux_target_live(self.target):
@@ -387,7 +470,8 @@ class CodexTmuxSession:
             "2. no, quit",
         )
         if any(marker in text.lower() for marker in markers):
-            _run_tmux(["tmux", "send-keys", "-t", self.target, _codex_submit_key()], timeout=5)
+            trust_key = os.environ.get("VULN_JUDGER_CODEX_TRUST_KEY", "Enter")
+            _run_tmux(["tmux", "send-keys", "-t", self.target, trust_key], timeout=5)
             return True
         return False
 
@@ -556,7 +640,7 @@ class CliDrivenRunner:
                 silence_reminder_seconds=config.silence_reminder_minutes * 60,
                 watchdog_callback=watchdog_event,
                 validator=validate_report_findings,
-                complete_on_valid=self.engine == OPENCODE_ENGINE,
+                complete_on_valid=True,
             )
         elif copied_findings:
             findings_data = _persist_findings_payload(findings_path, config.reused_findings_payload)
@@ -573,7 +657,7 @@ class CliDrivenRunner:
                 silence_reminder_seconds=config.silence_reminder_minutes * 60,
                 watchdog_callback=watchdog_event,
                 validator=validate_report_findings,
-                complete_on_valid=self.engine == OPENCODE_ENGINE,
+                complete_on_valid=True,
             )
         if moderation_reason == "markdown" and not copied_findings:
             findings_data = _finalize_markdown_findings(findings_path, findings_data, report_text)
@@ -741,7 +825,7 @@ class CliDrivenRunner:
                 silence_reminder_seconds=config.silence_reminder_minutes * 60,
                 watchdog_callback=watchdog_events.put,
                 validator=validate,
-                complete_on_valid=self.engine == OPENCODE_ENGINE,
+                complete_on_valid=True,
             )
             return result
 
@@ -1309,22 +1393,42 @@ def _ensure_codex_project_trust(path: Path, config_path: Optional[Path] = None) 
     trusted_path = str(path.expanduser().resolve())
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
     target = (config_path or codex_home / "config.toml").expanduser()
+    if target.is_symlink():
+        target = target.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    text = target.read_text(encoding="utf-8") if target.exists() else ""
-    header = f"[projects.{json.dumps(trusted_path)}]"
-    block_re = re.compile(rf"({re.escape(header)}\n)(.*?)(?=\n\[|\Z)", re.DOTALL)
-    match = block_re.search(text)
-    if match is None:
-        separator = "\n\n" if text.strip() else ""
-        text = f"{text.rstrip()}{separator}{header}\ntrust_level = \"trusted\"\n"
-    else:
-        body = match.group(2)
-        if re.search(r"(?m)^trust_level\s*=", body):
-            body = re.sub(r'(?m)^trust_level\s*=.*$', 'trust_level = "trusted"', body)
-        else:
-            body = f"{body.rstrip()}\ntrust_level = \"trusted\"\n"
-        text = f"{text[:match.start(2)]}{body}{text[match.end(2):]}"
-    target.write_text(text, encoding="utf-8")
+    lock_path = target.with_name(f".{target.name}.vuln-judger.lock")
+    temporary_path: Optional[Path] = None
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            text = target.read_text(encoding="utf-8") if target.exists() else ""
+            header = f"[projects.{json.dumps(trusted_path)}]"
+            block_re = re.compile(rf"({re.escape(header)}\n)(.*?)(?=\n\[|\Z)", re.DOTALL)
+            match = block_re.search(text)
+            if match is None:
+                separator = "\n\n" if text.strip() else ""
+                text = f"{text.rstrip()}{separator}{header}\ntrust_level = \"trusted\"\n"
+            else:
+                body = match.group(2)
+                if re.search(r"(?m)^trust_level\s*=", body):
+                    body = re.sub(r'(?m)^trust_level\s*=.*$', 'trust_level = "trusted"', body)
+                else:
+                    body = f"{body.rstrip()}\ntrust_level = \"trusted\"\n"
+                text = f"{text[:match.start(2)]}{body}{text[match.end(2):]}"
+
+            temporary_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+            with temporary_path.open("w", encoding="utf-8") as temporary_file:
+                temporary_file.write(text)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+            if target.exists():
+                os.chmod(temporary_path, target.stat().st_mode & 0o7777)
+            os.replace(temporary_path, target)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _wait_json(
@@ -1368,6 +1472,7 @@ def _wait_json(
     last_capture: Optional[str] = None
     last_error = ""
     last_corrected_artifact: Optional[tuple[int, int]] = None
+    completed_turn_correction_sent = False
     while True:
         if should_stop is not None and should_stop():
             raise CodexRunnerStopped("Codex-driven task stopped")
@@ -1383,11 +1488,9 @@ def _wait_json(
             )
             return data
 
-        # For OpenCode, a parseable JSON artifact is the end of the current
-        # provider turn even when semantic validation fails. Keeping that turn
-        # alive lets provider retry/repetition continue indefinitely while the
-        # scheduler waits for a correction the agent cannot see. Stop it once
-        # per artifact revision and submit an isolated correction immediately.
+        # A parseable JSON artifact ends the current CLI turn even when semantic
+        # validation fails. Stop that turn once per artifact revision and submit
+        # an isolated correction containing the exact validation failure.
         artifact_signature = _artifact_signature(path)
         if (
             complete_on_valid
@@ -1397,7 +1500,7 @@ def _wait_json(
             and artifact_signature != last_corrected_artifact
             and reminder_session is not None
         ):
-            _handle_silence_deadline(
+            correction_sent = _handle_silence_deadline(
                 path=path,
                 session=reminder_session,
                 previous_output_path=previous_output_path,
@@ -1406,12 +1509,13 @@ def _wait_json(
                 validator=validator,
                 trigger="artifact_validation",
             )
-            last_corrected_artifact = artifact_signature
-            now = time.monotonic()
-            silence_deadline = now + silence_interval if silence_interval > 0 else None
-            next_activity_check = now
-            last_capture = None
-            continue
+            if correction_sent:
+                last_corrected_artifact = artifact_signature
+                now = time.monotonic()
+                silence_deadline = now + silence_interval if silence_interval > 0 else None
+                next_activity_check = now
+                last_capture = None
+                continue
 
         if reminder_session is not None:
             failure_method = getattr(reminder_session, "failure_message", None)
@@ -1420,6 +1524,23 @@ def _wait_json(
                 raise CodexRunnerError(f"CLI session 执行失败：{failure}")
             task_finished = _cli_task_finished(reminder_session)
             if data is None and task_finished is True:
+                if not completed_turn_correction_sent:
+                    correction_sent = _handle_silence_deadline(
+                        path=path,
+                        session=reminder_session,
+                        previous_output_path=previous_output_path,
+                        stage_prompt=stage_prompt,
+                        watchdog_callback=watchdog_callback,
+                        validator=validator,
+                        trigger="turn_completed_without_valid_artifact",
+                    )
+                    if correction_sent:
+                        completed_turn_correction_sent = True
+                        now = time.monotonic()
+                        silence_deadline = now + silence_interval if silence_interval > 0 else None
+                        next_activity_check = now
+                        last_capture = None
+                        continue
                 raise CodexRunnerError(
                     f"CLI session 已结束但未生成合法 JSON：{path}；最后错误：{last_error}"
                 )
@@ -1498,13 +1619,14 @@ def _handle_silence_deadline(
     watchdog_callback: Optional[Callable[[Dict[str, Any]], None]],
     validator: Optional[Callable[[Dict[str, Any]], None]],
     trigger: str,
-) -> None:
+) -> bool:
     current_data, validation_error = _read_validated_json_object(path, validator)
     if current_data is not None:
-        return
+        return False
     event: Optional[Dict[str, Any]] = None
     try:
-        if session.is_live():
+        is_live = getattr(session, "is_live", None)
+        if callable(is_live) and is_live():
             previous_data, _ = _read_json_object(previous_output_path)
             upstream_ready = previous_output_path is None or previous_data is not None
             _, busy = _cli_activity_snapshot(session)
@@ -1515,7 +1637,10 @@ def _handle_silence_deadline(
                 if callable(interrupt):
                     interrupt()
                     preempted_busy_turn = True
-                    _, busy = _cli_activity_snapshot(session)
+                    # interrupt() is the transport boundary: it either ends the
+                    # old turn or raises.  Avoid treating startup output from the
+                    # fresh TUI as proof that the rejected turn is still busy.
+                    busy = False
             if current_data is None and upstream_ready and not busy:
                 artifact_state = "invalid" if path.exists() else "missing"
                 session.send(
@@ -1548,7 +1673,7 @@ def _handle_silence_deadline(
                 "error": str(exc),
             },
         )
-        return
+        return False
 
     if event is None:
         LOG.info(
@@ -1559,7 +1684,7 @@ def _handle_silence_deadline(
                 "output_path": str(path),
             },
         )
-        return
+        return False
     LOG.info(
         "Codex 静默看门狗已处理",
         extra={
@@ -1570,6 +1695,7 @@ def _handle_silence_deadline(
     )
     if watchdog_callback is not None:
         watchdog_callback(event)
+    return True
 
 
 def _silence_watchdog_prompt(
@@ -1628,6 +1754,12 @@ def _artifact_text_excerpt(path: Path, *, limit: int = 12000) -> str:
 
 def _session_busy(text: str) -> bool:
     return bool(CODEX_ACTIVE_PROGRESS_RE.search(text) or CODEX_BACKGROUND_RUNNING_RE.search(text))
+
+
+def _codex_activity_token(text: str) -> str:
+    """Ignore Codex's elapsed timer when deciding whether a turn made progress."""
+
+    return CODEX_ACTIVE_PROGRESS_RE.sub("(… • esc to interrupt)", text)
 
 
 def _stop_cli_session_objects(sessions: Dict[str, CliSession]) -> None:
@@ -2692,7 +2824,10 @@ def _location_from_dict(data: Dict[str, Any]) -> SourceLocation:
 
 
 def _safe_tmux_name(value: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", value)[:80].strip("-")
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-")
+    if len(cleaned) > 80:
+        suffix = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+        cleaned = f"{cleaned[:69].rstrip('-')}-{suffix}"
     return cleaned or "vj-session"
 
 
