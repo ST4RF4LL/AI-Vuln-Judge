@@ -41,7 +41,7 @@ from .opencode_runner import (
 )
 from .pipeline import RunStopped, run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE, ProviderStore
-from .records import RunRecordStore, normalize_run_origin
+from .records import RunControlStore, RunRecordStore, normalize_run_origin
 from .run_state import (
     FINDING_COMPLETED,
     completed_finding_count,
@@ -56,6 +56,8 @@ DEFAULT_RECORDS_DIR = Path(".vuln-judger") / "runs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 RUN_ORIGIN_WEB = "web"
 RESUMABLE_RUN_STATUSES = {"paused", "failed"}
+MANUAL_REVIEW_DECISIONS = {"TRUE_POSITIVE", "FALSE_POSITIVE", "INCONCLUSIVE"}
+MANUAL_REVIEW_EVIDENCE_MAX_LENGTH = 50_000
 LOG = logger("api")
 PROMPT_ECHO_MARKERS = (
     "AGENT.md",
@@ -146,6 +148,7 @@ def make_handler(
     mcp_store = mcp_store or MCPServerStore(store.root.parent / "mcp.json")
     mcp_store.ensure_default_atlas()
     skill_store = skill_store or SkillSourceStore(store.root.parent / "skills.json")
+    control_store = RunControlStore(store.root)
     recovered = store.recover_unfinished()
     if recovered:
         LOG.info("恢复未完成运行记录 count=%s ids=%s", len(recovered), ",".join(str(item.get("run_id")) for item in recovered))
@@ -156,6 +159,49 @@ def make_handler(
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "vuln-judger/0.1"
+
+        def do_PUT(self) -> None:  # noqa: N802
+            parts = _parts(self.path)
+            try:
+                if len(parts) == 5 and parts[0] == "runs" and parts[2] == "findings" and parts[4] == "manual-review":
+                    run_id = parts[1]
+                    finding_id = parts[3]
+                    persisted = store.get(run_id)
+                    task = _get_task(tasks, tasks_lock, run_id)
+                    effective = _merge_manual_reviews(task, persisted) if task is not None else persisted
+                    if effective is None:
+                        self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
+                        return
+                    if not _finding_exists(effective, finding_id):
+                        self._json({"error": "发现未找到"}, HTTPStatus.NOT_FOUND)
+                        return
+                    decision, evidence = _validated_manual_review_payload(self._read_json())
+                    saved = store.update_manual_review(
+                        run_id,
+                        finding_id,
+                        decision=decision,
+                        evidence=evidence,
+                    )
+                    if saved is None:
+                        self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
+                        return
+                    review, created = saved
+                    LOG.info(
+                        "保存人工复核 run_id=%s finding_id=%s decision=%s created=%s",
+                        run_id,
+                        finding_id,
+                        decision,
+                        created,
+                    )
+                    self._json(
+                        {"run_id": run_id, "finding_id": finding_id, "created": created, "manual_review": review},
+                        HTTPStatus.CREATED if created else HTTPStatus.OK,
+                    )
+                    return
+                self._json({"error": "未找到"}, HTTPStatus.NOT_FOUND)
+            except Exception as exc:
+                LOG.exception("PUT 处理失败 path=%s", self.path)
+                self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
         def do_POST(self) -> None:  # noqa: N802
             parts = _parts(self.path)
@@ -177,16 +223,41 @@ def make_handler(
                     task = _task_from_config(config, run_id, "running")
                     stop_event = Event()
                     pause_event = Event()
-                    store.save_payload(task)
-                    with tasks_lock:
-                        tasks[run_id] = task
-                        stop_events[run_id] = stop_event
-                        pause_events[run_id] = pause_event
-                    Thread(
+                    control_owner_id = control_store.claim(run_id, origin=RUN_ORIGIN_WEB)
+                    if control_owner_id is None:
+                        raise RuntimeError(f"任务 {run_id} 已被其他 worker 占用")
+                    worker = Thread(
                         target=_run_task,
-                        args=(config, store, tasks, stop_events, pause_events, tasks_lock, stop_event, pause_event),
+                        args=(
+                            config,
+                            store,
+                            tasks,
+                            stop_events,
+                            pause_events,
+                            tasks_lock,
+                            stop_event,
+                            pause_event,
+                            control_store,
+                            control_owner_id,
+                            RUN_ORIGIN_WEB,
+                        ),
                         daemon=True,
-                    ).start()
+                    )
+                    try:
+                        store.save_payload(task)
+                        with tasks_lock:
+                            tasks[run_id] = task
+                            stop_events[run_id] = stop_event
+                            pause_events[run_id] = pause_event
+                        worker.start()
+                    except Exception:
+                        with tasks_lock:
+                            tasks.pop(run_id, None)
+                            stop_events.pop(run_id, None)
+                            pause_events.pop(run_id, None)
+                        control_store.release(run_id, control_owner_id)
+                        store.delete(run_id)
+                        raise
                     self._json(
                         {
                             "run_id": run_id,
@@ -198,7 +269,14 @@ def make_handler(
                     )
                     return
                 if len(parts) == 3 and parts[0] == "runs" and parts[2] == "stop":
-                    result = _request_stop(tasks, stop_events, tasks_lock, parts[1])
+                    result = _request_stop(
+                        tasks,
+                        stop_events,
+                        tasks_lock,
+                        parts[1],
+                        store=store,
+                        control_store=control_store,
+                    )
                     if result is None:
                         self._json({"error": "运行任务未找到或已结束"}, HTTPStatus.NOT_FOUND)
                     else:
@@ -206,11 +284,17 @@ def make_handler(
                             "收到停止任务请求",
                             extra={"event": "run.stop", "run_id": parts[1], "status": result.get("status")},
                         )
-                        store.save_payload(result)
                         self._json(result)
                     return
                 if len(parts) == 3 and parts[0] == "runs" and parts[2] == "pause":
-                    result = _request_pause(tasks, pause_events, tasks_lock, parts[1])
+                    result = _request_pause(
+                        tasks,
+                        pause_events,
+                        tasks_lock,
+                        parts[1],
+                        store=store,
+                        control_store=control_store,
+                    )
                     if result is None:
                         self._json({"error": "运行任务未找到或已结束"}, HTTPStatus.NOT_FOUND)
                     else:
@@ -218,7 +302,6 @@ def make_handler(
                             "收到暂停任务请求",
                             extra={"event": "run.pause", "run_id": parts[1], "status": result.get("status")},
                         )
-                        store.save_payload(result)
                         self._json(result)
                     return
                 if len(parts) == 3 and parts[0] == "runs" and parts[2] == "resume":
@@ -233,6 +316,7 @@ def make_handler(
                         agent_store,
                         mcp_store.path,
                         skill_store,
+                        control_store,
                     )
                     if result is None:
                         self._json({"error": "暂停或失败任务未找到，或当前状态不允许恢复"}, HTTPStatus.NOT_FOUND)
@@ -342,6 +426,21 @@ def make_handler(
 
         def do_DELETE(self) -> None:  # noqa: N802
             parts = _parts(self.path)
+            if len(parts) == 5 and parts[0] == "runs" and parts[2] == "findings" and parts[4] == "manual-review":
+                run_id = parts[1]
+                finding_id = parts[3]
+                persisted = store.get(run_id)
+                task = _get_task(tasks, tasks_lock, run_id)
+                effective = _merge_manual_reviews(task, persisted) if task is not None else persisted
+                if effective is None:
+                    self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
+                    return
+                if not _finding_exists(effective, finding_id):
+                    self._json({"error": "发现未找到"}, HTTPStatus.NOT_FOUND)
+                    return
+                deleted = bool(store.delete_manual_review(run_id, finding_id))
+                self._json({"deleted": deleted, "run_id": run_id, "finding_id": finding_id})
+                return
             if len(parts) == 2 and parts[0] == "runs":
                 deleted_record = store.delete(parts[1])
                 deleted_task = _delete_task(tasks, tasks_lock, parts[1])
@@ -440,6 +539,8 @@ def make_handler(
             if len(parts) >= 2 and parts[0] == "runs":
                 run = store.get(parts[1])
                 task = _get_task(tasks, tasks_lock, parts[1])
+                if task is not None:
+                    task = _merge_manual_reviews(task, run)
                 active_task = task if task is not None and task.get("status") != "completed" else None
                 terminal_payload = active_task if active_task is not None else run if run is not None else task
                 if len(parts) == 5 and parts[2] in {"cli-sessions", "codex-sessions"} and parts[4] in {"terminal-ui", "ws"}:
@@ -494,12 +595,12 @@ def make_handler(
                         self._json(active_task)
                         return
                     if len(parts) == 3 and parts[2] == "findings":
-                        self._json([_finding_summary(report) for report in active_task.get("reports", [])])
+                        self._json([_finding_summary(report, _manual_review_for(active_task, report.get("finding_id"))) for report in active_task.get("reports", [])])
                         return
                     if len(parts) == 4 and parts[2] == "findings":
                         for report in active_task.get("reports", []):
                             if report.get("finding_id") == parts[3]:
-                                self._json(report)
+                                self._json(_finding_detail(report, active_task))
                                 return
                         self._json({"error": "发现尚未生成或未找到"}, HTTPStatus.NOT_FOUND)
                         return
@@ -517,12 +618,12 @@ def make_handler(
                         self._json(task)
                         return
                     if len(parts) == 3 and parts[2] == "findings":
-                        self._json([_finding_summary(report) for report in task.get("reports", [])])
+                        self._json([_finding_summary(report, _manual_review_for(task, report.get("finding_id"))) for report in task.get("reports", [])])
                         return
                     if len(parts) == 4 and parts[2] == "findings":
                         for report in task.get("reports", []):
                             if report.get("finding_id") == parts[3]:
-                                self._json(report)
+                                self._json(_finding_detail(report, task))
                                 return
                         self._json({"error": "发现尚未生成或未找到"}, HTTPStatus.NOT_FOUND)
                         return
@@ -538,12 +639,12 @@ def make_handler(
                     self._json(_cli_session_terminal(run, parts[3]))
                     return
                 if len(parts) == 3 and parts[2] == "findings":
-                    self._json([_finding_summary(report) for report in run.get("reports", [])])
+                    self._json([_finding_summary(report, _manual_review_for(run, report.get("finding_id"))) for report in run.get("reports", [])])
                     return
                 if len(parts) == 4 and parts[2] == "findings":
                     for report in run.get("reports", []):
                         if report.get("finding_id") == parts[3]:
-                            self._json(report)
+                            self._json(_finding_detail(report, run))
                             return
                     self._json({"error": "发现未找到"}, HTTPStatus.NOT_FOUND)
                     return
@@ -796,6 +897,8 @@ def _run_detail(run):
         "resume_from_finding_id": run.get("resume_from_finding_id"),
         "resume_from_finding_index": run.get("resume_from_finding_index"),
         "config": run.get("config", {}),
+        "manual_reviews": _manual_reviews(run),
+        "manual_review_count": len(_manual_reviews(run)),
         "reusable_findings": _reusable_findings_metadata(run),
         "cli_sessions": cli_sessions,
         "cli_workflow": cli_workflow,
@@ -882,9 +985,24 @@ def _run_task(
     tasks_lock: Lock,
     stop_event: Event,
     pause_event: Event,
+    control_store: Optional[RunControlStore] = None,
+    control_owner_id: Optional[str] = None,
+    run_origin: str = RUN_ORIGIN_WEB,
 ) -> None:
     if config.engine in CLI_ENGINES:
-        _run_codex_task(config, store, tasks, stop_events, pause_events, tasks_lock, stop_event, pause_event)
+        _run_codex_task(
+            config,
+            store,
+            tasks,
+            stop_events,
+            pause_events,
+            tasks_lock,
+            stop_event,
+            pause_event,
+            control_store,
+            control_owner_id,
+            run_origin,
+        )
         return
     last_payload = None
     try:
@@ -892,10 +1010,17 @@ def _run_task(
         def on_progress(progress_report):
             nonlocal last_payload
             payload = to_jsonable(progress_report)
-            payload["run_origin"] = RUN_ORIGIN_WEB
+            payload["run_origin"] = run_origin
             payload["config"] = _config_task_snapshot(config)
             last_payload = payload
-            status = "stopping" if stop_event.is_set() else "pausing" if pause_event.is_set() else "running"
+            action = _requested_run_action(
+                config.run_id,
+                stop_event,
+                pause_event,
+                control_store,
+                control_owner_id,
+            )
+            status = "stopping" if action == "stop" else "pausing" if action == "pause" else "running"
             payload["status"] = status
             with tasks_lock:
                 tasks[payload["run_id"]] = _task_from_report_payload(payload, status)
@@ -910,19 +1035,42 @@ def _run_task(
         report = run_judgement(
             config,
             progress_callback=on_progress,
-            should_stop=lambda: stop_event.is_set() or pause_event.is_set(),
+            should_stop=lambda: _requested_run_action(
+                config.run_id,
+                stop_event,
+                pause_event,
+                control_store,
+                control_owner_id,
+            )
+            is not None,
         )
         payload = to_jsonable(report)
-        payload["run_origin"] = RUN_ORIGIN_WEB
+        last_payload = payload
+        if _requested_run_action(
+            config.run_id,
+            stop_event,
+            pause_event,
+            control_store,
+            control_owner_id,
+        ) is not None:
+            raise RunStopped("任务完成返回时收到暂停或停止请求")
+        payload["run_origin"] = run_origin
         payload["config"] = _config_task_snapshot(config)
         store.save_payload(payload)
         with tasks_lock:
             tasks[report.run_id] = _task_from_report_payload(payload, "completed")
         LOG.info("后台任务完成 run_id=%s findings=%s", report.run_id, report.finding_count)
     except RunStopped as exc:
-        if pause_event.is_set() and not stop_event.is_set():
+        action = _requested_run_action(
+            config.run_id,
+            stop_event,
+            pause_event,
+            control_store,
+            control_owner_id,
+        )
+        if action == "pause":
             LOG.info("后台任务已暂停 run_id=%s", config.run_id)
-            stopped_payload = _pause_payload(config, last_payload, str(exc))
+            stopped_payload = _pause_payload(config, last_payload, str(exc), run_origin=run_origin)
             status = "paused"
         else:
             LOG.info("后台任务已停止 run_id=%s", config.run_id)
@@ -935,6 +1083,7 @@ def _run_task(
             if "reports" not in stopped_payload:
                 stopped_payload["reports"] = []
             stopped_payload["config"] = _config_task_snapshot(config)
+            stopped_payload["run_origin"] = run_origin
             status = "stopped"
         store.save_payload(stopped_payload)
         with tasks_lock:
@@ -947,12 +1096,15 @@ def _run_task(
             failed["status"] = "failed"
             failed["error"] = str(exc)
             failed["diagnostics"] = [str(exc)]
+            failed["run_origin"] = run_origin
             tasks[failed["run_id"]] = failed
             store.save_payload(failed)
     finally:
         with tasks_lock:
             stop_events.pop(config.run_id, None)
             pause_events.pop(config.run_id, None)
+        if control_store is not None and control_owner_id is not None:
+            control_store.release(str(config.run_id), control_owner_id)
 
 
 def _run_codex_task(
@@ -964,6 +1116,9 @@ def _run_codex_task(
     tasks_lock: Lock,
     stop_event: Event,
     pause_event: Event,
+    control_store: Optional[RunControlStore] = None,
+    control_owner_id: Optional[str] = None,
+    run_origin: str = RUN_ORIGIN_WEB,
 ) -> None:
     cli_name = "OpenCode" if config.engine == OPENCODE_ENGINE else "Codex"
     last_payload = None
@@ -973,12 +1128,19 @@ def _run_codex_task(
         def on_progress(progress_payload):
             nonlocal last_payload
             payload = dict(progress_payload)
-            payload["run_origin"] = RUN_ORIGIN_WEB
+            payload["run_origin"] = run_origin
             payload["engine"] = config.engine
             payload["config"] = payload.get("config") or _config_task_snapshot(config)
             status = payload.get("status") or "running"
             if status == "running":
-                status = "stopping" if stop_event.is_set() else "pausing" if pause_event.is_set() else "running"
+                action = _requested_run_action(
+                    config.run_id,
+                    stop_event,
+                    pause_event,
+                    control_store,
+                    control_owner_id,
+                )
+                status = "stopping" if action == "stop" else "pausing" if action == "pause" else "running"
                 payload["status"] = status
             last_payload = payload
             with tasks_lock:
@@ -1001,9 +1163,26 @@ def _run_codex_task(
             config,
             store=store,
             progress_callback=on_progress,
-            should_stop=lambda: stop_event.is_set() or pause_event.is_set(),
+            run_origin=run_origin,
+            should_stop=lambda: _requested_run_action(
+                config.run_id,
+                stop_event,
+                pause_event,
+                control_store,
+                control_owner_id,
+            )
+            is not None,
         )
-        payload["run_origin"] = RUN_ORIGIN_WEB
+        last_payload = payload
+        if _requested_run_action(
+            config.run_id,
+            stop_event,
+            pause_event,
+            control_store,
+            control_owner_id,
+        ) is not None:
+            raise CodexRunnerStopped(f"{cli_name} 任务完成返回时收到暂停或停止请求")
+        payload["run_origin"] = run_origin
         payload["engine"] = config.engine
         payload["config"] = payload.get("config") or _config_task_snapshot(config)
         store.save_payload(payload)
@@ -1012,9 +1191,16 @@ def _run_codex_task(
         LOG.info("%s-driven 后台任务完成 run_id=%s findings=%s", cli_name, payload.get("run_id"), payload.get("finding_count"))
     except CodexRunnerStopped as exc:
         stop_sessions(last_payload or {})
-        if pause_event.is_set() and not stop_event.is_set():
+        action = _requested_run_action(
+            config.run_id,
+            stop_event,
+            pause_event,
+            control_store,
+            control_owner_id,
+        )
+        if action == "pause":
             LOG.info("%s-driven 后台任务已暂停 run_id=%s", cli_name, config.run_id)
-            stopped_payload = _pause_payload(config, last_payload, str(exc))
+            stopped_payload = _pause_payload(config, last_payload, str(exc), run_origin=run_origin)
             status = "paused"
         else:
             LOG.info("%s-driven 后台任务已停止 run_id=%s", cli_name, config.run_id)
@@ -1026,6 +1212,7 @@ def _run_codex_task(
             diagnostics.append(str(exc))
             stopped_payload["diagnostics"] = diagnostics
             stopped_payload["config"] = stopped_payload.get("config") or _config_task_snapshot(config)
+            stopped_payload["run_origin"] = run_origin
             status = "stopped"
         store.save_payload(stopped_payload)
         with tasks_lock:
@@ -1043,12 +1230,15 @@ def _run_codex_task(
             diagnostics.append(str(exc))
             failed["diagnostics"] = diagnostics
             failed["config"] = failed.get("config") or _config_task_snapshot(config)
+            failed["run_origin"] = run_origin
             tasks[failed["run_id"]] = failed
             store.save_payload(failed)
     finally:
         with tasks_lock:
             stop_events.pop(config.run_id, None)
             pause_events.pop(config.run_id, None)
+        if control_store is not None and control_owner_id is not None:
+            control_store.release(str(config.run_id), control_owner_id)
 
 
 def _task_from_report_payload(payload: dict, status: str) -> dict:
@@ -1626,8 +1816,15 @@ def _config_task_snapshot(config: RunConfig) -> dict:
     return run_config_snapshot(config)
 
 
-def _pause_payload(config: RunConfig, last_payload: Optional[dict], reason: str) -> dict:
+def _pause_payload(
+    config: RunConfig,
+    last_payload: Optional[dict],
+    reason: str,
+    *,
+    run_origin: str = RUN_ORIGIN_WEB,
+) -> dict:
     payload = dict(last_payload or _task_from_config(config, config.run_id or _new_run_id(), "paused"))
+    payload["run_origin"] = run_origin
     reports = mark_incomplete_findings_pending(
         payload.get("reports") or [],
         payload.get("completed_finding_count"),
@@ -1662,6 +1859,22 @@ def _pause_payload(config: RunConfig, last_payload: Optional[dict], reason: str)
     return payload
 
 
+def _requested_run_action(
+    run_id: Optional[str],
+    stop_event: Event,
+    pause_event: Event,
+    control_store: Optional[RunControlStore],
+    control_owner_id: Optional[str],
+) -> Optional[str]:
+    if stop_event.is_set():
+        return "stop"
+    if pause_event.is_set():
+        return "pause"
+    if control_store is None or control_owner_id is None or not run_id:
+        return None
+    return control_store.requested_action(str(run_id), control_owner_id)
+
+
 def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
     try:
         result = int(value)
@@ -1670,38 +1883,116 @@ def _bounded_int(value, *, default: int, minimum: int, maximum: int) -> int:
     return min(max(result, minimum), maximum)
 
 
-def _request_stop(tasks: dict, stop_events: dict, tasks_lock: Lock, run_id: str) -> Optional[dict]:
+def _request_stop(
+    tasks: dict,
+    stop_events: dict,
+    tasks_lock: Lock,
+    run_id: str,
+    *,
+    store: Optional[RunRecordStore] = None,
+    control_store: Optional[RunControlStore] = None,
+) -> Optional[dict]:
+    updated = None
+    stop_event = None
     with tasks_lock:
         task = tasks.get(run_id)
         stop_event = stop_events.get(run_id)
-        if task is None or stop_event is None:
-            return None
-        if task.get("status") in {"completed", "failed", "stopped"}:
+        if task is not None and task.get("status") in {"completed", "failed", "stopped"}:
             return dict(task)
-        stop_event.set()
-        updated = dict(task)
-        updated["status"] = "stopping"
-        updated["stop_requested"] = True
-        tasks[run_id] = updated
+        if task is not None and stop_event is not None:
+            updated = dict(task)
+            updated["status"] = "stopping"
+            updated["stop_requested"] = True
+            tasks[run_id] = updated
+    control = control_store or (RunControlStore(store.root) if store is not None else None)
+    if updated is not None:
+        signaled = False
+        if control is not None:
+            signaled = control.request(
+                run_id,
+                "stop",
+                requested_by=RUN_ORIGIN_WEB,
+                before_signal=(lambda: store.save_payload(updated)) if store is not None else None,
+            )
+        if store is not None and not signaled:
+            store.save_payload(updated)
+        if stop_event is not None:
+            stop_event.set()
         return dict(updated)
+    if store is None or control is None:
+        return None
+    stored = store.get(run_id)
+    if not stored or stored.get("status") not in {"queued", "running", "pausing", "stopping"}:
+        return None
+    updated = dict(stored)
+    updated["status"] = "stopping"
+    updated["stop_requested"] = True
+    if not control.request(
+        run_id,
+        "stop",
+        requested_by=RUN_ORIGIN_WEB,
+        before_signal=lambda: store.save_payload(updated),
+    ):
+        return None
+    return updated
 
 
-def _request_pause(tasks: dict, pause_events: dict, tasks_lock: Lock, run_id: str) -> Optional[dict]:
+def _request_pause(
+    tasks: dict,
+    pause_events: dict,
+    tasks_lock: Lock,
+    run_id: str,
+    *,
+    store: Optional[RunRecordStore] = None,
+    control_store: Optional[RunControlStore] = None,
+) -> Optional[dict]:
+    updated = None
+    pause_event = None
     with tasks_lock:
         task = tasks.get(run_id)
         pause_event = pause_events.get(run_id)
-        if task is None:
-            return None
-        if task.get("status") == "paused":
+        if task is not None and task.get("status") == "paused":
             return dict(task)
-        if pause_event is None or task.get("status") in {"completed", "failed", "stopped"}:
-            return None
-        pause_event.set()
-        updated = dict(task)
-        updated["status"] = "pausing"
-        updated["pause_requested"] = True
-        tasks[run_id] = updated
+        if task is not None and pause_event is not None and task.get("status") not in {"completed", "failed", "stopped"}:
+            updated = dict(task)
+            updated["status"] = "pausing"
+            updated["pause_requested"] = True
+            tasks[run_id] = updated
+    control = control_store or (RunControlStore(store.root) if store is not None else None)
+    if updated is not None:
+        signaled = False
+        if control is not None:
+            signaled = control.request(
+                run_id,
+                "pause",
+                requested_by=RUN_ORIGIN_WEB,
+                before_signal=(lambda: store.save_payload(updated)) if store is not None else None,
+            )
+        if store is not None and not signaled:
+            store.save_payload(updated)
+        if pause_event is not None:
+            pause_event.set()
         return dict(updated)
+    if store is None or control is None:
+        return None
+    stored = store.get(run_id)
+    if not stored:
+        return None
+    if stored.get("status") == "paused":
+        return dict(stored)
+    if stored.get("status") not in {"queued", "running", "pausing"}:
+        return None
+    updated = dict(stored)
+    updated["status"] = "pausing"
+    updated["pause_requested"] = True
+    if not control.request(
+        run_id,
+        "pause",
+        requested_by=RUN_ORIGIN_WEB,
+        before_signal=lambda: store.save_payload(updated),
+    ):
+        return None
+    return updated
 
 
 def _request_resume(
@@ -1715,7 +2006,11 @@ def _request_resume(
     agent_store: AgentDirectoryStore,
     mcp_servers_file: Path,
     skill_store: SkillSourceStore,
+    control_store: Optional[RunControlStore] = None,
 ) -> Optional[dict]:
+    control = control_store or RunControlStore(store.root)
+    control_owner_id = None
+    run_origin = RUN_ORIGIN_WEB
     with tasks_lock:
         active_task = tasks.get(run_id)
         if active_task and active_task.get("status") in {"running", "pausing", "stopping"}:
@@ -1730,22 +2025,56 @@ def _request_resume(
             return None
         checkpoint = _resume_checkpoint_payload(resumable_payload)
         config = _config_from_paused_payload(checkpoint, providers_file, agent_store, mcp_servers_file, skill_store)
+        run_origin = normalize_run_origin(resumable_payload)
+        control_owner_id = control.claim(
+            run_id,
+            origin=run_origin,
+            allow_paused_takeover=True,
+        )
+        if control_owner_id is None:
+            return None
         stop_event = Event()
         pause_event = Event()
         task = _task_from_report_payload(checkpoint, "running")
         task["status"] = "running"
         task["error"] = None
+        try:
+            store.save_payload(task)
+        except Exception:
+            control.release(run_id, control_owner_id)
+            raise
         tasks[run_id] = task
         stop_events[run_id] = stop_event
         pause_events[run_id] = pause_event
-        store.save_payload(task)
     if config.engine in CLI_ENGINES:
         stop_sessions(resumable_payload)
-    Thread(
+    worker = Thread(
         target=_run_task,
-        args=(config, store, tasks, stop_events, pause_events, tasks_lock, stop_event, pause_event),
+        args=(
+            config,
+            store,
+            tasks,
+            stop_events,
+            pause_events,
+            tasks_lock,
+            stop_event,
+            pause_event,
+            control,
+            control_owner_id,
+            run_origin,
+        ),
         daemon=True,
-    ).start()
+    )
+    try:
+        worker.start()
+    except Exception:
+        with tasks_lock:
+            tasks[run_id] = _task_from_report_payload(resumable_payload, str(resumable_payload.get("status") or "paused"))
+            stop_events.pop(run_id, None)
+            pause_events.pop(run_id, None)
+        store.save_payload(resumable_payload)
+        control.release(run_id, control_owner_id)
+        raise
     return dict(task)
 
 
@@ -1845,7 +2174,58 @@ def _safe_payload(payload) -> dict:
     return masked
 
 
-def _finding_summary(report):
+def _manual_reviews(run: Optional[dict]) -> dict:
+    value = run.get("manual_reviews") if isinstance(run, dict) else None
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(finding_id): dict(review)
+        for finding_id, review in value.items()
+        if finding_id and isinstance(review, dict)
+    }
+
+
+def _manual_review_for(run: Optional[dict], finding_id) -> Optional[dict]:
+    review = _manual_reviews(run).get(str(finding_id or ""))
+    return dict(review) if isinstance(review, dict) else None
+
+
+def _merge_manual_reviews(payload: Optional[dict], persisted: Optional[dict]) -> Optional[dict]:
+    if payload is None:
+        return dict(persisted) if isinstance(persisted, dict) else None
+    merged = dict(payload)
+    merged["manual_reviews"] = _manual_reviews(persisted)
+    return merged
+
+
+def _finding_exists(run: dict, finding_id: str) -> bool:
+    return any(str(report.get("finding_id") or "") == finding_id for report in run.get("reports") or [])
+
+
+def _validated_manual_review_payload(payload) -> tuple[str, str]:
+    if not isinstance(payload, dict):
+        raise ValueError("人工复核请求必须是 JSON 对象")
+    decision = str(payload.get("decision") or "").strip().upper()
+    if decision not in MANUAL_REVIEW_DECISIONS:
+        raise ValueError("人工复核结论必须是 TRUE_POSITIVE、FALSE_POSITIVE 或 INCONCLUSIVE")
+    evidence_value = payload.get("evidence", "")
+    if evidence_value is None:
+        evidence_value = ""
+    if not isinstance(evidence_value, str):
+        raise ValueError("人工复核证据必须是文本")
+    evidence = evidence_value.strip()
+    if len(evidence) > MANUAL_REVIEW_EVIDENCE_MAX_LENGTH:
+        raise ValueError(f"人工复核证据不能超过 {MANUAL_REVIEW_EVIDENCE_MAX_LENGTH} 个字符")
+    return decision, evidence
+
+
+def _finding_detail(report: dict, run: Optional[dict]) -> dict:
+    detail = dict(report)
+    detail["manual_review"] = _manual_review_for(run, report.get("finding_id"))
+    return detail
+
+
+def _finding_summary(report, manual_review: Optional[dict] = None):
     delivery = _codex_delivery_summary(report)
     return {
         "finding_id": report.get("finding_id"),
@@ -1860,6 +2240,7 @@ def _finding_summary(report):
         "debate_turn_count": len(report.get("debate", [])),
         "cli_delivery": delivery,
         "codex_delivery": delivery,
+        "manual_review": dict(manual_review) if isinstance(manual_review, dict) else None,
     }
 
 
@@ -1982,6 +2363,10 @@ def _export_run_markdown(run: dict) -> str:
                 f"- 结论：{report.get('verdict') or ''}",
                 f"- 置信度：{report.get('confidence')}",
                 "",
+                "### 人工复核",
+                "",
+                _manual_review_markdown(_manual_review_for(run, report.get("finding_id"))),
+                "",
                 "### 最终结论",
                 "",
                 _conclusion_without_graph(str(report.get("final_conclusion") or "无")),
@@ -2081,6 +2466,28 @@ def _export_run_markdown(run: dict) -> str:
             lines.append("- 无")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _manual_review_markdown(review: Optional[dict]) -> str:
+    if not isinstance(review, dict):
+        return "未复核。"
+    label = {
+        "TRUE_POSITIVE": "真实漏洞",
+        "FALSE_POSITIVE": "误报",
+        "INCONCLUSIVE": "证据不足",
+    }.get(str(review.get("decision") or ""), str(review.get("decision") or "未知"))
+    evidence = str(review.get("evidence") or "").strip() or "未填写"
+    return "\n".join(
+        [
+            f"- 人工结论：{label}",
+            f"- 创建时间：{review.get('created_at') or ''}",
+            f"- 更新时间：{review.get('updated_at') or ''}",
+            "",
+            "#### 人工证据",
+            "",
+            evidence,
+        ]
+    )
 
 
 def _verification_case_markdown(report: dict) -> str:
@@ -2453,6 +2860,38 @@ def app_html() -> str:
     }}
     .findings-table-wrap table {{ min-width: 620px; }}
     .findings-table-wrap tr.active {{ background: #edf7fb; box-shadow: inset 4px 0 0 var(--accent); }}
+    .manual-review-cell {{ width: 118px; white-space: nowrap; }}
+    .manual-review-toggle {{ padding: 5px 8px; background: #fbfcfe; }}
+    .manual-review-row > td {{ padding: 0; border-top: 0; background: #f8fafc; }}
+    .manual-review-card {{
+      display: grid;
+      gap: 12px;
+      padding: 14px;
+      border: 1px solid #b9d8e5;
+      border-left: 4px solid var(--accent);
+      border-radius: 6px;
+      background: #ffffff;
+      margin: 8px;
+    }}
+    .manual-review-card h4 {{ margin: 0; font-size: 14px; }}
+    .manual-review-options {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+    .manual-review-option {{
+      display: inline-flex;
+      grid-template-columns: none;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fbfcfe;
+      color: var(--text);
+      cursor: pointer;
+      font-size: 13px;
+    }}
+    .manual-review-option input {{ width: auto; margin: 0; padding: 0; }}
+    .manual-review-card textarea {{ min-height: 118px; }}
+    .manual-review-meta {{ font-size: 12px; color: var(--muted); }}
+    .manual-review-status {{ min-height: 20px; font-size: 12px; }}
     .findings-section {{
       overflow: visible;
     }}
@@ -3106,7 +3545,8 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, reuseFindingsFromRunId: null, deleteConfirmRunId: null }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentRun: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, reuseFindingsFromRunId: null, deleteConfirmRunId: null, expandedManualReviewKey: null, manualReviewDrafts: {{}} }};
+    const MANUAL_REVIEW_EVIDENCE_MAX_LENGTH = {MANUAL_REVIEW_EVIDENCE_MAX_LENGTH};
     const el = {{
       list: document.getElementById('run-list'),
       count: document.getElementById('run-count'),
@@ -3635,6 +4075,9 @@ def app_html() -> str:
     }}
     function jsonPost(body) {{
       return {{ method: 'POST', headers: {{ 'content-type': 'application/json' }}, body: JSON.stringify(body || {{}}) }};
+    }}
+    function jsonPut(body) {{
+      return {{ method: 'PUT', headers: {{ 'content-type': 'application/json' }}, body: JSON.stringify(body || {{}}) }};
     }}
 
     async function refreshAll() {{
@@ -4641,6 +5084,7 @@ def app_html() -> str:
     }}
 
     function renderRunDetail(run, findings) {{
+      state.currentRun = run;
       state.currentFindings = findings || [];
       const status = run.status || 'completed';
       const resumable = status === 'paused' || status === 'failed';
@@ -4777,18 +5221,90 @@ def app_html() -> str:
           </div>
           ${{findings.length ? `<div class="findings-table-wrap">
             <table>
-              <thead><tr><th>状态 / 结论</th><th>规则</th><th>置信度</th><th>摘要</th></tr></thead>
+              <thead><tr><th>状态 / 结论</th><th>规则</th><th>置信度</th><th>摘要</th><th>人工复核</th></tr></thead>
               <tbody>
-                ${{findings.map(item => `<tr class="clickable ${{state.selectedFinding === item.finding_id ? 'active' : ''}}" data-finding-id="${{esc(item.finding_id)}}">
-                  <td>${{findingStatusChip(item)}}</td>
-                  <td>${{esc(item.rule_id)}}<div class="path">${{esc(item.finding_id)}}</div></td>
-                  <td>${{item.finding_status === 'completed' ? esc(item.confidence) : '—'}}</td>
-                  <td><span class="plain-inline">${{plainInlineText(item.summary)}}</span><div class="path">${{esc((item.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div></td>
-                </tr>`).join('')}}
+                ${{findings.map(item => {{
+                  const key = manualReviewKey(state.selectedRun, item.finding_id);
+                  const expanded = state.expandedManualReviewKey === key;
+                  return `<tr class="clickable ${{state.selectedFinding === item.finding_id ? 'active' : ''}}" data-finding-id="${{esc(item.finding_id)}}">
+                    <td>${{findingStatusChip(item)}}</td>
+                    <td>${{esc(item.rule_id)}}<div class="path">${{esc(item.finding_id)}}</div></td>
+                    <td>${{item.finding_status === 'completed' ? esc(item.confidence) : '—'}}</td>
+                    <td><span class="plain-inline">${{plainInlineText(item.summary)}}</span><div class="path">${{esc((item.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div></td>
+                    <td class="manual-review-cell"><button type="button" class="manual-review-toggle" data-manual-review-toggle="true" data-finding-id="${{esc(item.finding_id)}}" aria-expanded="${{expanded ? 'true' : 'false'}}">${{manualReviewButton(item.manual_review)}}</button></td>
+                  </tr>
+                  <tr class="manual-review-row" data-manual-review-row="${{esc(item.finding_id)}}" ${{expanded ? '' : 'hidden'}}><td colspan="5">${{renderManualReviewCard(item)}}</td></tr>`;
+                }}).join('')}}
               </tbody>
             </table>
           </div>` : '<div class="muted">暂无漏洞发现。</div>'}}
         </div>
+      </div>`;
+    }}
+
+    function manualReviewKey(runId, findingId) {{
+      return `${{runId || ''}}:${{findingId || ''}}`;
+    }}
+
+    function manualReviewDecisionLabel(decision) {{
+      return {{ TRUE_POSITIVE: '真实漏洞', FALSE_POSITIVE: '误报', INCONCLUSIVE: '证据不足' }}[decision] || '未复核';
+    }}
+
+    function manualReviewButton(review) {{
+      if (!review || !review.decision) return '<span class="chip">未复核</span>';
+      return `<span class="chip ${{verdictClass(review.decision)}}">${{esc(manualReviewDecisionLabel(review.decision))}}</span>`;
+    }}
+
+    function manualReviewDraft(item) {{
+      const key = manualReviewKey(state.selectedRun, item.finding_id);
+      const saved = item.manual_review || null;
+      let draft = state.manualReviewDrafts[key];
+      if (!draft) {{
+        draft = {{
+          decision: saved?.decision || '',
+          evidence: saved?.evidence || '',
+          dirty: false,
+          savedUpdatedAt: saved?.updated_at || '',
+          message: '',
+          error: false,
+        }};
+        state.manualReviewDrafts[key] = draft;
+      }} else if (!draft.dirty && (saved?.updated_at || '') !== draft.savedUpdatedAt) {{
+        draft.decision = saved?.decision || '';
+        draft.evidence = saved?.evidence || '';
+        draft.savedUpdatedAt = saved?.updated_at || '';
+        draft.message = '';
+        draft.error = false;
+      }}
+      return draft;
+    }}
+
+    function renderManualReviewCard(item) {{
+      const draft = manualReviewDraft(item);
+      const review = item.manual_review || null;
+      const radioName = `manual-review-${{state.selectedRun || ''}}-${{item.finding_id || ''}}`;
+      const option = (decision, label) => `<label class="manual-review-option"><input type="radio" name="${{esc(radioName)}}" value="${{decision}}" data-manual-review-decision="true" data-finding-id="${{esc(item.finding_id)}}" ${{draft.decision === decision ? 'checked' : ''}}> ${{esc(label)}}</label>`;
+      return `<div class="manual-review-card" data-manual-review-card="${{esc(item.finding_id)}}">
+        <div>
+          <h4>人工复核 · ${{esc(item.rule_id || item.finding_id)}}</h4>
+          <div class="path">${{esc(item.finding_id)}}</div>
+        </div>
+        ${{item.finding_status !== 'completed' ? '<div class="muted">AI 研判尚未完成；人工记录仍可保存，后续流水线更新不会覆盖它。</div>' : ''}}
+        <div class="manual-review-options" role="radiogroup" aria-label="人工复核结论">
+          ${{option('TRUE_POSITIVE', '真实漏洞')}}
+          ${{option('FALSE_POSITIVE', '误报')}}
+          ${{option('INCONCLUSIVE', '证据不足')}}
+        </div>
+        <label>人工证据
+          <textarea maxlength="${{MANUAL_REVIEW_EVIDENCE_MAX_LENGTH}}" data-manual-review-evidence="true" data-finding-id="${{esc(item.finding_id)}}" placeholder="输入人工确认依据、代码位置、复现情况或排除理由">${{esc(draft.evidence)}}</textarea>
+        </label>
+        ${{review ? `<div class="manual-review-meta">创建：${{esc(fmtDate(review.created_at))}} · 更新：${{esc(fmtDate(review.updated_at))}}</div>` : '<div class="manual-review-meta">尚未保存人工复核。</div>'}}
+        <div class="toolbar">
+          <button type="button" data-manual-review-save="true" data-finding-id="${{esc(item.finding_id)}}">保存复核</button>
+          <button type="button" data-manual-review-cancel="true" data-finding-id="${{esc(item.finding_id)}}">取消</button>
+          ${{review ? `<button type="button" class="danger-button" data-manual-review-clear="true" data-finding-id="${{esc(item.finding_id)}}">清除复核</button>` : ''}}
+        </div>
+        <div class="manual-review-status ${{draft.error ? 'error' : draft.message ? 'success' : ''}}" data-manual-review-status="${{esc(item.finding_id)}}">${{esc(draft.message || '')}}</div>
       </div>`;
     }}
 
@@ -4998,11 +5514,164 @@ def app_html() -> str:
       for (const row of el.detail.querySelectorAll('tr[data-finding-id]')) {{
         row.addEventListener('click', () => selectFinding(row.dataset.findingId, {{ scrollToDetail: true }}));
       }}
+      for (const button of el.detail.querySelectorAll('[data-manual-review-toggle]')) {{
+        button.addEventListener('click', event => {{
+          event.stopPropagation();
+          const key = manualReviewKey(state.selectedRun, button.dataset.findingId);
+          state.expandedManualReviewKey = state.expandedManualReviewKey === key ? null : key;
+          updateManualReviewExpansionUi();
+        }});
+      }}
+      for (const input of el.detail.querySelectorAll('[data-manual-review-decision]')) {{
+        input.addEventListener('change', () => {{
+          const item = findingSummaryById(input.dataset.findingId);
+          if (!item) return;
+          const draft = manualReviewDraft(item);
+          draft.decision = input.value;
+          draft.dirty = true;
+          draft.message = '';
+          draft.error = false;
+          setManualReviewStatus(item.finding_id, '', false);
+        }});
+      }}
+      for (const textarea of el.detail.querySelectorAll('[data-manual-review-evidence]')) {{
+        textarea.addEventListener('input', () => {{
+          const item = findingSummaryById(textarea.dataset.findingId);
+          if (!item) return;
+          const draft = manualReviewDraft(item);
+          draft.evidence = textarea.value;
+          draft.dirty = true;
+          draft.message = '';
+          draft.error = false;
+          setManualReviewStatus(item.finding_id, '', false);
+        }});
+      }}
+      for (const button of el.detail.querySelectorAll('[data-manual-review-save]')) {{
+        button.addEventListener('click', () => saveManualReview(button.dataset.findingId, button));
+      }}
+      for (const button of el.detail.querySelectorAll('[data-manual-review-cancel]')) {{
+        button.addEventListener('click', () => cancelManualReview(button.dataset.findingId));
+      }}
+      for (const button of el.detail.querySelectorAll('[data-manual-review-clear]')) {{
+        button.addEventListener('click', () => clearManualReview(button.dataset.findingId, button));
+      }}
       if (!findings.length) return;
       const selected = state.selectedFinding && findings.some(item => item.finding_id === state.selectedFinding)
         ? state.selectedFinding
         : findings[0].finding_id;
       selectFinding(selected, {{ scrollToDetail: false }});
+    }}
+
+    function findingSummaryById(findingId) {{
+      return (state.currentFindings || []).find(item => item.finding_id === findingId) || null;
+    }}
+
+    function updateManualReviewExpansionUi() {{
+      for (const row of el.detail.querySelectorAll('[data-manual-review-row]')) {{
+        const key = manualReviewKey(state.selectedRun, row.dataset.manualReviewRow);
+        row.hidden = state.expandedManualReviewKey !== key;
+      }}
+      for (const button of el.detail.querySelectorAll('[data-manual-review-toggle]')) {{
+        const key = manualReviewKey(state.selectedRun, button.dataset.findingId);
+        button.setAttribute('aria-expanded', state.expandedManualReviewKey === key ? 'true' : 'false');
+      }}
+    }}
+
+    function setManualReviewStatus(findingId, message, isError) {{
+      const status = el.detail.querySelector(`[data-manual-review-status="${{cssEscape(findingId)}}"]`);
+      if (!status) return;
+      status.textContent = message || '';
+      status.classList.toggle('error', Boolean(isError));
+      status.classList.toggle('success', Boolean(message) && !isError);
+    }}
+
+    function cssEscape(value) {{
+      if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(String(value || ''));
+      return String(value || '').replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+    }}
+
+    function cancelManualReview(findingId) {{
+      const item = findingSummaryById(findingId);
+      if (!item) return;
+      const saved = item.manual_review || null;
+      state.manualReviewDrafts[manualReviewKey(state.selectedRun, findingId)] = {{
+        decision: saved?.decision || '',
+        evidence: saved?.evidence || '',
+        dirty: false,
+        savedUpdatedAt: saved?.updated_at || '',
+        message: '',
+        error: false,
+      }};
+      state.expandedManualReviewKey = null;
+      renderRunDetail(state.currentRun || {{}}, state.currentFindings);
+    }}
+
+    async function saveManualReview(findingId, button) {{
+      const item = findingSummaryById(findingId);
+      if (!item) return;
+      const draft = manualReviewDraft(item);
+      if (!draft.decision) {{
+        draft.message = '请选择人工复核结论。';
+        draft.error = true;
+        setManualReviewStatus(findingId, draft.message, true);
+        return;
+      }}
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = '保存中...';
+      setManualReviewStatus(findingId, '', false);
+      try {{
+        const result = await fetchJson(
+          `/runs/${{encodeURIComponent(state.selectedRun)}}/findings/${{encodeURIComponent(findingId)}}/manual-review`,
+          jsonPut({{ decision: draft.decision, evidence: draft.evidence }})
+        );
+        const currentItem = findingSummaryById(findingId);
+        if (currentItem) currentItem.manual_review = result.manual_review;
+        if (state.currentRun) {{
+          state.currentRun.manual_reviews = state.currentRun.manual_reviews || {{}};
+          state.currentRun.manual_reviews[findingId] = result.manual_review;
+        }}
+        state.manualReviewDrafts[manualReviewKey(state.selectedRun, findingId)] = {{
+          decision: result.manual_review.decision,
+          evidence: result.manual_review.evidence || '',
+          dirty: false,
+          savedUpdatedAt: result.manual_review.updated_at || '',
+          message: result.created ? '人工复核已创建。' : '人工复核已更新。',
+          error: false,
+        }};
+        renderRunDetail(state.currentRun || {{}}, state.currentFindings);
+      }} catch (error) {{
+        draft.message = error.message;
+        draft.error = true;
+        setManualReviewStatus(findingId, error.message, true);
+        button.disabled = false;
+        button.textContent = originalText;
+      }}
+    }}
+
+    async function clearManualReview(findingId, button) {{
+      const item = findingSummaryById(findingId);
+      if (!item) return;
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = '清除中...';
+      try {{
+        await fetchJson(
+          `/runs/${{encodeURIComponent(state.selectedRun)}}/findings/${{encodeURIComponent(findingId)}}/manual-review`,
+          {{ method: 'DELETE' }}
+        );
+        const currentItem = findingSummaryById(findingId);
+        if (currentItem) currentItem.manual_review = null;
+        if (state.currentRun?.manual_reviews) delete state.currentRun.manual_reviews[findingId];
+        state.manualReviewDrafts[manualReviewKey(state.selectedRun, findingId)] = {{
+          decision: '', evidence: '', dirty: false, savedUpdatedAt: '', message: '人工复核已清除。', error: false,
+        }};
+        renderRunDetail(state.currentRun || {{}}, state.currentFindings);
+      }} catch (error) {{
+        setManualReviewStatus(findingId, error.message, true);
+        button.disabled = false;
+        button.textContent = originalText;
+      }}
     }}
 
     function providerLabel(value, llmEnabled) {{

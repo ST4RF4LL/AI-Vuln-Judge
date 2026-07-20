@@ -105,6 +105,10 @@ Web 端选择 Skill Source，或继续手动填写 `skills_path`。
 Web 端右上角提供 `MCP / Skills` 配置入口，支持 MCP Server 保存、删除、默认 Atlas MCP
 选择、连通性测试，以及 Skill Source 保存、删除、默认知识库选择和加载测试。
 
+漏洞发现表格最右侧提供“人工复核”入口。每个任务中的每个 finding 可保存一条最新人工结论
+（真实漏洞、误报或证据不足）及人工证据；再次打开会加载已保存内容。人工复核独立于 AI 结论，
+会随 run 记录落盘，并包含在 JSON、Markdown 和 MCP finding 查询结果中。
+
 ## vuln-judger MCP Server
 
 `vuln-judger` 也可以作为 stdio MCP Server 暴露给 Codex、opencode 等 CLI 客户端。客户端
@@ -126,7 +130,10 @@ uv run vuln-judger mcp \
 - `judge_report`：对 SARIF/Markdown 报告和源码目录启动完整研判。默认使用重构后的
   `codex` 三会话引擎并立即返回 `run_id`；使用 `get_run` 轮询运行状态。传
   `engine: "opencode"` 可改用 OpenCode，传 `engine: "builtin"` 可继续使用旧的同步内置流程。
-- `stop_run`：停止由当前 MCP Server 启动且仍在运行的异步 CLI 研判。
+- `stop_run`：停止仍在运行的异步 CLI 研判；Web 与 MCP 创建的任务共用控制状态。
+- `pause_run`：请求暂停异步 CLI 研判并持久化断点。
+- `resume_run`：从首个未完成 stage 恢复暂停或失败的异步 CLI 研判。MCP 创建的任务也可在
+  Web Dashboard 中暂停和恢复。
 - `one_round_judge`：使用内置流程对单个 finding 进行单轮快速验证，默认保存 run 记录。
   默认 `response_mode: compact` 只返回关键结论、调用链/数据流概览、关键缺口和完整报告访问方式，
   以减少 CLI Agent 上下文占用；如不希望 Web 端显示该快速验证记录，可传 `save: false`。

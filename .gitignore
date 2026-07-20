@@ -33,3 +33,6 @@ agents/*/*/AGENT.json
 vuln_judger.egg-info/
 
 .codex/
+
+# Local design notes
+DESIGN_NOW.md

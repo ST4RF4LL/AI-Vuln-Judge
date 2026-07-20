@@ -13,7 +13,15 @@ from uuid import uuid4
 
 from .agents import DEFAULT_AGENTS_DIR, AgentDirectoryStore
 from .analyzers import AnalyzerSettings, AnalyzerSuite
-from .api import DEFAULT_RECORDS_DIR, _export_run_markdown
+from .api import (
+    DEFAULT_RECORDS_DIR,
+    _config_from_paused_payload,
+    _export_run_markdown,
+    _finding_detail,
+    _manual_review_for,
+    _pause_payload,
+    _resume_checkpoint_payload,
+)
 from .codex_runner import CLI_ENGINES, CODEX_ENGINE, OPENCODE_ENGINE, CodexDrivenRunner, CodexRunnerStopped, stop_sessions
 from .debate import DebateOrchestrator
 from .evidence import EvidenceCollector
@@ -22,7 +30,7 @@ from .models import DEFAULT_SILENCE_REMINDER_MINUTES, RunConfig, SourceLocation,
 from .opencode_runner import OpenCodeDrivenRunner
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
-from .records import RunRecordStore, normalize_run_origin
+from .records import RunControlStore, RunRecordStore, normalize_run_origin
 from .run_state import FINDING_COMPLETED, completed_finding_count, finding_report_status
 from .sarif import load_report
 from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore, load_project_context
@@ -48,6 +56,7 @@ class JudgerMCPSettings:
 class _ActiveRun:
     stop_event: Event
     thread: Thread
+    owner_id: str
 
 
 class JudgerMCPServer:
@@ -61,6 +70,7 @@ class JudgerMCPServer:
         self.stdin = stdin or sys.stdin
         self.stdout = stdout or sys.stdout
         self.records = RunRecordStore(self.settings.records_dir)
+        self.control_store = RunControlStore(self.records.root)
         self.agent_store = AgentDirectoryStore(self.settings.agents_dir)
         self.skill_store = SkillSourceStore(self.settings.skills_file)
         self._active_runs: Dict[str, _ActiveRun] = {}
@@ -85,6 +95,7 @@ class JudgerMCPServer:
             active = list(self._active_runs.items())
         for run_id, task in active:
             task.stop_event.set()
+            self.control_store.request(run_id, "stop", requested_by="mcp")
             stop_sessions(self.records.get(run_id) or {})
         for _, task in active:
             task.thread.join(timeout=1)
@@ -150,6 +161,10 @@ class JudgerMCPServer:
             return self._export_run_markdown(arguments)
         if name == "stop_run":
             return self._stop_run(arguments)
+        if name == "pause_run":
+            return self._pause_run(arguments)
+        if name == "resume_run":
+            return self._resume_run(arguments)
         raise ValueError(f"Unknown tool: {name}")
 
     def _judge_report(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -226,25 +241,61 @@ class JudgerMCPServer:
             result["report"] = payload
         return result
 
-    def _start_codex_report(self, config: RunConfig) -> Dict[str, Any]:
+    def _start_codex_report(
+        self,
+        config: RunConfig,
+        *,
+        resume_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         run_id = str(config.run_id)
-        queued = _queued_codex_payload(config)
+        run_origin = normalize_run_origin(resume_payload or {"run_origin": "mcp"})
+        queued = dict(resume_payload or _queued_codex_payload(config))
+        queued["status"] = "running" if resume_payload is not None else "queued"
+        queued["run_origin"] = run_origin
+        queued["error"] = None
         stop_event = Event()
-        thread = Thread(
-            target=self._codex_run_worker,
-            args=(config, stop_event),
-            name=f"vuln-judger-mcp-{run_id}",
-            daemon=True,
-        )
         with self._active_runs_lock:
             if run_id in self._active_runs:
                 raise ValueError(f"Run is already active: {run_id}")
             existing = self.records.get(run_id)
-            if existing is not None:
+            if existing is not None and resume_payload is None:
                 raise ValueError(f"Run already exists: {run_id}")
-            self._active_runs[run_id] = _ActiveRun(stop_event=stop_event, thread=thread)
-            self.records.save_payload(queued)
-        thread.start()
+            owner_id = self.control_store.claim(
+                run_id,
+                origin=run_origin,
+                allow_paused_takeover=resume_payload is not None,
+            )
+            if owner_id is None:
+                raise ValueError(f"Run is already owned by another worker: {run_id}")
+            thread = Thread(
+                target=self._codex_run_worker,
+                args=(config, stop_event, owner_id, run_origin),
+                name=f"vuln-judger-mcp-{run_id}",
+                daemon=True,
+            )
+            self._active_runs[run_id] = _ActiveRun(
+                stop_event=stop_event,
+                thread=thread,
+                owner_id=owner_id,
+            )
+            try:
+                self.records.save_payload(queued)
+            except Exception:
+                self._active_runs.pop(run_id, None)
+                self.control_store.release(run_id, owner_id)
+                raise
+        try:
+            thread.start()
+        except Exception as exc:
+            with self._active_runs_lock:
+                self._active_runs.pop(run_id, None)
+            self.control_store.release(run_id, owner_id)
+            failed = dict(self.records.get(run_id) or queued)
+            failed["status"] = "failed"
+            failed["error"] = str(exc)
+            failed["run_origin"] = run_origin
+            self.records.save_payload(failed)
+            raise
         result = _run_summary(queued)
         result.update(
             {
@@ -253,49 +304,111 @@ class JudgerMCPServer:
                 "record_path": str(self.records._path(run_id)),
                 "poll": {"tool": "get_run", "arguments": {"run_id": run_id}},
                 "stop": {"tool": "stop_run", "arguments": {"run_id": run_id}},
+                "pause": {"tool": "pause_run", "arguments": {"run_id": run_id}},
             }
         )
         return result
 
-    def _codex_run_worker(self, config: RunConfig, stop_event: Event) -> None:
+    def _codex_run_worker(
+        self,
+        config: RunConfig,
+        stop_event: Event,
+        owner_id: str,
+        run_origin: str,
+    ) -> None:
         try:
-            self._run_codex_report(config, stop_event=stop_event)
+            self._run_codex_report(
+                config,
+                stop_event=stop_event,
+                owner_id=owner_id,
+                run_origin=run_origin,
+            )
         except Exception as exc:
-            self._record_codex_failure(config, exc, stopped=stop_event.is_set())
+            self._record_codex_failure(
+                config,
+                exc,
+                stopped=stop_event.is_set(),
+                run_origin=run_origin,
+            )
         finally:
+            self.control_store.release(str(config.run_id), owner_id)
             with self._active_runs_lock:
                 self._active_runs.pop(str(config.run_id), None)
 
-    def _run_codex_report(self, config: RunConfig, stop_event: Optional[Event] = None) -> Dict[str, Any]:
+    def _run_codex_report(
+        self,
+        config: RunConfig,
+        stop_event: Optional[Event] = None,
+        owner_id: Optional[str] = None,
+        run_origin: str = "mcp",
+    ) -> Dict[str, Any]:
         runner = (
             OpenCodeDrivenRunner(records_dir=self.records.root)
             if config.engine == OPENCODE_ENGINE
             else CodexDrivenRunner(records_dir=self.records.root)
         )
+
+        def requested_action() -> Optional[str]:
+            if stop_event is not None and stop_event.is_set():
+                return "stop"
+            if owner_id is None:
+                return None
+            return self.control_store.requested_action(str(config.run_id), owner_id)
+
         try:
             payload = runner.run(
                 config,
                 store=self.records,
-                run_origin="mcp",
-                should_stop=stop_event.is_set if stop_event is not None else None,
+                run_origin=run_origin,
+                should_stop=lambda: requested_action() is not None,
             )
         except CodexRunnerStopped:
             current = self.records.get(str(config.run_id)) or _queued_codex_payload(config)
-            stop_sessions(current)
-            stopped = dict(current)
-            stopped["status"] = "stopped"
-            stopped["run_origin"] = "mcp"
-            stopped["engine"] = config.engine
-            stopped["error"] = None
-            self.records.save_payload(stopped)
-            return stopped
-        payload["run_origin"] = "mcp"
+            action = requested_action()
+            return self._controlled_codex_result(config, current, action, run_origin)
+        action = requested_action()
+        if action is not None:
+            current = self.records.get(str(config.run_id)) or payload
+            return self._controlled_codex_result(config, current, action, run_origin)
+        payload["run_origin"] = run_origin
         payload["engine"] = config.engine
         payload["config"] = payload.get("config") or _config_snapshot(config)
         self.records.save_payload(payload)
         return payload
 
-    def _record_codex_failure(self, config: RunConfig, exc: Exception, *, stopped: bool = False) -> Dict[str, Any]:
+    def _controlled_codex_result(
+        self,
+        config: RunConfig,
+        current: Dict[str, Any],
+        action: Optional[str],
+        run_origin: str,
+    ) -> Dict[str, Any]:
+        stop_sessions(current)
+        if action == "pause":
+            paused = _pause_payload(
+                config,
+                current,
+                "MCP worker 收到暂停请求",
+                run_origin=run_origin,
+            )
+            self.records.save_payload(paused)
+            return paused
+        stopped = dict(current)
+        stopped["status"] = "stopped"
+        stopped["run_origin"] = run_origin
+        stopped["engine"] = config.engine
+        stopped["error"] = None
+        self.records.save_payload(stopped)
+        return stopped
+
+    def _record_codex_failure(
+        self,
+        config: RunConfig,
+        exc: Exception,
+        *,
+        stopped: bool = False,
+        run_origin: str = "mcp",
+    ) -> Dict[str, Any]:
         run_id = str(config.run_id)
         current = self.records.get(run_id) or _queued_codex_payload(config)
         stop_sessions(current)
@@ -305,7 +418,7 @@ class JudgerMCPServer:
         diagnostics = list(failed.get("diagnostics") or [])
         diagnostics.append(str(exc))
         failed["diagnostics"] = diagnostics
-        failed["run_origin"] = "mcp"
+        failed["run_origin"] = run_origin
         failed["engine"] = config.engine
         self.records.save_payload(failed)
         return failed
@@ -487,7 +600,7 @@ class JudgerMCPServer:
         finding_id = _required_text(arguments, "finding_id")
         for report in run.get("reports") or []:
             if report.get("finding_id") == finding_id:
-                return report
+                return _finding_detail(report, run)
         raise ValueError(f"Finding not found: {finding_id}")
 
     def _export_run_markdown(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -498,8 +611,6 @@ class JudgerMCPServer:
         run_id = _required_text(arguments, "run_id")
         with self._active_runs_lock:
             active = self._active_runs.get(run_id)
-            if active is not None:
-                active.stop_event.set()
         run = self.records.get(run_id)
         if run is None:
             raise ValueError(f"Run not found: {run_id}")
@@ -508,18 +619,88 @@ class JudgerMCPServer:
             result["stop_requested"] = False
             result["message"] = f"Run is already {run.get('status')}: {run_id}"
             return result
-        if active is None:
+        stopping = dict(run)
+        stopping["status"] = "stopping"
+        stopping["run_origin"] = normalize_run_origin(run)
+        control_requested = self.control_store.request(
+            run_id,
+            "stop",
+            requested_by="mcp",
+            before_signal=lambda: self.records.save_payload(stopping),
+        )
+        if active is None and not control_requested:
             result = _run_summary(run)
             result["stop_requested"] = False
             result["message"] = f"Run is not active: {run_id}"
             return result
+        if not control_requested:
+            self.records.save_payload(stopping)
+        if active is not None:
+            active.stop_event.set()
         stop_sessions(run)
-        stopping = dict(run)
-        stopping["status"] = "stopping"
-        stopping["run_origin"] = "mcp"
-        self.records.save_payload(stopping)
         result = _run_summary(stopping)
         result["stop_requested"] = True
+        return result
+
+    def _pause_run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        run_id = _required_text(arguments, "run_id")
+        run = self.records.get(run_id)
+        if run is None:
+            raise ValueError(f"Run not found: {run_id}")
+        status = str(run.get("status") or "")
+        if status == "paused":
+            result = _run_summary(run)
+            result["pause_requested"] = False
+            result["message"] = f"Run is already paused: {run_id}"
+            return result
+        if status in {"completed", "failed", "stopped"}:
+            result = _run_summary(run)
+            result["pause_requested"] = False
+            result["message"] = f"Run is already {status}: {run_id}"
+            return result
+        pausing = dict(run)
+        pausing["status"] = "pausing"
+        pausing["pause_requested"] = True
+        if not self.control_store.request(
+            run_id,
+            "pause",
+            requested_by="mcp",
+            before_signal=lambda: self.records.save_payload(pausing),
+        ):
+            result = _run_summary(run)
+            result["pause_requested"] = False
+            result["message"] = f"Run is not active: {run_id}"
+            return result
+        result = _run_summary(pausing)
+        result["pause_requested"] = True
+        return result
+
+    def _resume_run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        run_id = _required_text(arguments, "run_id")
+        run = self.records.get(run_id)
+        if run is None:
+            raise ValueError(f"Run not found: {run_id}")
+        status = str(run.get("status") or "")
+        if status not in {"paused", "failed"}:
+            result = _run_summary(run)
+            result["resume_started"] = False
+            result["message"] = f"Run is not resumable from {status}: {run_id}"
+            return result
+        checkpoint = _resume_checkpoint_payload(run)
+        config = _config_from_paused_payload(
+            checkpoint,
+            self.settings.providers_file,
+            self.agent_store,
+            self.settings.mcp_servers_file,
+            self.skill_store,
+        )
+        stop_sessions(run)
+        with self._active_runs_lock:
+            previous = self._active_runs.get(run_id)
+        if previous is not None:
+            previous.thread.join(timeout=2)
+        result = self._start_codex_report(config, resume_payload=checkpoint)
+        result["resume_started"] = True
         return result
 
     def _load_run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
@@ -684,6 +865,18 @@ def _tool_specs() -> List[Dict[str, Any]]:
         _tool(
             "stop_run",
             "Request cancellation of an asynchronous CLI review started by this MCP server.",
+            {"run_id": {"type": "string"}},
+            ["run_id"],
+        ),
+        _tool(
+            "pause_run",
+            "Pause an asynchronous CLI review and persist a resumable checkpoint.",
+            {"run_id": {"type": "string"}},
+            ["run_id"],
+        ),
+        _tool(
+            "resume_run",
+            "Resume a paused or failed asynchronous CLI review from its first incomplete stage.",
             {"run_id": {"type": "string"}},
             ["run_id"],
         ),
@@ -1202,6 +1395,7 @@ def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
                 "confidence": report.get("confidence"),
                 "summary": report.get("reasoning_summary"),
                 "source_locations": report.get("source_locations", []),
+                "manual_review": _manual_review_for(run, report.get("finding_id")),
             }
         )
     return {
@@ -1219,6 +1413,7 @@ def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
         "current_finding_index": run.get("current_finding_index"),
         "current_finding_ids": run.get("current_finding_ids") or {},
         "verdict_counts": counts,
+        "manual_review_count": len(run.get("manual_reviews") or {}),
         "findings": finding_summaries,
         "diagnostics": run.get("diagnostics", []),
         "error": run.get("error"),

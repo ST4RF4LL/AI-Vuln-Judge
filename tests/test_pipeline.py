@@ -28,6 +28,7 @@ from vuln_judger.api import (
     _config_from_payload,
     _finding_summary,
     _pause_payload,
+    _request_pause,
     _request_resume,
     _resume_checkpoint_payload,
     _send_codex_session_input,
@@ -91,7 +92,7 @@ from vuln_judger.opencode_runner import (
 from vuln_judger.opencode_prompt_client import send_prompt
 from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
-from vuln_judger.records import RunRecordStore
+from vuln_judger.records import RunControlStore, RunRecordStore
 from vuln_judger.sarif import ReportPreparationError, load_sarif, prepare_report_for_processing
 from vuln_judger.skills import SkillSourceStore
 from vuln_judger.source import SourceIndexer, detect_project_languages
@@ -1795,6 +1796,109 @@ for raw in sys.stdin.buffer:
             self.assertEqual([item["finding_status"] for item in saved["reports"]], ["completed", "pending", "pending"])
             self.assertIn("服务重启时发现任务未完成", saved["diagnostics"][-1])
 
+    def test_run_control_store_serializes_worker_ownership_and_pause_signal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            control = RunControlStore(Path(tmp) / "records")
+            owner = control.claim("run-control", origin="mcp")
+
+            self.assertIsNotNone(owner)
+            self.assertIsNone(control.claim("run-control", origin="web"))
+            persisted = []
+            self.assertTrue(
+                control.request(
+                    "run-control",
+                    "pause",
+                    requested_by="web",
+                    before_signal=lambda: persisted.append("pausing"),
+                )
+            )
+            self.assertEqual(persisted, ["pausing"])
+            self.assertEqual(control.requested_action("run-control", owner), "pause")
+
+            replacement = control.claim("run-control", origin="mcp", allow_paused_takeover=True)
+            self.assertIsNotNone(replacement)
+            self.assertNotEqual(replacement, owner)
+            self.assertIsNone(control.requested_action("run-control", owner))
+            self.assertIsNone(control.requested_action("run-control", replacement))
+            self.assertFalse(control.release("run-control", owner))
+            self.assertTrue(control.release("run-control", replacement))
+
+    def test_record_store_does_not_recover_run_owned_by_live_mcp_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunRecordStore(Path(tmp) / "records")
+            store.save_payload(
+                {
+                    "run_id": "run-live-mcp",
+                    "status": "running",
+                    "run_origin": "mcp",
+                    "engine": "opencode",
+                    "finding_count": 1,
+                    "completed_finding_count": 0,
+                    "reports": [],
+                    "diagnostics": [],
+                }
+            )
+            control = RunControlStore(store.root)
+            owner = control.claim("run-live-mcp", origin="mcp")
+
+            self.assertEqual(store.recover_unfinished(), [])
+            self.assertEqual(store.get("run-live-mcp")["status"], "running")
+            self.assertTrue(control.release("run-live-mcp", owner))
+            self.assertEqual(len(store.recover_unfinished()), 1)
+            self.assertEqual(store.get("run-live-mcp")["status"], "paused")
+
+    def test_record_store_preserves_latest_manual_review_across_pipeline_writes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunRecordStore(Path(tmp) / "records")
+            pipeline_payload = {
+                "run_id": "run-manual-review",
+                "status": "running",
+                "reports": [
+                    {
+                        "finding_id": "finding-1",
+                        "rule_id": "rule-1",
+                        "finding_status": "completed",
+                        "verdict": "INCONCLUSIVE",
+                    }
+                ],
+            }
+            store.save_payload(dict(pipeline_payload))
+
+            created, was_created = store.update_manual_review(
+                "run-manual-review",
+                "finding-1",
+                decision="TRUE_POSITIVE",
+                evidence="人工确认入口可达。",
+            )
+            self.assertTrue(was_created)
+            self.assertEqual(created["decision"], "TRUE_POSITIVE")
+            self.assertEqual(created["created_at"], created["updated_at"])
+
+            stale_pipeline_payload = dict(pipeline_payload)
+            stale_pipeline_payload["manual_reviews"] = {
+                "finding-1": {"decision": "FALSE_POSITIVE", "evidence": "stale"}
+            }
+            store.save_payload(stale_pipeline_payload)
+            preserved = store.get("run-manual-review")["manual_reviews"]["finding-1"]
+            self.assertEqual(preserved["decision"], "TRUE_POSITIVE")
+            self.assertEqual(preserved["evidence"], "人工确认入口可达。")
+
+            updated, was_created = store.update_manual_review(
+                "run-manual-review",
+                "finding-1",
+                decision="FALSE_POSITIVE",
+                evidence="固定白名单映射，无法注入。",
+            )
+            self.assertFalse(was_created)
+            self.assertEqual(updated["created_at"], created["created_at"])
+            self.assertEqual(updated["decision"], "FALSE_POSITIVE")
+            self.assertTrue(store.delete_manual_review("run-manual-review", "finding-1"))
+
+            # A stale worker payload must not resurrect a review after the user clears it.
+            store.save_payload(stale_pipeline_payload)
+            self.assertEqual(store.get("run-manual-review")["manual_reviews"], {})
+            self.assertFalse(store.delete_manual_review("run-manual-review", "finding-1"))
+
     def test_record_store_preserves_opencode_stage_checkpoint_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = RunRecordStore(Path(tmp) / "records")
@@ -1917,6 +2021,44 @@ for raw in sys.stdin.buffer:
                     runs = json.loads(response.read().decode("utf-8"))
                 with urllib.request.urlopen(f"{base}/runs/{created['run_id']}/findings", timeout=5) as response:
                     findings = json.loads(response.read().decode("utf-8"))
+                finding_id = findings[0]["finding_id"]
+                manual_review_url = f"{base}/runs/{created['run_id']}/findings/{finding_id}/manual-review"
+                create_review_request = urllib.request.Request(
+                    manual_review_url,
+                    data=json.dumps(
+                        {"decision": "TRUE_POSITIVE", "evidence": "人工确认请求参数可到达危险函数。"}
+                    ).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="PUT",
+                )
+                with urllib.request.urlopen(create_review_request, timeout=5) as response:
+                    created_review = json.loads(response.read().decode("utf-8"))
+                    self.assertEqual(response.status, HTTPStatus.CREATED)
+                self.assertTrue(created_review["created"])
+                first_created_at = created_review["manual_review"]["created_at"]
+
+                update_review_request = urllib.request.Request(
+                    manual_review_url,
+                    data=json.dumps(
+                        {"decision": "FALSE_POSITIVE", "evidence": "人工复核确认存在固定白名单映射。"}
+                    ).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="PUT",
+                )
+                with urllib.request.urlopen(update_review_request, timeout=5) as response:
+                    updated_review = json.loads(response.read().decode("utf-8"))
+                    self.assertEqual(response.status, HTTPStatus.OK)
+                self.assertFalse(updated_review["created"])
+                self.assertEqual(updated_review["manual_review"]["created_at"], first_created_at)
+
+                with urllib.request.urlopen(f"{base}/runs/{created['run_id']}/findings", timeout=5) as response:
+                    reviewed_findings = json.loads(response.read().decode("utf-8"))
+                with urllib.request.urlopen(
+                    f"{base}/runs/{created['run_id']}/findings/{finding_id}", timeout=5
+                ) as response:
+                    reviewed_detail = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(reviewed_findings[0]["manual_review"]["decision"], "FALSE_POSITIVE")
+                self.assertEqual(reviewed_detail["manual_review"]["evidence"], "人工复核确认存在固定白名单映射。")
                 with urllib.request.urlopen(
                     f"{base}/runs/{created['run_id']}/export?format=markdown",
                     timeout=5,
@@ -1937,10 +2079,14 @@ for raw in sys.stdin.buffer:
                 self.assertEqual(runs[0]["run_origin"], "web")
                 self.assertEqual(json_report["run_id"], run["run_id"])
                 self.assertEqual(json_report["run_origin"], "web")
+                self.assertEqual(json_report["manual_reviews"][finding_id]["decision"], "FALSE_POSITIVE")
                 self.assertIn("# 漏洞研判报告", markdown_report)
                 self.assertIn(f"- 任务 ID：{created['run_id']}", markdown_report)
                 self.assertIn("- 任务来源：Web 端", markdown_report)
                 self.assertIn("## 发现 1:", markdown_report)
+                self.assertIn("### 人工复核", markdown_report)
+                self.assertIn("- 人工结论：误报", markdown_report)
+                self.assertIn("人工复核确认存在固定白名单映射。", markdown_report)
                 self.assertIn("### 调用链 / 数据流概览", markdown_report)
                 self.assertNotIn("```mermaid", markdown_report)
                 overview_section = markdown_report.split("### 调用链 / 数据流概览", 1)[1].split("### 摘要", 1)[0]
@@ -1953,6 +2099,25 @@ for raw in sys.stdin.buffer:
                 self.assertIn("evidence_graph", json_report["reports"][0])
                 self.assertEqual(findings[0]["verdict"], "TRUE_POSITIVE")
                 self.assertIn("漏洞研判记录", html)
+                invalid_review_request = urllib.request.Request(
+                    manual_review_url,
+                    data=json.dumps({"decision": "UNKNOWN", "evidence": "invalid"}).encode("utf-8"),
+                    headers={"content-type": "application/json"},
+                    method="PUT",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as invalid_context:
+                    urllib.request.urlopen(invalid_review_request, timeout=5)
+                self.assertEqual(invalid_context.exception.code, HTTPStatus.BAD_REQUEST)
+
+                clear_review_request = urllib.request.Request(manual_review_url, method="DELETE")
+                with urllib.request.urlopen(clear_review_request, timeout=5) as response:
+                    cleared_review = json.loads(response.read().decode("utf-8"))
+                self.assertTrue(cleared_review["deleted"])
+                with urllib.request.urlopen(
+                    f"{base}/runs/{created['run_id']}/findings/{finding_id}", timeout=5
+                ) as response:
+                    cleared_detail = json.loads(response.read().decode("utf-8"))
+                self.assertIsNone(cleared_detail["manual_review"])
                 delete_request = urllib.request.Request(f"{base}/runs/{created['run_id']}", method="DELETE")
                 with urllib.request.urlopen(delete_request, timeout=5) as response:
                     deleted = json.loads(response.read().decode("utf-8"))
@@ -2106,6 +2271,17 @@ for raw in sys.stdin.buffer:
         self.assertIn('async function stopRun(runId)', html)
         self.assertIn('async function pauseRun(runId)', html)
         self.assertIn('async function resumeRun(runId)', html)
+        self.assertIn('<th>人工复核</th>', html)
+        self.assertIn('data-manual-review-toggle="true"', html)
+        self.assertIn('class="manual-review-card"', html)
+        self.assertIn("option('TRUE_POSITIVE', '真实漏洞')", html)
+        self.assertIn("option('FALSE_POSITIVE', '误报')", html)
+        self.assertIn("option('INCONCLUSIVE', '证据不足')", html)
+        self.assertIn('async function saveManualReview(findingId, button)', html)
+        self.assertIn('async function clearManualReview(findingId, button)', html)
+        self.assertIn('state.manualReviewDrafts[key]', html)
+        self.assertIn('draft.dirty = true', html)
+        self.assertIn("method: 'PUT'", html)
         self.assertIn("paused: '已暂停'", html)
         self.assertIn("pausing: '正在暂停'", html)
         self.assertIn('function isTerminalStatus(status)', html)
@@ -5180,6 +5356,7 @@ for raw in sys.stdin.buffer:
             self.assertTrue(started["asynchronous"])
             self.assertEqual(started["engine"], "opencode")
             self.assertEqual(started["poll"]["tool"], "get_run")
+            self.assertEqual(started["pause"]["tool"], "pause_run")
             self.assertEqual(completed["status"], "completed")
             self.assertEqual(completed["run_origin"], "mcp")
             self.assertEqual(captured["config"].engine, "opencode")
@@ -5232,6 +5409,128 @@ for raw in sys.stdin.buffer:
             self.assertEqual(stopped["status"], "stopped")
             self.assertEqual(stopped["run_origin"], "mcp")
 
+    def test_web_can_pause_and_resume_run_owned_by_mcp_server(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = JudgerMCPSettings(
+                records_dir=root / "records",
+                providers_file=root / "providers.json",
+                mcp_servers_file=root / "mcp.json",
+                skills_file=root / "skills.json",
+                agents_dir=root / "agents",
+            )
+            server = JudgerMCPServer(settings)
+            resumed = {}
+
+            class BlockingOpenCodeRunner:
+                def __init__(self, *, records_dir):
+                    self.records_dir = records_dir
+
+                def run(self, config, *, store, run_origin, should_stop=None):
+                    while should_stop is None or not should_stop():
+                        time.sleep(0.005)
+                    # Exercise the completion race: a CLI adapter may return just
+                    # as pause is requested instead of raising CodexRunnerStopped.
+                    return {
+                        "run_id": str(config.run_id),
+                        "status": "completed",
+                        "run_origin": run_origin,
+                        "engine": "opencode",
+                        "finding_count": 0,
+                        "completed_finding_count": 0,
+                        "reports": [],
+                        "diagnostics": [],
+                    }
+
+            class CompletingOpenCodeRunner:
+                def __init__(self, *, records_dir):
+                    self.records_dir = records_dir
+
+                def run(self, config, *, store, progress_callback=None, run_origin, should_stop=None):
+                    resumed["run_origin"] = run_origin
+                    resumed["config"] = config
+                    payload = dict(store.get(str(config.run_id)) or {})
+                    payload.update(
+                        {
+                            "run_id": str(config.run_id),
+                            "status": "completed",
+                            "run_origin": run_origin,
+                            "engine": "opencode",
+                            "finding_count": 0,
+                            "completed_finding_count": 0,
+                            "reports": [],
+                            "diagnostics": payload.get("diagnostics") or [],
+                        }
+                    )
+                    return payload
+
+            try:
+                with patch("vuln_judger.mcp_server.OpenCodeDrivenRunner", BlockingOpenCodeRunner):
+                    started = server._judge_report(
+                        {
+                            "report_path": str(root / "report.md"),
+                            "source_path": str(root / "source"),
+                            "engine": "opencode",
+                        }
+                    )
+                    run_id = started["run_id"]
+
+                    # A Dashboard process starting while MCP owns the run must not
+                    # mistake it for an abandoned run and auto-pause it.
+                    self.assertEqual(server.records.recover_unfinished(), [])
+
+                    pause_result = _request_pause(
+                        {},
+                        {},
+                        Lock(),
+                        run_id,
+                        store=server.records,
+                        control_store=RunControlStore(server.records.root),
+                    )
+                    self.assertEqual(pause_result["status"], "pausing")
+                    deadline = time.monotonic() + 2
+                    paused = None
+                    while time.monotonic() < deadline:
+                        paused = server.records.get(run_id)
+                        if paused and paused.get("status") == "paused":
+                            break
+                        time.sleep(0.01)
+                    self.assertEqual(paused["status"], "paused")
+                    self.assertEqual(paused["run_origin"], "mcp")
+
+                tasks = {}
+                stop_events = {}
+                pause_events = {}
+                tasks_lock = Lock()
+                with patch("vuln_judger.api.OpenCodeDrivenRunner", CompletingOpenCodeRunner):
+                    resume_result = _request_resume(
+                        server.records,
+                        tasks,
+                        stop_events,
+                        pause_events,
+                        tasks_lock,
+                        run_id,
+                        settings.providers_file,
+                        server.agent_store,
+                        settings.mcp_servers_file,
+                        server.skill_store,
+                        RunControlStore(server.records.root),
+                    )
+                    self.assertEqual(resume_result["status"], "running")
+                    deadline = time.monotonic() + 2
+                    completed = None
+                    while time.monotonic() < deadline:
+                        completed = server.records.get(run_id)
+                        if completed and completed.get("status") == "completed":
+                            break
+                        time.sleep(0.01)
+
+                self.assertEqual(completed["status"], "completed")
+                self.assertEqual(completed["run_origin"], "mcp")
+                self.assertEqual(resumed["run_origin"], "mcp")
+            finally:
+                server.close()
+
     def test_vuln_judger_mcp_server_tools_run_and_export(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5261,6 +5560,8 @@ for raw in sys.stdin.buffer:
                 self.assertIn("collect_evidence", tools)
                 self.assertIn("export_run_markdown", tools)
                 self.assertIn("stop_run", tools)
+                self.assertIn("pause_run", tools)
+                self.assertIn("resume_run", tools)
                 judge_spec = next(tool for tool in tool_specs if tool.get("name") == "judge_report")
                 self.assertEqual(judge_spec["inputSchema"]["properties"]["engine"]["default"], "opencode")
                 self.assertEqual(
@@ -5338,6 +5639,19 @@ for raw in sys.stdin.buffer:
                 quick_finding = mcp_tool_json(client.call_tool("get_finding", quick_finding_args))
                 self.assertEqual(quick_finding["finding_id"], quick["selected_finding"]["finding_id"])
                 self.assertIn("evidence_chain", quick_finding)
+                review_store = RunRecordStore(records)
+                saved_review = review_store.update_manual_review(
+                    quick["run_id"],
+                    quick["selected_finding"]["finding_id"],
+                    decision="TRUE_POSITIVE",
+                    evidence="MCP 读取人工复核测试。",
+                )
+                self.assertIsNotNone(saved_review)
+                reviewed_quick_finding = mcp_tool_json(client.call_tool("get_finding", quick_finding_args))
+                self.assertEqual(reviewed_quick_finding["manual_review"]["decision"], "TRUE_POSITIVE")
+                reviewed_quick_run = mcp_tool_json(client.call_tool("get_run", {"run_id": quick["run_id"]}))
+                self.assertEqual(reviewed_quick_run["manual_review_count"], 1)
+                self.assertEqual(reviewed_quick_run["findings"][0]["manual_review"]["evidence"], "MCP 读取人工复核测试。")
 
                 judged = mcp_tool_json(
                     client.call_tool(
