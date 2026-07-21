@@ -20,6 +20,7 @@ from .api import (
     _finding_detail,
     _manual_review_for,
     _pause_payload,
+    _report_findings_payload,
     _resume_checkpoint_payload,
 )
 from .codex_runner import CLI_ENGINES, CODEX_ENGINE, OPENCODE_ENGINE, CodexDrivenRunner, CodexRunnerStopped, stop_sessions
@@ -31,7 +32,13 @@ from .opencode_runner import OpenCodeDrivenRunner
 from .pipeline import run_judgement
 from .providers import DEFAULT_PROVIDERS_FILE
 from .records import RunControlStore, RunRecordStore, normalize_run_origin
-from .run_state import FINDING_COMPLETED, completed_finding_count, finding_report_status
+from .run_state import (
+    FINDING_COMPLETED,
+    FINDING_IN_PROGRESS,
+    FINDING_PENDING,
+    completed_finding_count,
+    finding_report_status,
+)
 from .sarif import load_report
 from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore, load_project_context
 from .source import SourceIndexer
@@ -159,6 +166,8 @@ class JudgerMCPServer:
             return self._get_finding(arguments)
         if name == "export_run_markdown":
             return self._export_run_markdown(arguments)
+        if name == "export_run_report":
+            return self._export_run_report(arguments)
         if name == "stop_run":
             return self._stop_run(arguments)
         if name == "pause_run":
@@ -607,6 +616,10 @@ class JudgerMCPServer:
         run = self._load_run(arguments)
         return {"run_id": run.get("run_id"), "markdown": _export_run_markdown(run)}
 
+    def _export_run_report(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        run = self._load_run(arguments)
+        return _structured_run_report(run, arguments)
+
     def _stop_run(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         run_id = _required_text(arguments, "run_id")
         with self._active_runs_lock:
@@ -860,6 +873,27 @@ def _tool_specs() -> List[Dict[str, Any]]:
             "export_run_markdown",
             "Export a saved run as Markdown.",
             {"run_id": {"type": "string"}},
+            ["run_id"],
+        ),
+        _tool(
+            "export_run_report",
+            "Export a saved run as stable structured JSON, including pending split findings and normalized report/adjudication details.",
+            {
+                "run_id": {"type": "string"},
+                "detail_level": {
+                    "type": "string",
+                    "enum": ["summary", "detail", "raw"],
+                    "default": "detail",
+                    "description": "detail returns Dashboard-aligned sections; raw additionally returns persisted reports and split findings.",
+                },
+                "finding_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional finding ids to export, in canonical report order.",
+                },
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+            },
             ["run_id"],
         ),
         _tool(
@@ -1168,7 +1202,11 @@ def _key_gaps(missing: Sequence[Dict[str, Any]], limit: int = 5) -> List[str]:
 
 
 def _next_actions(saved: bool) -> List[str]:
-    actions = ["需要更多细节时，优先调用 get_finding 读取完整 finding 报告。", "需要人读报告时，调用 export_run_markdown 导出完整 Markdown。"]
+    actions = [
+        "需要结构化消费整个 run 时，调用 export_run_report 导出状态、结论和详情。",
+        "需要更多细节时，优先调用 get_finding 读取完整 finding 报告。",
+        "需要人读报告时，调用 export_run_markdown 导出完整 Markdown。",
+    ]
     if not saved:
         actions.insert(0, "当前未保存 run；如需后续访问完整报告，请重新调用 one_round_judge 并设置 save=true。")
     return actions
@@ -1180,6 +1218,12 @@ def _full_report_access(run_id: str, finding_id: str, record_path: Optional[str]
         "record_path": record_path,
         "mcp_get_run": {"tool": "get_run", "arguments": {"run_id": run_id, "include_reports": True}} if saved else None,
         "mcp_get_finding": {"tool": "get_finding", "arguments": {"run_id": run_id, "finding_id": finding_id}} if saved else None,
+        "mcp_export_report": {
+            "tool": "export_run_report",
+            "arguments": {"run_id": run_id, "detail_level": "detail"},
+        }
+        if saved
+        else None,
         "mcp_export_markdown": {"tool": "export_run_markdown", "arguments": {"run_id": run_id}} if saved else None,
     }
 
@@ -1418,3 +1462,298 @@ def _run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
         "diagnostics": run.get("diagnostics", []),
         "error": run.get("error"),
     }
+
+
+def _structured_run_report(run: Dict[str, Any], arguments: Dict[str, Any]) -> Dict[str, Any]:
+    detail_level = str(arguments.get("detail_level") or "detail").strip().lower()
+    if detail_level not in {"summary", "detail", "raw"}:
+        raise ValueError("detail_level must be summary, detail, or raw")
+    offset = _export_integer_argument(arguments, "offset", default=0, minimum=0)
+    limit = _export_integer_argument(arguments, "limit", default=20, minimum=1, maximum=100)
+
+    canonical, canonical_source, split_origin = _canonical_export_findings(run)
+    requested_ids = _export_finding_ids(arguments.get("finding_ids"))
+    canonical_ids = [str(item.get("finding_id") or "") for item, _ in canonical]
+    if requested_ids is not None:
+        unknown = [finding_id for finding_id in requested_ids if finding_id not in canonical_ids]
+        if unknown:
+            raise ValueError(f"Finding not found: {', '.join(unknown)}")
+        requested = set(requested_ids)
+        matched = [item for item in canonical if str(item[0].get("finding_id") or "") in requested]
+    else:
+        matched = canonical
+
+    all_statuses = [_export_finding_status(run, split, report) for split, report in canonical]
+    selected = matched[offset : offset + limit]
+    exported_findings = [
+        _export_finding(run, split, report, detail_level)
+        for split, report in selected
+    ]
+    status_counts = {
+        FINDING_COMPLETED: all_statuses.count(FINDING_COMPLETED),
+        FINDING_IN_PROGRESS: all_statuses.count(FINDING_IN_PROGRESS),
+        FINDING_PENDING: all_statuses.count(FINDING_PENDING),
+    }
+    verdict_counts: Dict[str, int] = {}
+    for _, report in canonical:
+        if not isinstance(report, dict) or finding_report_status(report) != FINDING_COMPLETED:
+            continue
+        verdict = str(report.get("verdict") or "UNKNOWN")
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+
+    declared_count = _safe_nonnegative_int(run.get("finding_count"), len(canonical))
+    matched_count = len(matched)
+    next_offset = offset + len(selected) if offset + len(selected) < matched_count else None
+    return {
+        "schema_version": 1,
+        "detail_level": detail_level,
+        "run": {
+            "run_id": run.get("run_id"),
+            "status": run.get("status", "completed"),
+            "engine": run.get("engine") or (run.get("config") or {}).get("engine") or BUILTIN_ENGINE,
+            "run_origin": normalize_run_origin(run),
+            "created_at": run.get("created_at"),
+            "updated_at": run.get("updated_at"),
+            "source_path": run.get("source_path"),
+            "sarif_path": run.get("sarif_path"),
+            "languages": _json_copy(run.get("languages") or []),
+            "finding_count": declared_count,
+            "completed_finding_count": status_counts[FINDING_COMPLETED],
+            "current_finding_id": run.get("current_finding_id"),
+            "current_finding_index": run.get("current_finding_index"),
+            "current_finding_ids": _json_copy(run.get("current_finding_ids") or {}),
+            "resume_from_finding_id": run.get("resume_from_finding_id"),
+            "resume_from_finding_index": run.get("resume_from_finding_index"),
+            "verdict_counts": verdict_counts,
+            "manual_review_count": len(run.get("manual_reviews") or {}),
+            "diagnostics": _json_copy(run.get("diagnostics") or []),
+            "error": run.get("error"),
+        },
+        "coverage": {
+            "source": canonical_source,
+            "split_origin": split_origin,
+            "total": len(canonical),
+            "declared_total": declared_count,
+            "canonical_complete": declared_count == 0 or len(canonical) >= declared_count,
+            "matched": matched_count,
+            "returned": len(exported_findings),
+            "offset": offset,
+            "limit": limit,
+            "next_offset": next_offset,
+            "completed": status_counts[FINDING_COMPLETED],
+            "in_progress": status_counts[FINDING_IN_PROGRESS],
+            "pending": status_counts[FINDING_PENDING],
+            "missing_detail": sum(1 for _, report in canonical if not isinstance(report, dict)),
+        },
+        "findings": exported_findings,
+    }
+
+
+def _canonical_export_findings(
+    run: Dict[str, Any],
+) -> Tuple[List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]], str, Optional[str]]:
+    reports = [item for item in run.get("reports") or [] if isinstance(item, dict)]
+    reports_by_id = {
+        str(report.get("finding_id") or ""): report
+        for report in reports
+        if str(report.get("finding_id") or "")
+    }
+    payload = _report_findings_payload(run)
+    raw_findings = payload.get("findings") if isinstance(payload, dict) else None
+    split_findings = [item for item in raw_findings or [] if isinstance(item, dict)]
+    if not split_findings:
+        return [(dict(report), report) for report in reports], "reports", None
+
+    canonical: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
+    included = set()
+    for item in split_findings:
+        finding_id = str(item.get("finding_id") or "")
+        canonical.append((item, reports_by_id.get(finding_id)))
+        if finding_id:
+            included.add(finding_id)
+    for report in reports:
+        finding_id = str(report.get("finding_id") or "")
+        if finding_id not in included:
+            canonical.append((dict(report), report))
+    origin = str(payload.get("origin") or "").strip() or None
+    return canonical, "report_findings", origin
+
+
+def _export_finding(
+    run: Dict[str, Any],
+    split: Dict[str, Any],
+    report: Optional[Dict[str, Any]],
+    detail_level: str,
+) -> Dict[str, Any]:
+    finding_id = str(split.get("finding_id") or (report or {}).get("finding_id") or "")
+    status = _export_finding_status(run, split, report)
+    conclusion = None
+    if isinstance(report, dict):
+        conclusion = {
+            "verdict": report.get("verdict"),
+            "confidence": report.get("confidence"),
+            "reasoning_summary": report.get("reasoning_summary"),
+            "final_conclusion": report.get("final_conclusion"),
+        }
+    item: Dict[str, Any] = {
+        "finding_id": finding_id,
+        "rule_id": split.get("rule_id") or (report or {}).get("rule_id"),
+        "status": status,
+        "conclusion": conclusion,
+        "report_detail_available": bool(_normalized_report_detail(split, report)),
+        "finding_detail_available": isinstance(report, dict),
+        "missing_detail_reason": _missing_detail_reason(status) if not isinstance(report, dict) else None,
+        "manual_review": _json_copy(_manual_review_for(run, finding_id)),
+        "report_detail": None,
+        "finding_detail": None,
+    }
+    if detail_level in {"detail", "raw"}:
+        item["report_detail"] = _normalized_report_detail(split, report)
+        item["finding_detail"] = _normalized_finding_detail(report) if isinstance(report, dict) else None
+    if detail_level == "raw":
+        item["raw"] = {
+            "split_finding": _json_copy(split),
+            "report": _json_copy(report),
+        }
+    return item
+
+
+def _normalized_report_detail(
+    split: Dict[str, Any], report: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    report_evidence = None
+    if isinstance(report, dict):
+        for evidence in report.get("evidence_chain") or []:
+            if isinstance(evidence, dict) and (
+                evidence.get("kind") == "REPORT" or evidence.get("source") == "input-report"
+            ):
+                report_evidence = evidence
+                break
+    data = report_evidence.get("data") if isinstance(report_evidence, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    detail = {
+        "rule_id": split.get("rule_id") or data.get("rule_id") or (report or {}).get("rule_id"),
+        "level": split.get("level") or data.get("level"),
+        "message": split.get("message") or data.get("message") or (report_evidence or {}).get("summary"),
+        "locations": _json_copy(split.get("locations") or data.get("locations") or (report_evidence or {}).get("locations") or []),
+        "code_flows": _json_copy(split.get("code_flows") or data.get("code_flows") or []),
+        "properties": _json_copy(data.get("properties")),
+        "raw_result": _json_copy(data.get("raw_result")),
+    }
+    if not any(value not in (None, "", [], {}) for value in detail.values()):
+        return None
+    return detail
+
+
+def _normalized_finding_detail(report: Dict[str, Any]) -> Dict[str, Any]:
+    workflow = report.get("cli_workflow") if isinstance(report.get("cli_workflow"), dict) else {}
+    if not workflow and isinstance(report.get("codex_workflow"), dict):
+        workflow = report["codex_workflow"]
+    role_conclusions = {
+        role: _normalized_role_conclusion(workflow.get(role))
+        for role in ("affirmative", "negative", "moderator")
+    }
+    return {
+        "reasoning_summary": report.get("reasoning_summary"),
+        "final_conclusion": report.get("final_conclusion"),
+        "source_locations": _json_copy(report.get("source_locations") or []),
+        "protection_assessment": report.get("protection_assessment"),
+        "impact_assessment": report.get("impact_assessment"),
+        "disputed_points": _json_copy(report.get("disputed_points") or []),
+        "recommended_next_steps": _json_copy(report.get("recommended_next_steps") or []),
+        "verification_case": _json_copy(report.get("verification_case") or {}),
+        "scorecard": _json_copy(report.get("scorecard") or {}),
+        "evidence_graph": _json_copy(report.get("evidence_graph") or {}),
+        "evidence_ledger": _json_copy(report.get("evidence_ledger") or []),
+        "role_conclusions": role_conclusions,
+    }
+
+
+def _normalized_role_conclusion(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict) or not value:
+        return None
+    keys = (
+        "position",
+        "verdict",
+        "confidence",
+        "summary",
+        "reasoning_summary",
+        "final_conclusion",
+        "attack_chain",
+        "data_flow",
+        "protection_assessment",
+        "impact_assessment",
+        "key_evidence",
+        "limitations",
+        "disputed_points",
+        "recommended_next_steps",
+        "source_locations",
+    )
+    return {key: _json_copy(value.get(key)) for key in keys if key in value}
+
+
+def _export_finding_status(
+    run: Dict[str, Any], split: Dict[str, Any], report: Optional[Dict[str, Any]]
+) -> str:
+    if isinstance(report, dict):
+        return finding_report_status(report)
+    run_status = str(run.get("status") or "").strip().lower()
+    if run_status not in {"queued", "starting", "running", "pausing", "stopping"}:
+        return FINDING_PENDING
+    finding_id = str(split.get("finding_id") or "")
+    current_ids = run.get("current_finding_ids") if isinstance(run.get("current_finding_ids"), dict) else {}
+    active_ids = {str(value or "") for value in current_ids.values()}
+    active_ids.add(str(run.get("current_finding_id") or ""))
+    return FINDING_IN_PROGRESS if finding_id and finding_id in active_ids else FINDING_PENDING
+
+
+def _missing_detail_reason(status: str) -> str:
+    if status == FINDING_IN_PROGRESS:
+        return "adjudication_in_progress"
+    if status == FINDING_COMPLETED:
+        return "completed_report_missing"
+    return "adjudication_not_started"
+
+
+def _export_finding_ids(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("finding_ids must be an array of non-empty strings")
+    result = []
+    for item in value:
+        finding_id = str(item).strip() if isinstance(item, str) else ""
+        if not finding_id:
+            raise ValueError("finding_ids must be an array of non-empty strings")
+        if finding_id not in result:
+            result.append(finding_id)
+    return result
+
+
+def _export_integer_argument(
+    arguments: Dict[str, Any], key: str, *, default: int, minimum: int, maximum: Optional[int] = None
+) -> int:
+    value = arguments.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be an integer") from exc
+    if parsed < minimum or (maximum is not None and parsed > maximum):
+        suffix = f" and at most {maximum}" if maximum is not None else ""
+        raise ValueError(f"{key} must be at least {minimum}{suffix}")
+    return parsed
+
+
+def _safe_nonnegative_int(value: Any, default: int) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, default)
+
+
+def _json_copy(value: Any) -> Any:
+    if value is None:
+        return None
+    return json.loads(json.dumps(value, ensure_ascii=False))

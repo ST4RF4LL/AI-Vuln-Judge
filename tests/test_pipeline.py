@@ -5559,6 +5559,7 @@ for raw in sys.stdin.buffer:
                 self.assertIn("one_round_judge", tools)
                 self.assertIn("collect_evidence", tools)
                 self.assertIn("export_run_markdown", tools)
+                self.assertIn("export_run_report", tools)
                 self.assertIn("stop_run", tools)
                 self.assertIn("pause_run", tools)
                 self.assertIn("resume_run", tools)
@@ -5627,6 +5628,7 @@ for raw in sys.stdin.buffer:
                 self.assertIn("next_actions", quick)
                 self.assertIn("full_report_access", quick)
                 self.assertEqual(quick["full_report_access"]["mcp_get_finding"]["tool"], "get_finding")
+                self.assertEqual(quick["full_report_access"]["mcp_export_report"]["tool"], "export_run_report")
                 self.assertNotIn("agent_configs", quick)
                 self.assertNotIn("evidence_summary", quick)
                 self.assertNotIn("missing_evidence", quick)
@@ -5681,6 +5683,180 @@ for raw in sys.stdin.buffer:
                 self.assertEqual(finding["finding_id"], finding_id)
                 exported = mcp_tool_json(client.call_tool("export_run_markdown", {"run_id": run_id}))
                 self.assertIn("# 漏洞研判报告", exported["markdown"])
+                structured = mcp_tool_json(client.call_tool("export_run_report", {"run_id": run_id}))
+                self.assertEqual(structured["schema_version"], 1)
+                self.assertEqual(structured["detail_level"], "detail")
+                self.assertEqual(structured["run"]["run_id"], run_id)
+                self.assertEqual(structured["coverage"]["returned"], 1)
+                self.assertEqual(structured["findings"][0]["finding_id"], finding_id)
+                self.assertIsNotNone(structured["findings"][0]["report_detail"])
+                self.assertIsNotNone(structured["findings"][0]["finding_detail"])
+
+    def test_mcp_structured_export_covers_split_pending_findings_and_detail_levels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = JudgerMCPServer(
+                JudgerMCPSettings(
+                    records_dir=root / "records",
+                    providers_file=root / "providers.json",
+                    mcp_servers_file=root / "mcp.json",
+                    skills_file=root / "skills.json",
+                    agents_dir=root / "agents",
+                )
+            )
+            try:
+                split_findings = [
+                    {
+                        "finding_id": "F-1",
+                        "rule_id": "RULE-1",
+                        "level": "error",
+                        "message": "first report",
+                        "locations": [{"file": "one.py", "line": 1}],
+                        "code_flows": [],
+                        "report_markdown": "# Original report one",
+                    },
+                    {
+                        "finding_id": "F-2",
+                        "rule_id": "RULE-2",
+                        "level": "warning",
+                        "message": "second report",
+                        "locations": [{"file": "two.py", "line": 2}],
+                        "code_flows": [],
+                        "report_markdown": "# Original report two",
+                    },
+                    {
+                        "finding_id": "F-3",
+                        "rule_id": "RULE-3",
+                        "level": "note",
+                        "message": "third report",
+                        "locations": [],
+                        "code_flows": [],
+                        "report_markdown": "# Original report three",
+                    },
+                ]
+                completed_report = {
+                    "finding_id": "F-1",
+                    "rule_id": "RULE-1",
+                    "verdict": "TRUE_POSITIVE",
+                    "confidence": 0.9,
+                    "reasoning_summary": "confirmed path",
+                    "final_conclusion": "real vulnerability",
+                    "source_locations": [{"file": "one.py", "line": 1}],
+                    "protection_assessment": "no guard",
+                    "impact_assessment": "command execution",
+                    "disputed_points": [],
+                    "recommended_next_steps": ["fix it"],
+                    "verification_case": {"vulnerability_type": "RULE-1"},
+                    "scorecard": {"call_chain": "confirmed"},
+                    "evidence_graph": {"nodes": [{"id": "source"}], "edges": []},
+                    "evidence_ledger": [{"claim": "entry", "status": "confirmed"}],
+                    "evidence_chain": [
+                        {
+                            "kind": "REPORT",
+                            "source": "input-report",
+                            "summary": "first report",
+                            "data": {
+                                "rule_id": "RULE-1",
+                                "level": "error",
+                                "message": "first report",
+                            },
+                        },
+                        {"kind": "SOURCE_LOCATION", "snippet": "dangerous()"},
+                    ],
+                    "debate": [{"role": "affirmative", "claim": "long debate"}],
+                    "cli_workflow": {
+                        "affirmative": {"position": "TRUE_POSITIVE", "summary": "reachable"},
+                        "negative": {"position": "INCONCLUSIVE", "limitations": ["guard unknown"]},
+                        "moderator": {"verdict": "TRUE_POSITIVE", "final_conclusion": "real vulnerability"},
+                        "pipeline": {"stage": "completed"},
+                    },
+                }
+                in_progress_report = {
+                    "finding_id": "F-2",
+                    "rule_id": "RULE-2",
+                    "finding_status": "in_progress",
+                    "cli_workflow": {"affirmative": {"position": "TRUE_POSITIVE", "summary": "checking"}},
+                }
+                server.records.save_payload(
+                    {
+                        "run_id": "run-structured",
+                        "status": "failed",
+                        "engine": "opencode",
+                        "run_origin": "mcp",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:05:00Z",
+                        "source_path": str(root / "source"),
+                        "sarif_path": str(root / "report.sarif"),
+                        "finding_count": 3,
+                        "completed_finding_count": 1,
+                        "current_finding_ids": {"negative": "F-2"},
+                        "resume_from_finding_id": "F-2",
+                        "resume_from_finding_index": 1,
+                        "report_findings": {"origin": "sarif-local", "findings": split_findings},
+                        "reports": [completed_report, in_progress_report],
+                        "manual_reviews": {
+                            "F-3": {"decision": "INCONCLUSIVE", "evidence": "needs reproduction"}
+                        },
+                        "diagnostics": ["stage failed"],
+                        "error": "delivery missing",
+                    }
+                )
+
+                detail = server._call_tool(
+                    "export_run_report",
+                    {"run_id": "run-structured", "offset": 1, "limit": 2},
+                )
+                self.assertEqual(detail["coverage"]["source"], "report_findings")
+                self.assertEqual(detail["coverage"]["split_origin"], "sarif-local")
+                self.assertEqual(detail["coverage"]["completed"], 1)
+                self.assertEqual(detail["coverage"]["in_progress"], 1)
+                self.assertEqual(detail["coverage"]["pending"], 1)
+                self.assertEqual(detail["coverage"]["missing_detail"], 1)
+                self.assertEqual([item["finding_id"] for item in detail["findings"]], ["F-2", "F-3"])
+                self.assertEqual(detail["findings"][0]["status"], "in_progress")
+                self.assertEqual(detail["findings"][1]["status"], "pending")
+                self.assertEqual(detail["findings"][1]["report_detail"]["message"], "third report")
+                self.assertIsNone(detail["findings"][1]["finding_detail"])
+                self.assertEqual(detail["findings"][1]["missing_detail_reason"], "adjudication_not_started")
+                self.assertEqual(detail["findings"][1]["manual_review"]["evidence"], "needs reproduction")
+
+                summary = server._call_tool(
+                    "export_run_report",
+                    {"run_id": "run-structured", "detail_level": "summary", "finding_ids": ["F-1"]},
+                )
+                self.assertIsNone(summary["findings"][0]["report_detail"])
+                self.assertIsNone(summary["findings"][0]["finding_detail"])
+                self.assertEqual(summary["findings"][0]["conclusion"]["verdict"], "TRUE_POSITIVE")
+
+                raw = server._call_tool(
+                    "export_run_report",
+                    {"run_id": "run-structured", "detail_level": "raw", "finding_ids": ["F-1"]},
+                )
+                raw_finding = raw["findings"][0]
+                self.assertEqual(raw_finding["raw"]["split_finding"]["report_markdown"], "# Original report one")
+                self.assertEqual(raw_finding["raw"]["report"]["debate"][0]["claim"], "long debate")
+                self.assertNotIn("debate", raw_finding["finding_detail"])
+                self.assertNotIn("pipeline", raw_finding["finding_detail"]["role_conclusions"])
+
+                server.records.save_payload(
+                    {
+                        "run_id": "run-legacy",
+                        "status": "completed",
+                        "finding_count": 1,
+                        "reports": [completed_report],
+                    }
+                )
+                legacy = server._call_tool("export_run_report", {"run_id": "run-legacy"})
+                self.assertEqual(legacy["coverage"]["source"], "reports")
+                self.assertTrue(legacy["coverage"]["canonical_complete"])
+
+                with self.assertRaisesRegex(ValueError, "Finding not found: missing"):
+                    server._call_tool(
+                        "export_run_report",
+                        {"run_id": "run-structured", "finding_ids": ["missing"]},
+                    )
+            finally:
+                server.close()
 
     def test_vuln_judger_mcp_server_supports_content_length_framing(self):
         with tempfile.TemporaryDirectory() as tmp:

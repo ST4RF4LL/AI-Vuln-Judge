@@ -140,10 +140,15 @@ uv run vuln-judger mcp \
 - `collect_evidence`：只采集某个 finding 的源码、SARIF、Atlas、检索和影响证据，不运行博弈。
 - `resolve_report_locations`：把报告路径映射到源码树中的真实文件并返回代码片段。
 - `list_runs` / `get_run` / `get_finding`：读取历史研判记录。
+- `export_run_report`：按 `run_id` 导出稳定的结构化 JSON。默认 `detail_level: "detail"`
+  返回 run 状态、全部拆分 findings 的状态/结论、原始报告详情、研判详情和人工复核记录；即使 finding
+  尚未开始或未生成最终报告，也会保留在结果中。可用 `offset` / `limit` 分页，或通过
+  `finding_ids` 精确筛选。`detail_level: "summary"` 只保留状态与结论，`"raw"` 额外包含完整持久化
+  report、原始拆分 finding、证据链、博弈过程和 CLI workflow。
 - `export_run_markdown`：导出指定 run 的 Markdown 报告。
 
-`one_round_judge` 的默认返回中会包含 `full_report_access`，指向 `get_run`、`get_finding`
-和 `export_run_markdown` 的调用参数。Agent 需要更多证据、辩论过程或源码片段时，应按该字段
+`one_round_judge` 的默认返回中会包含 `full_report_access`，指向 `get_run`、`get_finding`、
+`export_run_report` 和 `export_run_markdown` 的调用参数。Agent 需要更多证据、辩论过程或源码片段时，应按该字段
 继续读取完整报告。调试时可传 `response_mode: standard` 返回证据摘要和诊断，或传
 `response_mode: full` 返回完整 run/report 内容。
 
