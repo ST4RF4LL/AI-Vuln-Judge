@@ -2274,6 +2274,15 @@ for raw in sys.stdin.buffer:
         self.assertIn('<th>人工复核</th>', html)
         self.assertIn('data-manual-review-toggle="true"', html)
         self.assertIn('class="manual-review-card"', html)
+        self.assertIn('data-selected-finding-review="${esc(finding.finding_id)}"', html)
+        self.assertIn('>复核</button>', html)
+        self.assertLess(
+            html.index('data-selected-finding-review="${esc(finding.finding_id)}"'),
+            html.index('data-finding-nav="next"'),
+        )
+        self.assertIn('function openManualReviewFromSticky(findingId)', html)
+        self.assertIn("state.expandedManualReviewKey = manualReviewKey(state.selectedRun, findingId)", html)
+        self.assertIn("card.scrollIntoView({ behavior: 'smooth', block: 'center' })", html)
         self.assertIn("option('TRUE_POSITIVE', '真实漏洞')", html)
         self.assertIn("option('FALSE_POSITIVE', '误报')", html)
         self.assertIn("option('INCONCLUSIVE', '证据不足')", html)

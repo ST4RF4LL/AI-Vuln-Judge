@@ -2910,6 +2910,26 @@ def app_html() -> str:
       align-items: center;
     }}
     .selected-finding-sticky.hidden {{ display: none; }}
+    .selected-finding-actions {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .finding-review-button {{
+      height: 38px;
+      min-width: 58px;
+      padding: 0 13px;
+      border-color: #b9d7e5;
+      background: #ffffff;
+      color: #0d4f6f;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .finding-review-button:hover {{
+      border-color: var(--accent);
+      background: #edf7fb;
+      color: #08384f;
+    }}
     .finding-nav-button {{
       width: 38px;
       height: 38px;
@@ -5333,7 +5353,10 @@ def app_html() -> str:
           <div><strong>当前漏洞：</strong> <span class="plain-inline">${{plainInlineText(finding.summary || finding.finding_id || '')}}</span></div>
           <div class="path">${{esc((finding.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div>
         </div>
-        <button type="button" class="finding-nav-button" data-finding-nav="next" title="下一个漏洞" ${{index >= total - 1 ? 'disabled' : ''}}>›</button>
+        <div class="selected-finding-actions">
+          <button type="button" class="finding-review-button" data-selected-finding-review="${{esc(finding.finding_id)}}" title="展开当前漏洞的人工复核">复核</button>
+          <button type="button" class="finding-nav-button" data-finding-nav="next" title="下一个漏洞" ${{index >= total - 1 ? 'disabled' : ''}}>›</button>
+        </div>
       `;
     }}
 
@@ -5776,6 +5799,19 @@ def app_html() -> str:
       for (const button of sticky.querySelectorAll('[data-finding-nav]')) {{
         button.addEventListener('click', () => switchFinding(button.dataset.findingNav === 'prev' ? -1 : 1));
       }}
+      for (const button of sticky.querySelectorAll('[data-selected-finding-review]')) {{
+        button.addEventListener('click', () => openManualReviewFromSticky(button.dataset.selectedFindingReview));
+      }}
+    }}
+
+    function openManualReviewFromSticky(findingId) {{
+      const item = findingSummaryById(findingId);
+      if (!item) return;
+      state.expandedManualReviewKey = manualReviewKey(state.selectedRun, findingId);
+      updateManualReviewExpansionUi();
+      const card = el.detail.querySelector(`[data-manual-review-card="${{cssEscape(findingId)}}"]`);
+      if (!card) return;
+      card.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
     }}
 
     function switchFinding(delta) {{
