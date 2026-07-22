@@ -2961,6 +2961,22 @@ def app_html() -> str:
       background: #edf7fb;
       color: #08384f;
     }}
+    .floating-manual-review {{
+      position: absolute;
+      top: calc(100% + 8px);
+      right: 0;
+      z-index: 8;
+      width: min(520px, calc(100% - 24px));
+      max-height: min(70vh, 640px);
+      overflow: auto;
+      border-radius: 8px;
+      background: #ffffff;
+      box-shadow: 0 18px 40px rgba(15, 23, 42, 0.2);
+    }}
+    .floating-manual-review .manual-review-card {{
+      margin: 0;
+      border-radius: 8px;
+    }}
     .finding-nav-button {{
       width: 38px;
       height: 38px;
@@ -3616,7 +3632,7 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentRun: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, reuseFindingsFromRunId: null, deleteConfirmRunId: null, expandedManualReviewKey: null, manualReviewDrafts: {{}} }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentRun: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, reuseFindingsFromRunId: null, deleteConfirmRunId: null, expandedManualReviewKey: null, floatingManualReviewKey: null, manualReviewDrafts: {{}} }};
     const MANUAL_REVIEW_EVIDENCE_MAX_LENGTH = {MANUAL_REVIEW_EVIDENCE_MAX_LENGTH};
     const el = {{
       list: document.getElementById('run-list'),
@@ -5250,7 +5266,11 @@ def app_html() -> str:
     async function selectRun(runId, resetFinding = true) {{
       state.deleteConfirmRunId = null;
       state.selectedRun = runId;
-      if (resetFinding) state.selectedFinding = null;
+      if (resetFinding) {{
+        state.selectedFinding = null;
+        state.expandedManualReviewKey = null;
+        state.floatingManualReviewKey = null;
+      }}
       renderRuns();
       el.title.textContent = runId;
       el.status.textContent = '正在加载详情...';
@@ -5321,6 +5341,12 @@ def app_html() -> str:
       bindRunExportButtons(el.detail);
       bindRunControlButtons(el.detail);
       bindFindingRows(findings);
+    }}
+
+    function rerenderRunDetailPreservingScroll() {{
+      const scrollTop = el.detailScroll.scrollTop;
+      renderRunDetail(state.currentRun || {{}}, state.currentFindings);
+      el.detailScroll.scrollTop = scrollTop;
     }}
 
     function renderRunMetadataCard(run, findings, status, detailControls, runningMessage, currentHint, resumeHint) {{
@@ -5463,7 +5489,7 @@ def app_html() -> str:
       return draft;
     }}
 
-    function renderManualReviewCard(item) {{
+    function renderManualReviewCard(item, surface = 'inline') {{
       const draft = manualReviewDraft(item);
       const review = item.manual_review || null;
       const radioName = `manual-review-${{state.selectedRun || ''}}-${{item.finding_id || ''}}`;
@@ -5485,7 +5511,7 @@ def app_html() -> str:
         ${{review ? `<div class="manual-review-meta">创建：${{esc(fmtDate(review.created_at))}} · 更新：${{esc(fmtDate(review.updated_at))}}</div>` : '<div class="manual-review-meta">尚未保存人工复核。</div>'}}
         <div class="toolbar">
           <button type="button" data-manual-review-save="true" data-finding-id="${{esc(item.finding_id)}}">保存复核</button>
-          <button type="button" data-manual-review-cancel="true" data-finding-id="${{esc(item.finding_id)}}">取消</button>
+          <button type="button" data-manual-review-cancel="true" data-review-surface="${{esc(surface)}}" data-finding-id="${{esc(item.finding_id)}}">取消</button>
           ${{review ? `<button type="button" class="danger-button" data-manual-review-clear="true" data-finding-id="${{esc(item.finding_id)}}">清除复核</button>` : ''}}
         </div>
         <div class="manual-review-status ${{draft.error ? 'error' : draft.message ? 'success' : ''}}" data-manual-review-status="${{esc(item.finding_id)}}">${{esc(draft.message || '')}}</div>
@@ -5505,6 +5531,8 @@ def app_html() -> str:
       if (!finding) return '';
       const index = selectedFindingIndex();
       const total = (state.currentFindings || []).length;
+      const reviewKey = manualReviewKey(state.selectedRun, finding.finding_id);
+      const reviewOpen = state.floatingManualReviewKey === reviewKey;
       return `
         <button type="button" class="finding-nav-button" data-finding-nav="prev" title="上一个漏洞" ${{index <= 0 ? 'disabled' : ''}}>‹</button>
         <div class="selected-finding-main">
@@ -5518,9 +5546,10 @@ def app_html() -> str:
           <div class="path">${{esc((finding.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div>
         </div>
         <div class="selected-finding-actions">
-          <button type="button" class="finding-review-button" data-selected-finding-review="${{esc(finding.finding_id)}}" title="展开当前漏洞的人工复核">复核</button>
+          <button type="button" class="finding-review-button" data-selected-finding-review="${{esc(finding.finding_id)}}" title="悬浮复核当前漏洞" aria-expanded="${{reviewOpen ? 'true' : 'false'}}">复核</button>
           <button type="button" class="finding-nav-button" data-finding-nav="next" title="下一个漏洞" ${{index >= total - 1 ? 'disabled' : ''}}>›</button>
         </div>
+        ${{reviewOpen ? `<div class="floating-manual-review" data-floating-manual-review="${{esc(finding.finding_id)}}">${{renderManualReviewCard(finding, 'floating')}}</div>` : ''}}
       `;
     }}
 
@@ -5705,11 +5734,22 @@ def app_html() -> str:
         button.addEventListener('click', event => {{
           event.stopPropagation();
           const key = manualReviewKey(state.selectedRun, button.dataset.findingId);
+          state.floatingManualReviewKey = null;
           state.expandedManualReviewKey = state.expandedManualReviewKey === key ? null : key;
           updateManualReviewExpansionUi();
+          updateSelectedFindingSticky();
         }});
       }}
-      for (const input of el.detail.querySelectorAll('[data-manual-review-decision]')) {{
+      bindManualReviewControls(el.detail);
+      if (!findings.length) return;
+      const selected = state.selectedFinding && findings.some(item => item.finding_id === state.selectedFinding)
+        ? state.selectedFinding
+        : findings[0].finding_id;
+      selectFinding(selected, {{ scrollToDetail: false }});
+    }}
+
+    function bindManualReviewControls(root) {{
+      for (const input of root.querySelectorAll('[data-manual-review-decision]')) {{
         input.addEventListener('change', () => {{
           const item = findingSummaryById(input.dataset.findingId);
           if (!item) return;
@@ -5721,7 +5761,7 @@ def app_html() -> str:
           setManualReviewStatus(item.finding_id, '', false);
         }});
       }}
-      for (const textarea of el.detail.querySelectorAll('[data-manual-review-evidence]')) {{
+      for (const textarea of root.querySelectorAll('[data-manual-review-evidence]')) {{
         textarea.addEventListener('input', () => {{
           const item = findingSummaryById(textarea.dataset.findingId);
           if (!item) return;
@@ -5733,20 +5773,15 @@ def app_html() -> str:
           setManualReviewStatus(item.finding_id, '', false);
         }});
       }}
-      for (const button of el.detail.querySelectorAll('[data-manual-review-save]')) {{
+      for (const button of root.querySelectorAll('[data-manual-review-save]')) {{
         button.addEventListener('click', () => saveManualReview(button.dataset.findingId, button));
       }}
-      for (const button of el.detail.querySelectorAll('[data-manual-review-cancel]')) {{
-        button.addEventListener('click', () => cancelManualReview(button.dataset.findingId));
+      for (const button of root.querySelectorAll('[data-manual-review-cancel]')) {{
+        button.addEventListener('click', () => cancelManualReview(button.dataset.findingId, button.dataset.reviewSurface));
       }}
-      for (const button of el.detail.querySelectorAll('[data-manual-review-clear]')) {{
+      for (const button of root.querySelectorAll('[data-manual-review-clear]')) {{
         button.addEventListener('click', () => clearManualReview(button.dataset.findingId, button));
       }}
-      if (!findings.length) return;
-      const selected = state.selectedFinding && findings.some(item => item.finding_id === state.selectedFinding)
-        ? state.selectedFinding
-        : findings[0].finding_id;
-      selectFinding(selected, {{ scrollToDetail: false }});
     }}
 
     function findingSummaryById(findingId) {{
@@ -5765,11 +5800,12 @@ def app_html() -> str:
     }}
 
     function setManualReviewStatus(findingId, message, isError) {{
-      const status = el.detail.querySelector(`[data-manual-review-status="${{cssEscape(findingId)}}"]`);
-      if (!status) return;
-      status.textContent = message || '';
-      status.classList.toggle('error', Boolean(isError));
-      status.classList.toggle('success', Boolean(message) && !isError);
+      const statuses = el.detail.querySelectorAll(`[data-manual-review-status="${{cssEscape(findingId)}}"]`);
+      for (const status of statuses) {{
+        status.textContent = message || '';
+        status.classList.toggle('error', Boolean(isError));
+        status.classList.toggle('success', Boolean(message) && !isError);
+      }}
     }}
 
     function cssEscape(value) {{
@@ -5777,7 +5813,7 @@ def app_html() -> str:
       return String(value || '').replace(/[^a-zA-Z0-9_-]/g, '\\$&');
     }}
 
-    function cancelManualReview(findingId) {{
+    function cancelManualReview(findingId, surface = 'inline') {{
       const item = findingSummaryById(findingId);
       if (!item) return;
       const saved = item.manual_review || null;
@@ -5789,8 +5825,13 @@ def app_html() -> str:
         message: '',
         error: false,
       }};
+      if (surface === 'floating') {{
+        state.floatingManualReviewKey = null;
+        updateSelectedFindingSticky();
+        return;
+      }}
       state.expandedManualReviewKey = null;
-      renderRunDetail(state.currentRun || {{}}, state.currentFindings);
+      rerenderRunDetailPreservingScroll();
     }}
 
     async function saveManualReview(findingId, button) {{
@@ -5826,7 +5867,7 @@ def app_html() -> str:
           message: result.created ? '人工复核已创建。' : '人工复核已更新。',
           error: false,
         }};
-        renderRunDetail(state.currentRun || {{}}, state.currentFindings);
+        rerenderRunDetailPreservingScroll();
       }} catch (error) {{
         draft.message = error.message;
         draft.error = true;
@@ -5853,7 +5894,7 @@ def app_html() -> str:
         state.manualReviewDrafts[manualReviewKey(state.selectedRun, findingId)] = {{
           decision: '', evidence: '', dirty: false, savedUpdatedAt: '', message: '人工复核已清除。', error: false,
         }};
-        renderRunDetail(state.currentRun || {{}}, state.currentFindings);
+        rerenderRunDetailPreservingScroll();
       }} catch (error) {{
         setManualReviewStatus(findingId, error.message, true);
         button.disabled = false;
@@ -5908,6 +5949,9 @@ def app_html() -> str:
     }}
 
     async function selectFinding(findingId, options = {{}}) {{
+      if (state.selectedFinding && state.selectedFinding !== findingId) {{
+        state.floatingManualReviewKey = null;
+      }}
       state.selectedFinding = findingId;
       markSelectedFindingRow(findingId);
       updateSelectedFindingSticky();
@@ -5966,16 +6010,17 @@ def app_html() -> str:
       for (const button of sticky.querySelectorAll('[data-selected-finding-review]')) {{
         button.addEventListener('click', () => openManualReviewFromSticky(button.dataset.selectedFindingReview));
       }}
+      bindManualReviewControls(sticky);
     }}
 
     function openManualReviewFromSticky(findingId) {{
       const item = findingSummaryById(findingId);
       if (!item) return;
-      state.expandedManualReviewKey = manualReviewKey(state.selectedRun, findingId);
+      const key = manualReviewKey(state.selectedRun, findingId);
+      state.floatingManualReviewKey = state.floatingManualReviewKey === key ? null : key;
+      state.expandedManualReviewKey = null;
       updateManualReviewExpansionUi();
-      const card = el.detail.querySelector(`[data-manual-review-card="${{cssEscape(findingId)}}"]`);
-      if (!card) return;
-      card.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+      updateSelectedFindingSticky();
     }}
 
     function switchFinding(delta) {{
