@@ -368,6 +368,8 @@ def make_handler(
                     if payload.get("reset"):
                         agent_store.ensure_defaults()
                         self._json(agent_store.summary())
+                    elif payload.get("action") == "save_agents_default":
+                        self._json(agent_store.save_agents_instructions(payload.get("instructions")))
                     elif payload.get("action") == "star":
                         self._json(
                             to_jsonable(
@@ -742,6 +744,12 @@ def _config_from_payload(
     if engine not in {*CLI_ENGINES, "builtin"}:
         raise ValueError(f"不支持的执行引擎：{engine}")
     cli_engine = engine in CLI_ENGINES
+    if "agents_instructions" in payload:
+        agents_instructions = str(payload.get("agents_instructions") or "").strip()
+    elif agent_store is not None:
+        agents_instructions = agent_store.agents_instructions()
+    else:
+        agents_instructions = ""
     affirmative_agent = None
     negative_agent = None
     moderator_agent = None
@@ -787,6 +795,7 @@ def _config_from_payload(
         affirmative_agent=affirmative_agent,
         negative_agent=negative_agent,
         moderator_agent=moderator_agent,
+        agents_instructions=agents_instructions,
         reuse_findings_from_run_id=(str(payload.get("reuse_findings_from_run_id") or "").strip() or None),
     )
 
@@ -3378,11 +3387,21 @@ def app_html() -> str:
       <div class="settings-head">
         <div>
           <h2 id="agent-prompts-title">Agent 配置</h2>
-          <div class="muted">配置正方、反方和主持人配置档案目录和 AGENT.md 提示词。</div>
+          <div class="muted">配置共享 AGENTS.md 默认约束，以及正方、反方和主持人的 AGENT.md 角色提示词。</div>
         </div>
         <button id="close-agent-prompts" type="button" title="关闭 Agent 提示词设置">关闭</button>
       </div>
       <div class="settings-body">
+        <div class="detail" id="agent-default-instructions-panel">
+          <h3>CLI AGENTS.md 默认配置</h3>
+          <div class="detail-body">
+            <div class="muted">自动注入所有新建 Codex/OpenCode 角色 session；任务启动后会保存当时的配置快照。</div>
+            <label>共享 AGENTS.md<textarea id="agent-default-instructions" placeholder="输入三个角色共同遵循的默认约束"></textarea></label>
+            <div class="toolbar">
+              <button id="save-agent-default-instructions" type="button">保存 AGENTS.md 默认配置</button>
+            </div>
+          </div>
+        </div>
         <div class="detail" id="agent-affirmative-profile-panel">
           <h3>正方配置档案</h3>
           <div class="detail-body">
@@ -3632,6 +3651,7 @@ def app_html() -> str:
       agentAffirmativeInstructions: document.getElementById('agent-affirmative-instructions'),
       agentNegativeInstructions: document.getElementById('agent-negative-instructions'),
       agentModeratorInstructions: document.getElementById('agent-moderator-instructions'),
+      agentDefaultInstructions: document.getElementById('agent-default-instructions'),
       runSarif: document.getElementById('run-sarif'),
       runSource: document.getElementById('run-source'),
       runReuseFindingsOption: document.getElementById('run-reuse-findings-option'),
@@ -3724,6 +3744,7 @@ def app_html() -> str:
     document.getElementById('save-affirmative-agent').addEventListener('click', () => saveAgentProfile('affirmative'));
     document.getElementById('save-negative-agent').addEventListener('click', () => saveAgentProfile('negative'));
     document.getElementById('save-moderator-agent').addEventListener('click', () => saveAgentProfile('moderator'));
+    document.getElementById('save-agent-default-instructions').addEventListener('click', saveAgentDefaultInstructions);
     document.getElementById('reset-agent-prompts').addEventListener('click', resetAgentPrompts);
     document.getElementById('save-mcp').addEventListener('click', saveMcpServer);
     document.getElementById('test-mcp').addEventListener('click', testMcpServer);
@@ -4451,6 +4472,7 @@ def app_html() -> str:
       const affirmativeOptions = profileOptions('affirmative');
       const negativeOptions = profileOptions('negative');
       const moderatorOptions = profileOptions('moderator');
+      el.agentDefaultInstructions.value = (state.agentPrompts.agents_md || {{}}).instructions || '';
       el.agentAffirmativeProfile.innerHTML = affirmativeOptions;
       el.agentNegativeProfile.innerHTML = negativeOptions;
       el.agentModeratorProfile.innerHTML = moderatorOptions;
@@ -4621,6 +4643,19 @@ def app_html() -> str:
         const profile = await fetchJson('/agent-prompts', jsonPost({{ action: 'star', role, profile_id: profileId, starred }}));
         await loadAgentPrompts();
         el.agentPromptsResult.textContent = JSON.stringify(profile, null, 2);
+      }} catch (error) {{
+        el.agentPromptsResult.textContent = error.message;
+      }}
+    }}
+
+    async function saveAgentDefaultInstructions() {{
+      try {{
+        const saved = await fetchJson('/agent-prompts', jsonPost({{
+          action: 'save_agents_default',
+          instructions: el.agentDefaultInstructions.value,
+        }}));
+        await loadAgentPrompts();
+        el.agentPromptsResult.textContent = JSON.stringify(saved, null, 2);
       }} catch (error) {{
         el.agentPromptsResult.textContent = error.message;
       }}

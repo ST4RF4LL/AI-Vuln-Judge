@@ -532,7 +532,12 @@ class CliDrivenRunner:
         languages = list(source_indexer.languages)
         created_at = config.created_at or _now()
         agent_configs = _codex_agent_configs(config)
-        session_dirs = self._prepare_agent_dirs(run_dir, agent_configs, source_path)
+        session_dirs = self._prepare_agent_dirs(
+            run_dir,
+            agent_configs,
+            source_path,
+            config.agents_instructions,
+        )
         sessions = self._sessions(run_id, source_path, run_dir, session_dirs)
         payload = _base_payload(
             config,
@@ -943,6 +948,7 @@ class CliDrivenRunner:
         run_dir: Path,
         agent_configs: Dict[str, AgentConfig],
         source_path: Path,
+        agents_instructions: str = "",
     ) -> Dict[str, Path]:
         raise NotImplementedError
 
@@ -981,8 +987,9 @@ class CodexDrivenRunner(CliDrivenRunner):
         run_dir: Path,
         agent_configs: Dict[str, AgentConfig],
         source_path: Path,
+        agents_instructions: str = "",
     ) -> Dict[str, Path]:
-        return _prepare_codex_agent_dirs(run_dir, agent_configs, source_path)
+        return _prepare_codex_agent_dirs(run_dir, agent_configs, source_path, agents_instructions)
 
     def _sessions(
         self,
@@ -1016,6 +1023,7 @@ def _prepare_codex_agent_dirs(
     run_dir: Path,
     agent_configs: Dict[str, AgentConfig],
     source_path: Path,
+    agents_instructions: str = "",
 ) -> Dict[str, Path]:
     session_dirs: Dict[str, Path] = {}
     for role in CODEX_ROLES:
@@ -1027,6 +1035,7 @@ def _prepare_codex_agent_dirs(
             agent=agent_configs[role],
             source_path=source_path,
             run_dir=run_dir,
+            agents_instructions=agents_instructions,
         )
         for file_name in CODEX_AGENT_FILE_NAMES:
             (role_dir / file_name).write_text(agent_text + "\n", encoding="utf-8")
@@ -1044,13 +1053,21 @@ def _prepare_codex_agent_dirs(
     return session_dirs
 
 
-def _codex_agent_file_text(*, role: str, agent: AgentConfig, source_path: Path, run_dir: Path) -> str:
+def _codex_agent_file_text(
+    *,
+    role: str,
+    agent: AgentConfig,
+    source_path: Path,
+    run_dir: Path,
+    agents_instructions: str = "",
+) -> str:
     return _cli_agent_file_text(
         role=role,
         agent=agent,
         source_path=source_path,
         run_dir=run_dir,
         cli_name="Codex",
+        agents_instructions=agents_instructions,
     )
 
 
@@ -1061,10 +1078,18 @@ def _cli_agent_file_text(
     source_path: Path,
     run_dir: Path,
     cli_name: str,
+    agents_instructions: str = "",
 ) -> str:
     role_label = ROLE_LABELS.get(role, role)
     profile = agent.profile_id or agent.name or role_label
     instructions = (agent.instructions or "").strip() or "围绕当前阶段任务进行可复核的漏洞报告复核。"
+    shared_instructions = str(agents_instructions or "").strip()
+    shared_section = (
+        "## 自定义默认配置\n\n"
+        f"{shared_instructions}\n\n"
+        if shared_instructions
+        else ""
+    )
     return (
         f"# vuln-judger {cli_name} Agent\n\n"
         f"- 角色：{role_label}\n"
@@ -1077,6 +1102,7 @@ def _cli_agent_file_text(
         "- 如 Atlas MCP 可用，开始代码图谱检索前先确认或打开源码根目录，不要把本 session 工作目录误当成待审源码。\n"
         "- 只写入当前 prompt 指定的 JSON 输出文件，以及共享任务工作目录中的必要临时文件。\n"
         "- 结论必须基于报告、源码、Atlas、rg/grep 或可复核工具输出；区分已证实证据、候选证据和未闭环缺口。\n\n"
+        f"{shared_section}"
         "## 角色配置\n\n"
         f"{instructions}\n"
     ).strip()

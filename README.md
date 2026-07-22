@@ -345,6 +345,17 @@ uv run vuln-judger run \
 
 ## Agent 配置
 
+Codex/OpenCode 三个角色还会共同加载一份可自定义的 `AGENTS.md` 默认配置：
+
+```text
+agents/AGENTS.md
+```
+
+Web 界面右上角“Agent 配置”中的“CLI AGENTS.md 默认配置”可以直接编辑它。新任务启动时会把
+当时的内容保存到 run 配置快照，并注入 Moderator、Affirmative、Negative 三个独立 session；
+暂停或失败后恢复仍使用该 run 的快照，不受之后修改默认配置的影响。系统生成的角色、源码目录、
+工作目录和交付协议约束不会被替换，自定义内容作为公共默认约束追加。
+
 正方、反方和主持人 Agent 使用固定角色目录，每个配置档案都以 `AGENT.md` 保存提示词：
 
 ```text

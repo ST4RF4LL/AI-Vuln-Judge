@@ -218,6 +218,7 @@ class RunConfig:
     affirmative_agent: Optional[AgentConfig] = None
     negative_agent: Optional[AgentConfig] = None
     moderator_agent: Optional[AgentConfig] = None
+    agents_instructions: str = ""
     created_at: Optional[str] = None
     resume_from_finding_index: int = 0
     resume_reports: List[Any] = field(default_factory=list)
@@ -289,4 +290,5 @@ def run_config_snapshot(config: RunConfig) -> Dict[str, Any]:
         "affirmative_agent": to_jsonable(config.affirmative_agent) if config.affirmative_agent else None,
         "negative_agent": to_jsonable(config.negative_agent) if config.negative_agent else None,
         "moderator_agent": to_jsonable(config.moderator_agent) if config.moderator_agent else None,
+        "agents_instructions": config.agents_instructions,
     }

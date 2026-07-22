@@ -558,6 +558,7 @@ class OpenCodeDrivenRunner(CliDrivenRunner):
         run_dir: Path,
         agent_configs: Dict[str, AgentConfig],
         source_path: Path,
+        agents_instructions: str = "",
     ) -> Dict[str, Path]:
         session_dirs: Dict[str, Path] = {}
         for role in CODEX_ROLES:
@@ -569,6 +570,7 @@ class OpenCodeDrivenRunner(CliDrivenRunner):
                 source_path=source_path,
                 run_dir=run_dir,
                 cli_name="OpenCode",
+                agents_instructions=agents_instructions,
             )
             for file_name in CODEX_AGENT_FILE_NAMES:
                 (role_dir / file_name).write_text(agent_text + "\n", encoding="utf-8")

@@ -2143,6 +2143,10 @@ for raw in sys.stdin.buffer:
         self.assertIn('id="provider-panel"', html)
         self.assertIn('id="open-agent-prompts"', html)
         self.assertIn('id="agent-prompts-modal"', html)
+        self.assertIn('id="agent-default-instructions"', html)
+        self.assertIn('id="save-agent-default-instructions"', html)
+        self.assertIn("action: 'save_agents_default'", html)
+        self.assertIn('async function saveAgentDefaultInstructions()', html)
         self.assertIn('id="open-integrations"', html)
         self.assertIn('id="integrations-modal"', html)
         self.assertIn('id="auto-refresh"', html)
@@ -4335,7 +4339,12 @@ for raw in sys.stdin.buffer:
             }
 
             with patch("vuln_judger.codex_runner._ensure_codex_project_trust") as trust:
-                session_dirs = _prepare_codex_agent_dirs(run_dir, agents, source)
+                session_dirs = _prepare_codex_agent_dirs(
+                    run_dir,
+                    agents,
+                    source,
+                    "三个角色共同遵循的默认约束。",
+                )
 
             self.assertEqual(set(session_dirs), {"moderator", "affirmative", "negative"})
             self.assertEqual(trust.call_count, 3)
@@ -4351,6 +4360,8 @@ for raw in sys.stdin.buffer:
             self.assertIn(str(source), text)
             self.assertIn(str(run_dir), text)
             self.assertIn("Atlas MCP", text)
+            self.assertIn("## 自定义默认配置", text)
+            self.assertIn("三个角色共同遵循的默认约束。", text)
             runner = CodexDrivenRunner(records_dir=root / "records", codex_command="codex")
             sessions = runner._sessions("run-1", source, run_dir, session_dirs)
             self.assertEqual(sessions["affirmative"].cwd, affirmative_dir.resolve())
@@ -4991,6 +5002,11 @@ for raw in sys.stdin.buffer:
                     defaults = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(defaults["defaults"]["affirmative"], "Affirmative_default")
                 self.assertEqual(defaults["defaults"]["moderator"], "Moderator_default")
+                self.assertTrue(defaults["agents_md"]["path"].endswith("AGENTS.md"))
+                self.assertIn("JSON schema", defaults["agents_md"]["instructions"])
+                with urllib.request.urlopen(f"{base}/agent-prompts/defaults", timeout=5) as response:
+                    agent_defaults = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(agent_defaults["agents_md"], defaults["agents_md"])
                 affirmative_default = next(
                     profile for profile in defaults["roles"]["affirmative"] if profile["profile_id"] == "Affirmative_default"
                 )
@@ -5010,6 +5026,18 @@ for raw in sys.stdin.buffer:
                 self.assertIn("自主达成 Moderator 目标", moderator_default["instructions"])
                 self.assertIn("代码上下文业务逻辑", moderator_default["instructions"])
                 self.assertIn("异常读取", moderator_default["instructions"])
+                saved_agents_default = post_json(
+                    f"{base}/agent-prompts",
+                    {
+                        "action": "save_agents_default",
+                        "instructions": "所有 CLI 角色共同遵循这条自定义约束。",
+                    },
+                )
+                self.assertEqual(saved_agents_default["instructions"], "所有 CLI 角色共同遵循这条自定义约束。")
+                self.assertEqual(
+                    (root / "agents" / "AGENTS.md").read_text(encoding="utf-8"),
+                    "所有 CLI 角色共同遵循这条自定义约束。\n",
+                )
                 saved = post_json(
                     f"{base}/agent-prompts",
                     {
@@ -5071,6 +5099,7 @@ for raw in sys.stdin.buffer:
                 self.assertEqual(run["agent_configs"]["negative"]["instructions"], "质疑可达性和防护条件。")
                 self.assertEqual(run["agent_configs"]["moderator"]["profile_id"], "Moderator_default")
                 self.assertEqual(run["agent_configs"]["moderator"]["instructions"], "中立总结双方核心争议。")
+                self.assertEqual(run["config"]["agents_instructions"], "所有 CLI 角色共同遵循这条自定义约束。")
                 delete_request = urllib.request.Request(
                     f"{base}/agent-prompts/affirmative/Affirmative_custom",
                     method="DELETE",
@@ -7563,6 +7592,7 @@ class OpenCodeRunnerTests(unittest.TestCase):
         self.assertIsNone(config.mcp_servers_file)
         self.assertFalse(config.enable_llm)
         self.assertIsNotNone(config.affirmative_agent)
+        self.assertIn("JSON schema", config.agents_instructions)
 
     def test_opencode_agent_dirs_include_unattended_permission_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -7579,13 +7609,38 @@ class OpenCodeRunnerTests(unittest.TestCase):
                 "affirmative": AgentConfig("Affirmative", "验证。", role="Affirmative"),
                 "negative": AgentConfig("Negative", "质疑。", role="Negative"),
             }
-            role_dirs = runner._prepare_agent_dirs(root / "run-1", agents, source)
+            role_dirs = runner._prepare_agent_dirs(
+                root / "run-1",
+                agents,
+                source,
+                "共享 OpenCode 默认约束。",
+            )
 
             for role_dir in role_dirs.values():
                 config_path = role_dir / ".opencode" / "opencode.json"
                 self.assertTrue(config_path.exists())
                 self.assertEqual(json.loads(config_path.read_text(encoding="utf-8"))["permission"], "allow")
                 self.assertIn("OpenCode Agent", (role_dir / "AGENTS.md").read_text(encoding="utf-8"))
+                self.assertIn("共享 OpenCode 默认约束。", (role_dir / "AGENTS.md").read_text(encoding="utf-8"))
+
+    def test_cli_run_config_keeps_persisted_agents_instructions_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent_store = AgentDirectoryStore(root / "agents")
+            agent_store.save_agents_instructions("后来修改的默认配置。")
+            config = _config_from_payload(
+                {
+                    "engine": "codex",
+                    "report_path": str(root / "report.sarif"),
+                    "source_path": str(root / "source"),
+                    "agents_instructions": "任务启动时保存的配置快照。",
+                },
+                root / "providers.json",
+                agent_store=agent_store,
+                mcp_servers_file=root / "mcp.json",
+            )
+
+        self.assertEqual(config.agents_instructions, "任务启动时保存的配置快照。")
 
     def test_opencode_probe_only_requires_attach_tui_capabilities(self):
         responses = [

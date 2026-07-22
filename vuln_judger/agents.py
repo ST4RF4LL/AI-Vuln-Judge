@@ -11,7 +11,12 @@ from .models import AgentConfig, to_jsonable
 
 DEFAULT_AGENTS_DIR = Path("agents")
 AGENT_FILE = "AGENT.md"
+AGENTS_FILE = "AGENTS.md"
 AGENT_META_FILE = "AGENT.json"
+
+DEFAULT_AGENTS_INSTRUCTIONS = (
+    "遵循当前角色的 AGENT.md 配置，以及每个阶段 prompt 指定的输入文件、输出文件和 JSON schema。"
+)
 
 ROLE_DIRS = {
     "affirmative": "Affirmative",
@@ -89,6 +94,7 @@ class AgentDirectoryStore:
         self.ensure_defaults()
         return {
             "root": str(self.root),
+            "agents_md": self.agents_file_summary(),
             "defaults": {
                 "affirmative": DEFAULT_PROFILE_IDS["affirmative"],
                 "negative": DEFAULT_PROFILE_IDS["negative"],
@@ -101,13 +107,32 @@ class AgentDirectoryStore:
             },
         }
 
-    def defaults(self) -> Dict[str, Dict[str, Any]]:
+    def defaults(self) -> Dict[str, Any]:
         self.ensure_defaults()
         return {
+            "agents_md": self.agents_file_summary(),
             "affirmative": to_jsonable(self.agent("affirmative", DEFAULT_PROFILE_IDS["affirmative"])),
             "negative": to_jsonable(self.agent("negative", DEFAULT_PROFILE_IDS["negative"])),
             "moderator": to_jsonable(self.agent("moderator", DEFAULT_PROFILE_IDS["moderator"])),
         }
+
+    def agents_instructions(self) -> str:
+        self.ensure_defaults()
+        return (self.root / AGENTS_FILE).read_text(encoding="utf-8", errors="replace").strip()
+
+    def agents_file_summary(self) -> Dict[str, Any]:
+        path = self.root / AGENTS_FILE
+        return {
+            "path": str(path.relative_to(Path.cwd())) if _is_under(path, Path.cwd()) else str(path),
+            "instructions": path.read_text(encoding="utf-8", errors="replace").strip() if path.exists() else "",
+        }
+
+    def save_agents_instructions(self, instructions: str) -> Dict[str, Any]:
+        text = str(instructions or "").strip()
+        self.root.mkdir(parents=True, exist_ok=True)
+        path = self.root / AGENTS_FILE
+        path.write_text(text + ("\n" if text else ""), encoding="utf-8")
+        return self.agents_file_summary()
 
     def list_profiles(self, role: str) -> List[AgentConfig]:
         role_key = _role_key(role)
@@ -169,6 +194,10 @@ class AgentDirectoryStore:
         return self.summary()
 
     def ensure_defaults(self) -> None:
+        agents_file = self.root / AGENTS_FILE
+        if not agents_file.exists():
+            agents_file.parent.mkdir(parents=True, exist_ok=True)
+            agents_file.write_text(DEFAULT_AGENTS_INSTRUCTIONS + "\n", encoding="utf-8")
         affirmative_file = self._role_dir("affirmative") / DEFAULT_PROFILE_IDS["affirmative"] / AGENT_FILE
         if not affirmative_file.exists():
             affirmative_file.parent.mkdir(parents=True, exist_ok=True)

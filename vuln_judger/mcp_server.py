@@ -210,6 +210,7 @@ class JudgerMCPServer:
             affirmative_agent=self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile"))),
             negative_agent=self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile"))),
             moderator_agent=self.agent_store.agent("moderator", _optional_text(arguments.get("moderator_agent_profile"))),
+            agents_instructions=self.agent_store.agents_instructions(),
         )
         if cli_engine:
             if not bool(arguments.get("save", True)):
