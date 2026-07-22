@@ -118,6 +118,13 @@ class RunRecordStore:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def revision(self, run_id: str) -> Optional[str]:
+        try:
+            stat = self._path(run_id).stat()
+        except OSError:
+            return None
+        return _revision_from_stat(stat)
+
     def delete(self, run_id: str) -> bool:
         lock_file = self._lock_record(run_id)
         try:
@@ -135,9 +142,10 @@ class RunRecordStore:
         for path in sorted(self.root.glob("run-*.json")):
             try:
                 payload = json.loads(path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
+                stat = path.stat()
+            except (json.JSONDecodeError, OSError):
                 continue
-            records.append(_summary(payload))
+            records.append(_summary(payload, revision=_revision_from_stat(stat)))
         records.sort(key=lambda item: item.get("created_at") or "", reverse=True)
         return records
 
@@ -331,7 +339,7 @@ class RunControlStore:
         return self.root / f".{_safe_run_id(run_id)}.lock"
 
 
-def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _summary(payload: Dict[str, Any], *, revision: Optional[str] = None) -> Dict[str, Any]:
     verdict_counts: Dict[str, int] = {}
     for report in payload.get("reports", []):
         if finding_report_status(report) != FINDING_COMPLETED:
@@ -344,6 +352,7 @@ def _summary(payload: Dict[str, Any]) -> Dict[str, Any]:
     sessions = payload.get("cli_sessions") or payload.get("codex_sessions") or workflow.get("sessions") or []
     return {
         "run_id": payload.get("run_id"),
+        "revision": revision,
         "status": payload.get("status", "completed"),
         "engine": payload.get("engine") or (payload.get("config") or {}).get("engine") or "builtin",
         "run_origin": normalize_run_origin(payload),
@@ -463,6 +472,10 @@ def _unlock_file(lock_file) -> None:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     finally:
         lock_file.close()
+
+
+def _revision_from_stat(stat) -> str:
+    return f"{stat.st_mtime_ns:x}-{stat.st_ctime_ns:x}-{stat.st_size:x}-{stat.st_ino:x}"
 
 
 def _pid_alive(pid: int) -> bool:

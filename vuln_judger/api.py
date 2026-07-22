@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import subprocess
 from datetime import datetime, timezone
@@ -554,6 +555,20 @@ def make_handler(
                 self._json(_list_runs(store, tasks, tasks_lock))
                 return
             if len(parts) >= 2 and parts[0] == "runs":
+                if len(parts) == 3 and parts[2] == "status":
+                    task = _get_task(tasks, tasks_lock, parts[1])
+                    payload = task if task is not None else store.get(parts[1])
+                    if payload is None:
+                        self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
+                        return
+                    self._json(
+                        {
+                            "run_id": parts[1],
+                            "status": payload.get("status", "completed"),
+                            "revision": store.revision(parts[1]),
+                        }
+                    )
+                    return
                 run = store.get(parts[1])
                 task = _get_task(tasks, tasks_lock, parts[1])
                 if task is not None:
@@ -609,7 +624,7 @@ def make_handler(
                     return
                 if active_task is not None:
                     if len(parts) == 2:
-                        self._json(active_task)
+                        self._json(_run_detail(active_task, revision=store.revision(parts[1])))
                         return
                     if len(parts) == 3 and parts[2] == "findings":
                         self._json([_finding_summary(report, _manual_review_for(active_task, report.get("finding_id"))) for report in active_task.get("reports", [])])
@@ -617,7 +632,7 @@ def make_handler(
                     if len(parts) == 4 and parts[2] == "findings":
                         for report in active_task.get("reports", []):
                             if report.get("finding_id") == parts[3]:
-                                self._json(_finding_detail(report, active_task))
+                                self._json(_finding_detail(report, active_task, revision=store.revision(parts[1])))
                                 return
                         self._json({"error": "发现尚未生成或未找到"}, HTTPStatus.NOT_FOUND)
                         return
@@ -632,7 +647,7 @@ def make_handler(
                         self._json({"error": "运行记录未找到"}, HTTPStatus.NOT_FOUND)
                         return
                     if len(parts) == 2:
-                        self._json(task)
+                        self._json(_run_detail(task, revision=store.revision(parts[1])))
                         return
                     if len(parts) == 3 and parts[2] == "findings":
                         self._json([_finding_summary(report, _manual_review_for(task, report.get("finding_id"))) for report in task.get("reports", [])])
@@ -640,14 +655,14 @@ def make_handler(
                     if len(parts) == 4 and parts[2] == "findings":
                         for report in task.get("reports", []):
                             if report.get("finding_id") == parts[3]:
-                                self._json(_finding_detail(report, task))
+                                self._json(_finding_detail(report, task, revision=store.revision(parts[1])))
                                 return
                         self._json({"error": "发现尚未生成或未找到"}, HTTPStatus.NOT_FOUND)
                         return
                     self._json({"error": "运行尚未完成"}, HTTPStatus.BAD_REQUEST)
                     return
                 if len(parts) == 2:
-                    self._json(_run_detail(run))
+                    self._json(_run_detail(run, revision=store.revision(parts[1])))
                     return
                 if len(parts) == 3 and parts[2] in {"cli-sessions", "codex-sessions"}:
                     self._json(_cli_sessions(run))
@@ -661,7 +676,7 @@ def make_handler(
                 if len(parts) == 4 and parts[2] == "findings":
                     for report in run.get("reports", []):
                         if report.get("finding_id") == parts[3]:
-                            self._json(_finding_detail(report, run))
+                            self._json(_finding_detail(report, run, revision=store.revision(parts[1])))
                             return
                     self._json({"error": "发现未找到"}, HTTPStatus.NOT_FOUND)
                     return
@@ -676,10 +691,16 @@ def make_handler(
             return json.loads(body or "{}")
 
         def _json(self, payload, status: HTTPStatus = HTTPStatus.OK) -> None:
-            raw = json.dumps(to_jsonable(payload), ensure_ascii=False, indent=2).encode("utf-8")
+            raw = json.dumps(to_jsonable(payload), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            use_gzip = "gzip" in str(self.headers.get("accept-encoding") or "").lower() and len(raw) >= 1024
+            if use_gzip:
+                raw = gzip.compress(raw, compresslevel=5)
             self.send_response(status)
             self.send_header("content-type", "application/json; charset=utf-8")
             self.send_header("cache-control", "no-store")
+            if use_gzip:
+                self.send_header("content-encoding", "gzip")
+                self.send_header("vary", "Accept-Encoding")
             self.send_header("content-length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
@@ -900,11 +921,12 @@ def _reusable_findings_metadata(run: dict) -> dict:
     }
 
 
-def _run_detail(run):
+def _run_detail(run, *, revision: Optional[str] = None):
     cli_sessions = _cli_sessions(run)
     cli_workflow = run.get("cli_workflow") or run.get("codex_workflow") or {}
     return {
         "run_id": run.get("run_id"),
+        "revision": revision,
         "status": run.get("status", "completed"),
         "engine": run.get("engine") or (run.get("config") or {}).get("engine") or "builtin",
         "run_origin": normalize_run_origin(run),
@@ -931,6 +953,7 @@ def _run_detail(run):
         "manual_reviews": _manual_reviews(run),
         "manual_review_count": len(_manual_reviews(run)),
         "reusable_findings": _reusable_findings_metadata(run),
+        "error": run.get("error"),
         "cli_sessions": cli_sessions,
         "cli_workflow": cli_workflow,
         "codex_sessions": _codex_sessions(run),
@@ -942,7 +965,7 @@ def _list_runs(store: RunRecordStore, tasks: dict, tasks_lock: Lock):
     records = store.list()
     with tasks_lock:
         visible_tasks = [
-            dict(task)
+            {**dict(task), "revision": store.revision(str(task.get("run_id") or ""))}
             for task in tasks.values()
             if task.get("status") != "completed"
         ]
@@ -2250,8 +2273,9 @@ def _validated_manual_review_payload(payload) -> tuple[str, str]:
     return decision, evidence
 
 
-def _finding_detail(report: dict, run: Optional[dict]) -> dict:
+def _finding_detail(report: dict, run: Optional[dict], *, revision: Optional[str] = None) -> dict:
     detail = dict(report)
+    detail["revision"] = revision
     detail["manual_review"] = _manual_review_for(run, report.get("finding_id"))
     return detail
 
@@ -2758,6 +2782,8 @@ def app_html() -> str:
     .run-item {{
       display: grid;
       position: relative;
+      content-visibility: auto;
+      contain-intrinsic-size: auto 150px;
       gap: 8px;
       width: 100%;
       text-align: left;
@@ -2890,6 +2916,10 @@ def app_html() -> str:
       overflow-y: visible;
     }}
     .findings-table-wrap table {{ min-width: 620px; }}
+    .findings-table-wrap tbody tr {{
+      content-visibility: auto;
+      contain-intrinsic-size: auto 56px;
+    }}
     .findings-table-wrap tr.active {{ background: #edf7fb; box-shadow: inset 4px 0 0 var(--accent); }}
     .manual-review-cell {{ width: 118px; white-space: nowrap; }}
     .manual-review-toggle {{ padding: 5px 8px; background: #fbfcfe; }}
@@ -3632,7 +3662,7 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentRun: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, polling: {{}}, autoRefreshEnabled: false, reuseFindingsFromRunId: null, deleteConfirmRunId: null, expandedManualReviewKey: null, floatingManualReviewKey: null, manualReviewDrafts: {{}} }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentRun: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, pollTimer: null, pollInFlight: false, autoRefreshEnabled: false, runListSignature: '', findingDetailCache: {{}}, reuseFindingsFromRunId: null, deleteConfirmRunId: null, expandedManualReviewKey: null, floatingManualReviewKey: null, manualReviewDrafts: {{}} }};
     const MANUAL_REVIEW_EVIDENCE_MAX_LENGTH = {MANUAL_REVIEW_EVIDENCE_MAX_LENGTH};
     const el = {{
       list: document.getElementById('run-list'),
@@ -3779,12 +3809,15 @@ def app_html() -> str:
     }});
     document.getElementById('refresh').addEventListener('click', refreshAll);
     el.autoRefresh.addEventListener('click', toggleAutoRefresh);
+    el.list.addEventListener('click', handleRunListClick);
+    el.list.addEventListener('keydown', handleRunListKeydown);
     el.detailScroll.addEventListener('scroll', updateStickyFindingVisibility);
     document.getElementById('clear-selection').addEventListener('click', () => {{
+      const previousRunId = state.selectedRun;
       state.selectedRun = null;
       state.selectedFinding = null;
       state.currentFindings = [];
-      renderRuns();
+      updateSelectedRunCard(previousRunId, null);
       renderEmpty('选择一个任务查看发现、证据和博弈回合。');
     }});
     document.getElementById('save-provider').addEventListener('click', saveProvider);
@@ -4972,31 +5005,71 @@ def app_html() -> str:
       }}
     }}
 
-    async function pollRun(runId) {{
-      for (let attempt = 0; attempt < 1800; attempt += 1) {{
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        if (!state.autoRefreshEnabled || !state.polling[runId]) return;
-        try {{
-          const run = await fetchJson(`/runs/${{encodeURIComponent(runId)}}`);
-          await loadRuns();
-          if (state.selectedRun === runId) {{
-            await selectRun(runId, false);
+    async function pollRunningRuns() {{
+      if (!state.autoRefreshEnabled || state.pollInFlight) return;
+      const active = runningRuns();
+      if (!active.length) {{
+        updateAutoRefreshControl();
+        return;
+      }}
+      state.pollInFlight = true;
+      try {{
+        const statuses = await Promise.all(active.map(async run => {{
+          try {{
+            return await fetchJson(`/runs/${{encodeURIComponent(run.run_id)}}/status`);
+          }} catch (_error) {{
+            return null;
           }}
-          if (isTerminalStatus(run.status)) return;
-          if (!state.autoRefreshEnabled || !state.polling[runId]) return;
-        }} catch (_error) {{
-          return;
-        }}
+        }}));
+        const changed = statuses.filter(item => {{
+          if (!item) return false;
+          const current = state.runs.find(run => run.run_id === item.run_id);
+          return !current || current.revision !== item.revision || current.status !== item.status;
+        }});
+        await Promise.all(changed.map(refreshRunFromPoll));
+      }} finally {{
+        state.pollInFlight = false;
+        updateAutoRefreshControl();
+        scheduleGlobalPoll();
       }}
     }}
 
-    function ensurePolling(runId) {{
-      if (!runId || !state.autoRefreshEnabled || state.polling[runId]) return;
-      state.polling[runId] = true;
-      pollRun(runId).finally(() => {{
-        delete state.polling[runId];
-        updateAutoRefreshControl();
-      }});
+    async function refreshRunFromPoll(status) {{
+      const runId = status.run_id;
+      const current = state.runs.find(run => run.run_id === runId) || {{ run_id: runId }};
+      try {{
+        const run = await fetchJson(`/runs/${{encodeURIComponent(runId)}}`);
+        const next = {{ ...current, ...run, revision: run.revision || status.revision }};
+        const index = state.runs.findIndex(item => item.run_id === runId);
+        if (index >= 0) state.runs[index] = next;
+        else state.runs.unshift(next);
+        updateRunListItem(next);
+        if (state.selectedRun === runId) {{
+          const findings = await fetchJson(`/runs/${{encodeURIComponent(runId)}}/findings`);
+          if (state.selectedRun !== runId) return;
+          renderRunDetail(run, findings);
+        }}
+      }} catch (_error) {{
+        return;
+      }}
+    }}
+
+    function scheduleGlobalPoll(delay = 1000) {{
+      if (state.pollTimer || state.pollInFlight || !state.autoRefreshEnabled || !runningRuns().length) return;
+      state.pollTimer = window.setTimeout(() => {{
+        state.pollTimer = null;
+        pollRunningRuns();
+      }}, delay);
+    }}
+
+    function stopGlobalPolling() {{
+      if (state.pollTimer) window.clearTimeout(state.pollTimer);
+      state.pollTimer = null;
+    }}
+
+    function ensurePolling(runId = null) {{
+      void runId;
+      scheduleGlobalPoll();
     }}
 
     function runningRuns() {{
@@ -5007,7 +5080,7 @@ def app_html() -> str:
       const running = runningRuns();
       if (!running.length) {{
         state.autoRefreshEnabled = false;
-        state.polling = {{}};
+        stopGlobalPolling();
       }}
       el.autoRefresh.disabled = !running.length;
       el.autoRefresh.textContent = state.autoRefreshEnabled ? '自动刷新：开' : '自动刷新：关';
@@ -5022,26 +5095,27 @@ def app_html() -> str:
       if (el.autoRefresh.disabled) return;
       state.autoRefreshEnabled = !state.autoRefreshEnabled;
       if (!state.autoRefreshEnabled) {{
-        state.polling = {{}};
+        stopGlobalPolling();
         updateAutoRefreshControl();
         return;
       }}
       updateAutoRefreshControl();
-      for (const run of runningRuns()) {{
-        ensurePolling(run.run_id);
-      }}
+      ensurePolling();
     }}
 
     async function loadRuns() {{
       el.subtitle.textContent = '正在加载记录...';
       try {{
-        state.runs = await fetchJson('/runs');
-        renderRuns();
+        const runs = await fetchJson('/runs');
+        const signature = runListSignature(runs);
+        const changed = signature !== state.runListSignature;
+        state.runs = runs;
+        state.runListSignature = signature;
+        if (changed) renderRuns();
+        else updateSelectedRunCard(null, state.selectedRun);
         updateAutoRefreshControl();
         if (state.autoRefreshEnabled) {{
-          for (const run of runningRuns()) {{
-            ensurePolling(run.run_id);
-          }}
+          ensurePolling();
         }}
         el.subtitle.textContent = '静态报告漏洞研判历史';
         if (!state.selectedRun && state.runs.length > 0) {{
@@ -5054,102 +5128,97 @@ def app_html() -> str:
       }}
     }}
 
+    function runListSignature(runs) {{
+      return JSON.stringify((runs || []).map(run => [run.run_id, run.revision || '', run.status || 'completed']));
+    }}
+
+    function renderRunItem(run) {{
+      const counts = run.verdict_counts || {{}};
+      const status = run.status || 'completed';
+      const resumable = status === 'paused' || status === 'failed';
+      const origin = runOriginLabel(run);
+      const pauseButton = status === 'running' || status === 'pausing'
+        ? `<span class="chip run-pause" data-run-pause="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="暂停该任务">暂停</span>`
+        : '';
+      const resumeButton = resumable
+        ? `<span class="chip run-resume" data-run-resume="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="${{status === 'failed' ? '从失败断点恢复任务' : '从当前 finding 恢复任务'}}">恢复</span>`
+        : '';
+      const stopButton = status === 'running' || status === 'stopping' || status === 'pausing'
+        ? `<span class="chip run-stop" data-run-stop="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="停止该任务">停止</span>`
+        : '';
+      const deleteConfirming = state.deleteConfirmRunId === run.run_id;
+      return `<button class="run-item ${{state.selectedRun === run.run_id ? 'active' : ''}}" type="button" data-run-id="${{esc(run.run_id)}}">
+        <div class="run-item-actions">
+          ${{pauseButton}}
+          ${{resumeButton}}
+          ${{stopButton}}
+          <span class="chip run-delete ${{deleteConfirming ? 'confirming' : ''}}" data-run-delete="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" aria-label="${{deleteConfirming ? '再次点击确认删除' : '删除该任务记录'}}" title="${{deleteConfirming ? '再次点击确认删除' : '删除该任务记录'}}">${{deleteConfirming ? '确认删除？' : '删除'}}</span>
+        </div>
+        <div class="run-item-headline">
+          <div class="run-id">${{esc(run.run_id)}}</div>
+          <div class="muted">${{esc(fmtDate(run.created_at))}}</div>
+          <div class="path">${{esc(run.source_path || '')}}</div>
+        </div>
+        <div class="chips">
+          <span class="chip origin">${{esc(origin)}}</span>
+          <span class="${{statusChipClass(status)}}">${{esc(statusLabel(status))}}</span>
+          <span class="chip">${{esc(run.finding_count)}} 个发现</span>
+        </div>
+        <div class="chips run-verdict-chips">
+          <span class="chip tp">真实 ${{counts.TRUE_POSITIVE || 0}}</span>
+          <span class="chip fp">误报 ${{counts.FALSE_POSITIVE || 0}}</span>
+          <span class="chip inc">不足 ${{counts.INCONCLUSIVE || 0}}</span>
+        </div>
+      </button>`;
+    }}
+
     function renderRuns() {{
       el.count.textContent = `${{state.runs.length}} 条记录`;
-      el.list.innerHTML = state.runs.map(run => {{
-        const counts = run.verdict_counts || {{}};
-        const status = run.status || 'completed';
-        const resumable = status === 'paused' || status === 'failed';
-        const origin = runOriginLabel(run);
-        const pauseButton = status === 'running' || status === 'pausing'
-          ? `<span class="chip run-pause" data-run-pause="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="暂停该任务">暂停</span>`
-          : '';
-        const resumeButton = resumable
-          ? `<span class="chip run-resume" data-run-resume="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="${{status === 'failed' ? '从失败断点恢复任务' : '从当前 finding 恢复任务'}}">恢复</span>`
-          : '';
-        const stopButton = status === 'running' || status === 'stopping' || status === 'pausing'
-          ? `<span class="chip run-stop" data-run-stop="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" title="停止该任务">停止</span>`
-          : '';
-        const deleteConfirming = state.deleteConfirmRunId === run.run_id;
-        return `<button class="run-item ${{state.selectedRun === run.run_id ? 'active' : ''}}" type="button" data-run-id="${{esc(run.run_id)}}">
-          <div class="run-item-actions">
-            ${{pauseButton}}
-            ${{resumeButton}}
-            ${{stopButton}}
-            <span class="chip run-delete ${{deleteConfirming ? 'confirming' : ''}}" data-run-delete="true" data-run-id="${{esc(run.run_id)}}" role="button" tabindex="0" aria-label="${{deleteConfirming ? '再次点击确认删除' : '删除该任务记录'}}" title="${{deleteConfirming ? '再次点击确认删除' : '删除该任务记录'}}">${{deleteConfirming ? '确认删除？' : '删除'}}</span>
-          </div>
-          <div class="run-item-headline">
-            <div class="run-id">${{esc(run.run_id)}}</div>
-            <div class="muted">${{esc(fmtDate(run.created_at))}}</div>
-            <div class="path">${{esc(run.source_path || '')}}</div>
-          </div>
-          <div class="chips">
-            <span class="chip origin">${{esc(origin)}}</span>
-            <span class="${{statusChipClass(status)}}">${{esc(statusLabel(status))}}</span>
-            <span class="chip">${{esc(run.finding_count)}} 个发现</span>
-          </div>
-          <div class="chips run-verdict-chips">
-            <span class="chip tp">真实 ${{counts.TRUE_POSITIVE || 0}}</span>
-            <span class="chip fp">误报 ${{counts.FALSE_POSITIVE || 0}}</span>
-            <span class="chip inc">不足 ${{counts.INCONCLUSIVE || 0}}</span>
-          </div>
-        </button>`;
-      }}).join('');
-      for (const button of el.list.querySelectorAll('button[data-run-id]')) {{
-        button.addEventListener('click', () => selectRun(button.dataset.runId));
+      el.list.innerHTML = state.runs.map(renderRunItem).join('');
+    }}
+
+    function updateRunListItem(run) {{
+      const current = el.list.querySelector(`.run-item[data-run-id="${{cssEscape(run.run_id)}}"]`);
+      if (current) current.outerHTML = renderRunItem(run);
+      else el.list.insertAdjacentHTML('afterbegin', renderRunItem(run));
+      el.count.textContent = `${{state.runs.length}} 条记录`;
+      state.runListSignature = runListSignature(state.runs);
+    }}
+
+    function updateSelectedRunCard(previousRunId, runId) {{
+      if (previousRunId) {{
+        el.list.querySelector(`.run-item[data-run-id="${{cssEscape(previousRunId)}}"]`)?.classList.remove('active');
       }}
-      for (const button of el.list.querySelectorAll('[data-run-delete]')) {{
-        button.addEventListener('click', event => {{
-          event.stopPropagation();
-          handleDeleteRunClick(button.dataset.runId);
-        }});
-        button.addEventListener('keydown', event => {{
-          if (event.key === 'Enter' || event.key === ' ') {{
-            event.preventDefault();
-            event.stopPropagation();
-            handleDeleteRunClick(button.dataset.runId);
-          }}
-        }});
+      if (runId) {{
+        el.list.querySelector(`.run-item[data-run-id="${{cssEscape(runId)}}"]`)?.classList.add('active');
       }}
-      for (const button of el.list.querySelectorAll('[data-run-stop]')) {{
-        button.addEventListener('click', event => {{
-          event.stopPropagation();
-          stopRun(button.dataset.runId);
-        }});
-        button.addEventListener('keydown', event => {{
-          if (event.key === 'Enter' || event.key === ' ') {{
-            event.preventDefault();
-            event.stopPropagation();
-            stopRun(button.dataset.runId);
-          }}
-        }});
-      }}
-      for (const button of el.list.querySelectorAll('[data-run-pause]')) {{
-        button.addEventListener('click', event => {{
-          event.stopPropagation();
-          pauseRun(button.dataset.runId);
-        }});
-        button.addEventListener('keydown', event => {{
-          if (event.key === 'Enter' || event.key === ' ') {{
-            event.preventDefault();
-            event.stopPropagation();
-            pauseRun(button.dataset.runId);
-          }}
-        }});
-      }}
-      for (const button of el.list.querySelectorAll('[data-run-resume]')) {{
-        button.addEventListener('click', event => {{
-          event.stopPropagation();
-          resumeRun(button.dataset.runId);
-        }});
-        button.addEventListener('keydown', event => {{
-          if (event.key === 'Enter' || event.key === ' ') {{
-            event.preventDefault();
-            event.stopPropagation();
-            resumeRun(button.dataset.runId);
-          }}
-        }});
-      }}
+    }}
+
+    function handleRunListAction(target) {{
+      const action = target.closest('[data-run-delete], [data-run-stop], [data-run-pause], [data-run-resume]');
+      if (!action) return false;
+      const runId = action.dataset.runId;
+      if (action.matches('[data-run-delete]')) handleDeleteRunClick(runId);
+      else if (action.matches('[data-run-stop]')) stopRun(runId);
+      else if (action.matches('[data-run-pause]')) pauseRun(runId);
+      else if (action.matches('[data-run-resume]')) resumeRun(runId);
+      return true;
+    }}
+
+    function handleRunListClick(event) {{
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) return;
+      if (handleRunListAction(target)) return;
+      const item = target.closest('.run-item[data-run-id]');
+      if (item) selectRun(item.dataset.runId);
+    }}
+
+    function handleRunListKeydown(event) {{
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || !target.closest('[data-run-delete], [data-run-stop], [data-run-pause], [data-run-resume]')) return;
+      event.preventDefault();
+      handleRunListAction(target);
     }}
 
     async function pauseRun(runId) {{
@@ -5265,13 +5334,18 @@ def app_html() -> str:
 
     async function selectRun(runId, resetFinding = true) {{
       state.deleteConfirmRunId = null;
+      const previousRunId = state.selectedRun;
       state.selectedRun = runId;
       if (resetFinding) {{
         state.selectedFinding = null;
         state.expandedManualReviewKey = null;
         state.floatingManualReviewKey = null;
       }}
-      renderRuns();
+      updateSelectedRunCard(previousRunId, runId);
+      const summary = state.runs.find(run => run.run_id === runId);
+      if (!resetFinding && state.currentRun?.run_id === runId && summary?.revision && state.currentRun.revision === summary.revision) {{
+        return;
+      }}
       el.title.textContent = runId;
       el.status.textContent = '正在加载详情...';
       try {{
@@ -5279,6 +5353,7 @@ def app_html() -> str:
           fetchJson(`/runs/${{encodeURIComponent(runId)}}`),
           fetchJson(`/runs/${{encodeURIComponent(runId)}}/findings`)
         ]);
+        if (state.selectedRun !== runId) return;
         renderRunDetail(run, findings);
       }} catch (error) {{
         renderError(error);
@@ -5741,11 +5816,21 @@ def app_html() -> str:
         }});
       }}
       bindManualReviewControls(el.detail);
-      if (!findings.length) return;
-      const selected = state.selectedFinding && findings.some(item => item.finding_id === state.selectedFinding)
-        ? state.selectedFinding
-        : findings[0].finding_id;
-      selectFinding(selected, {{ scrollToDetail: false }});
+      if (!findings.length) {{
+        state.selectedFinding = null;
+        updateSelectedFindingSticky();
+        const emptyContainer = document.getElementById('finding-detail');
+        if (emptyContainer) emptyContainer.innerHTML = '<div class="empty">暂无可加载的漏洞详情。</div>';
+        return;
+      }}
+      if (state.selectedFinding && findings.some(item => item.finding_id === state.selectedFinding)) {{
+        selectFinding(state.selectedFinding, {{ scrollToDetail: false }});
+        return;
+      }}
+      state.selectedFinding = null;
+      updateSelectedFindingSticky();
+      const container = document.getElementById('finding-detail');
+      if (container) container.innerHTML = '<div class="empty">点击上方漏洞条目后加载完整详情。</div>';
     }}
 
     function bindManualReviewControls(root) {{
@@ -5953,20 +6038,38 @@ def app_html() -> str:
         state.floatingManualReviewKey = null;
       }}
       state.selectedFinding = findingId;
+      const requestedRunId = state.selectedRun;
       markSelectedFindingRow(findingId);
       updateSelectedFindingSticky();
       const container = document.getElementById('finding-detail');
       if (!container) return;
+      const cacheKey = manualReviewKey(state.selectedRun, findingId);
+      const revision = state.currentRun?.revision || state.runs.find(run => run.run_id === state.selectedRun)?.revision || '';
+      const cached = state.findingDetailCache[cacheKey];
+      if (cached && cached.revision === revision) {{
+        renderFindingDetailIntoContainer(container, cached.detail);
+        if (options.scrollToDetail) scrollFindingDetailIntoView();
+        return;
+      }}
       container.innerHTML = '<div class="empty">正在加载发现详情...</div>';
       if (options.scrollToDetail) scrollFindingDetailIntoView();
       try {{
         const detail = await fetchJson(`/runs/${{encodeURIComponent(state.selectedRun)}}/findings/${{encodeURIComponent(findingId)}}`);
-        container.innerHTML = renderFindingDetail(detail);
+        state.findingDetailCache[cacheKey] = {{ revision: detail.revision || revision, detail }};
+        const currentRevision = state.currentRun?.revision || '';
+        if (state.selectedRun !== requestedRunId || state.selectedFinding !== findingId) return;
+        if (detail.revision && currentRevision && detail.revision !== currentRevision) return;
+        renderFindingDetailIntoContainer(container, detail);
         updateSelectedFindingSticky();
         if (options.scrollToDetail) scrollFindingDetailIntoView();
       }} catch (error) {{
         container.innerHTML = `<div class="empty error">${{esc(error.message)}}</div>`;
       }}
+    }}
+
+    function renderFindingDetailIntoContainer(container, detail) {{
+      container.innerHTML = renderFindingDetail(detail);
+      bindLazyFindingSections(container, detail);
     }}
 
     function scrollFindingDetailIntoView() {{
@@ -6055,7 +6158,14 @@ def app_html() -> str:
       }}
     }}
 
-    function renderOriginalReportSection(detail) {{
+    function renderLazyFindingSection(kind, title) {{
+      return `<details class="detail lazy-finding-section" data-lazy-finding-section="${{esc(kind)}}">
+        <summary class="detail-summary">${{esc(title)}}</summary>
+        <div class="detail-body" data-lazy-finding-body="${{esc(kind)}}"><div class="muted">展开后加载。</div></div>
+      </details>`;
+    }}
+
+    function renderOriginalReportBody(detail) {{
       const item = findingReportEvidence(detail);
       const data = item && item.data ? item.data : {{}};
       const locations = Array.isArray(data.locations) ? data.locations : [];
@@ -6068,16 +6178,15 @@ def app_html() -> str:
         data.message ? `消息：${{data.message}}` : ''
       ].filter(Boolean).join('\\n');
       return `
-        <div class="detail">
-          <h3>原始报告详情</h3>
-          <div class="detail-body">
-            ${{rawLines ? `<div class="plain-text">${{rawText(rawLines)}}</div>` : '<div class="muted">未找到输入报告摘要。</div>'}}
-            ${{locations.length ? `<div><strong>报告位置：</strong><div class="plain-text">${{rawText(locations.join('\\n'))}}</div></div>` : ''}}
-            ${{codeFlows.length ? `<div><strong>报告代码流：</strong><pre>${{esc(codeFlows.map((flow, index) => `Flow ${{index + 1}}:\\n${{flow.join('\\n')}}`).join('\\n\\n'))}}</pre></div>` : ''}}
-            ${{properties ? `<div><strong>报告 properties：</strong><pre>${{esc(jsonBlock(properties))}}</pre></div>` : ''}}
-            ${{rawResult ? `<div><strong>原始 SARIF result：</strong><pre>${{esc(jsonBlock(rawResult))}}</pre></div>` : ''}}
-          </div>
-        </div>`;
+        ${{rawLines ? `<div class="plain-text">${{rawText(rawLines)}}</div>` : '<div class="muted">未找到输入报告摘要。</div>'}}
+        ${{locations.length ? `<div><strong>报告位置：</strong><div class="plain-text">${{rawText(locations.join('\\n'))}}</div></div>` : ''}}
+        ${{codeFlows.length ? `<div><strong>报告代码流：</strong><pre>${{esc(codeFlows.map((flow, index) => `Flow ${{index + 1}}:\\n${{flow.join('\\n')}}`).join('\\n\\n'))}}</pre></div>` : ''}}
+        ${{properties ? `<div><strong>报告 properties：</strong><pre>${{esc(jsonBlock(properties))}}</pre></div>` : ''}}
+        ${{rawResult ? `<div><strong>原始 SARIF result：</strong><pre>${{esc(jsonBlock(rawResult))}}</pre></div>` : ''}}`;
+    }}
+
+    function renderOriginalReportSection(_detail) {{
+      return renderLazyFindingSection('original-report', '原始报告详情');
     }}
 
     function uniqueDebateTurns(debate) {{
@@ -6346,7 +6455,7 @@ def app_html() -> str:
       return labels[String(status || '')] || String(status || '未知');
     }}
 
-    function renderCodexWorkflowSection(detail) {{
+    function renderCodexWorkflowBody(detail) {{
       const workflow = detail.cli_workflow && typeof detail.cli_workflow === 'object'
         ? detail.cli_workflow
         : (detail.codex_workflow && typeof detail.codex_workflow === 'object' ? detail.codex_workflow : null);
@@ -6355,17 +6464,19 @@ def app_html() -> str:
       const affirmative = workflow.affirmative && typeof workflow.affirmative === 'object' ? workflow.affirmative : {{}};
       const negative = workflow.negative && typeof workflow.negative === 'object' ? workflow.negative : {{}};
       const moderatorText = moderator.final_conclusion || moderator.reasoning_summary || detail.final_conclusion || detail.reasoning_summary || '';
-      return `<div class="detail">
-        <h3>CLI 三方复核</h3>
-        <div class="detail-body">
-          <div>
-            <strong>Moderator 总结：</strong>
-            ${{markdownBlock(moderatorText || '暂无 Moderator 总结。')}}
-          </div>
-          ${{renderCodexRoleConclusion('正方 finding', affirmative, false)}}
-          ${{renderCodexRoleConclusion('反方 finding', negative, false)}}
+      return `<div>
+          <strong>Moderator 总结：</strong>
+          ${{markdownBlock(moderatorText || '暂无 Moderator 总结。')}}
         </div>
-      </div>`;
+        ${{renderCodexRoleConclusion('正方 finding', affirmative, false)}}
+        ${{renderCodexRoleConclusion('反方 finding', negative, false)}}`;
+    }}
+
+    function renderCodexWorkflowSection(detail) {{
+      const workflow = detail.cli_workflow && typeof detail.cli_workflow === 'object'
+        ? detail.cli_workflow
+        : (detail.codex_workflow && typeof detail.codex_workflow === 'object' ? detail.codex_workflow : null);
+      return workflow ? renderLazyFindingSection('cli-workflow', 'CLI 三方复核') : '';
     }}
 
     function renderCodexEvidenceList(label, values) {{
@@ -6431,9 +6542,53 @@ def app_html() -> str:
       </details>`;
     }}
 
-    function renderFindingDetail(detail) {{
-      const evidence = detail.evidence_chain || [];
+    function renderDebateBody(detail) {{
       const debate = uniqueDebateTurns(detail.debate || []);
+      return debate.map(turn => `<div class="debate-turn">
+        <strong>${{esc(roleLabel(turn.role))}} 第 ${{esc(turn.round_index)}} 回合</strong>
+        ${{markdownBlock(turn.claim)}}
+        ${{renderDebateStructuredTurn(turn)}}
+        <div class="path">证据：${{esc((turn.evidence_ids || []).join(', '))}}</div>
+        ${{renderRawTurn(turn)}}
+      </div>`).join('') || '<div class="muted">暂无博弈回合记录。</div>';
+    }}
+
+    function renderEvidenceBody(detail) {{
+      const evidence = detail.evidence_chain || [];
+      return evidence.map(item => `<div>
+        <div class="chips">
+          <span class="chip">${{esc(item.evidence_id)}}</span>
+          <span class="chip">${{esc(evidenceKindLabel(item.kind))}}</span>
+          <span class="chip">${{esc(evidenceStrengthLabel(item.strength))}}</span>
+          <span class="chip">${{esc(item.source)}}</span>
+        </div>
+        ${{markdownBlock(item.summary)}}
+        ${{item.locations && item.locations.length ? `<div class="path">位置：${{esc(item.locations.map(locationText).join(' -> '))}}</div>` : ''}}
+        ${{item.data && (item.data.requested_file || item.data.resolved_file) ? `<div class="path">路径映射：${{esc(item.data.requested_file || '')}}${{item.data.resolved_file ? ' => ' + esc(item.data.resolved_file) : ''}}</div>` : ''}}
+        ${{item.snippet ? `<pre>${{esc(item.snippet)}}</pre>` : ''}}
+      </div>`).join('') || '<div class="muted">暂无证据记录。</div>';
+    }}
+
+    function bindLazyFindingSections(container, detail) {{
+      const renderers = {{
+        'original-report': () => renderOriginalReportBody(detail),
+        'cli-workflow': () => renderCodexWorkflowBody(detail),
+        'debate': () => renderDebateBody(detail),
+        'evidence': () => renderEvidenceBody(detail),
+      }};
+      for (const section of container.querySelectorAll('[data-lazy-finding-section]')) {{
+        section.addEventListener('toggle', () => {{
+          if (!section.open || section.dataset.lazyLoaded === 'true') return;
+          const kind = section.dataset.lazyFindingSection;
+          const body = section.querySelector('[data-lazy-finding-body]');
+          if (!body || !renderers[kind]) return;
+          body.innerHTML = renderers[kind]();
+          section.dataset.lazyLoaded = 'true';
+        }});
+      }}
+    }}
+
+    function renderFindingDetail(detail) {{
       const conclusion = conclusionWithoutEvidenceGraph(detail.final_conclusion);
       if (detail.finding_status && detail.finding_status !== 'completed') {{
         return `
@@ -6472,35 +6627,8 @@ def app_html() -> str:
         ${{renderScorecardSection(detail)}}
         ${{renderPathOverviewSection(detail)}}
         ${{renderEvidenceLedgerSection(detail)}}
-        <div class="detail">
-          <h3>博弈过程</h3>
-          <div class="detail-body">
-            ${{debate.map(turn => `<div class="debate-turn">
-              <strong>${{esc(roleLabel(turn.role))}} 第 ${{esc(turn.round_index)}} 回合</strong>
-              ${{markdownBlock(turn.claim)}}
-              ${{renderDebateStructuredTurn(turn)}}
-              <div class="path">证据：${{esc((turn.evidence_ids || []).join(', '))}}</div>
-              ${{renderRawTurn(turn)}}
-            </div>`).join('') || '<div class="muted">暂无博弈回合记录。</div>'}}
-          </div>
-        </div>
-        <div class="detail">
-          <h3>证据链</h3>
-          <div class="detail-body">
-            ${{evidence.map(item => `<div>
-              <div class="chips">
-                <span class="chip">${{esc(item.evidence_id)}}</span>
-                <span class="chip">${{esc(evidenceKindLabel(item.kind))}}</span>
-                <span class="chip">${{esc(evidenceStrengthLabel(item.strength))}}</span>
-                <span class="chip">${{esc(item.source)}}</span>
-              </div>
-              ${{markdownBlock(item.summary)}}
-              ${{item.locations && item.locations.length ? `<div class="path">位置：${{esc(item.locations.map(locationText).join(' -> '))}}</div>` : ''}}
-              ${{item.data && (item.data.requested_file || item.data.resolved_file) ? `<div class="path">路径映射：${{esc(item.data.requested_file || '')}}${{item.data.resolved_file ? ' => ' + esc(item.data.resolved_file) : ''}}</div>` : ''}}
-              ${{item.snippet ? `<pre>${{esc(item.snippet)}}</pre>` : ''}}
-            </div>`).join('') || '<div class="muted">暂无证据记录。</div>'}}
-          </div>
-        </div>`;
+        ${{renderLazyFindingSection('debate', '博弈过程')}}
+        ${{renderLazyFindingSection('evidence', '证据链')}}`;
     }}
 
     function locationText(location) {{

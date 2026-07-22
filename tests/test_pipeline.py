@@ -1,4 +1,5 @@
 import http.client
+import gzip
 import json
 import os
 import subprocess
@@ -1899,6 +1900,53 @@ for raw in sys.stdin.buffer:
             self.assertEqual(store.get("run-manual-review")["manual_reviews"], {})
             self.assertFalse(store.delete_manual_review("run-manual-review", "finding-1"))
 
+    def test_api_run_status_uses_revision_and_json_supports_gzip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunRecordStore(Path(tmp) / "records")
+            for index in range(30):
+                store.save_payload(
+                    {
+                        "run_id": f"run-revision-{index:02d}",
+                        "status": "completed",
+                        "created_at": f"2026-07-22T00:00:{index:02d}Z",
+                        "source_path": f"/workspace/project-{index:02d}",
+                        "sarif_path": f"/workspace/report-{index:02d}.sarif",
+                        "finding_count": 1,
+                        "reports": [],
+                    }
+                )
+            provider_store = ProviderStore(Path(tmp) / "providers.json")
+            api_server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(store, provider_store))
+            api_thread = Thread(target=api_server.serve_forever, daemon=True)
+            api_thread.start()
+            base = f"http://127.0.0.1:{api_server.server_port}"
+            try:
+                with urllib.request.urlopen(f"{base}/runs/run-revision-00/status", timeout=5) as response:
+                    first_status = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(set(first_status), {"run_id", "status", "revision"})
+                self.assertTrue(first_status["revision"])
+
+                updated = store.get("run-revision-00")
+                updated["status"] = "failed"
+                store.save_payload(updated)
+                with urllib.request.urlopen(f"{base}/runs/run-revision-00/status", timeout=5) as response:
+                    second_status = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(second_status["status"], "failed")
+                self.assertNotEqual(second_status["revision"], first_status["revision"])
+
+                request = urllib.request.Request(f"{base}/runs", headers={"Accept-Encoding": "gzip"})
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.headers.get("Content-Encoding"), "gzip")
+                    raw = gzip.decompress(response.read())
+                self.assertNotIn(b"\n  ", raw)
+                listed = json.loads(raw.decode("utf-8"))
+                self.assertEqual(len(listed), 30)
+                self.assertTrue(all(item.get("revision") for item in listed))
+            finally:
+                api_server.shutdown()
+                api_server.server_close()
+                api_thread.join(timeout=5)
+
     def test_record_store_preserves_opencode_stage_checkpoint_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = RunRecordStore(Path(tmp) / "records")
@@ -2263,7 +2311,10 @@ for raw in sys.stdin.buffer:
         self.assertIn('deleteConfirmRunId: null', html)
         self.assertIn("deleteConfirming ? '确认删除？' : '删除'", html)
         self.assertIn('function handleDeleteRunClick(runId)', html)
-        self.assertIn('handleDeleteRunClick(button.dataset.runId)', html)
+        self.assertIn("if (action.matches('[data-run-delete]')) handleDeleteRunClick(runId)", html)
+        self.assertIn("el.list.addEventListener('click', handleRunListClick)", html)
+        self.assertIn("el.list.addEventListener('keydown', handleRunListKeydown)", html)
+        self.assertNotIn("el.list.querySelectorAll('button[data-run-id]')", html)
         self.assertIn("state.deleteConfirmRunId !== runId", html)
         self.assertIn("!target?.closest('[data-run-delete]')", html)
         self.assertIn('async function deleteRun(runId)', html)
@@ -2345,6 +2396,22 @@ for raw in sys.stdin.buffer:
         self.assertIn("该漏洞报告尚未完成三方复核", html)
         self.assertIn("ensurePolling(created.run_id);", html)
         self.assertLess(html.index("ensurePolling(created.run_id);"), html.index("await loadRuns();"))
+        self.assertIn('async function pollRunningRuns()', html)
+        self.assertIn('/status`', html)
+        self.assertIn('function scheduleGlobalPoll(delay = 1000)', html)
+        self.assertNotIn('async function pollRun(runId)', html)
+        self.assertNotIn('state.polling[runId]', html)
+        self.assertIn('function updateSelectedRunCard(previousRunId, runId)', html)
+        self.assertIn('updateSelectedRunCard(previousRunId, runId)', html)
+        self.assertIn('function runListSignature(runs)', html)
+        self.assertIn('if (changed) renderRuns()', html)
+        self.assertIn('点击上方漏洞条目后加载完整详情', html)
+        self.assertIn('findingDetailCache: {}', html)
+        self.assertIn('cached && cached.revision === revision', html)
+        self.assertIn('function bindLazyFindingSections(container, detail)', html)
+        self.assertIn("renderLazyFindingSection('debate', '博弈过程')", html)
+        self.assertIn("renderLazyFindingSection('evidence', '证据链')", html)
+        self.assertIn('content-visibility: auto', html)
         self.assertIn('正方验证阶段，等待正方 result.json', html)
         self.assertIn('反方复核阶段，正方已交付', html)
         self.assertIn('最终裁决阶段，正反方已交付', html)

@@ -415,6 +415,11 @@ uv run vuln-judger api \
 证据链、博弈过程、防护分析、影响分析、LLM 提供商配置、正反方和主持人默认提供商选择、
 提供商连通性测试、三方 Agent 配置管理，以及 MCP / Skill Source 配置管理。
 
+Dashboard 使用单一全局轮询器查询运行中任务的 `status/revision`，只有 revision 变化时才刷新对应
+任务卡片和当前详情，不会在每个运行任务的每次轮询中重新请求全部历史记录。finding 完整详情仅在
+用户点击后加载，并按 run revision 缓存；原始报告、CLI 三方材料、博弈过程和证据链在展开章节时
+才生成 DOM。JSON API 默认使用紧凑编码，客户端声明 `Accept-Encoding: gzip` 时会压缩较大响应。
+
 Codex/OpenCode 三方复核引擎会直接复用合法、无分组歧义的 SARIF results；Markdown、解析失败或
 分组存在歧义时才调用 Moderator 拆分。报告准备完成后会立即把全部 finding 写入运行记录，并在
 `.workspaces/runs/<run-id>/findings/<finding-id>/brief.json` 保存各自的输入材料。前端会将
@@ -466,6 +471,7 @@ curl -X POST http://127.0.0.1:8765/runs \
 ```bash
 curl http://127.0.0.1:8765/runs
 curl http://127.0.0.1:8765/runs/<run_id>
+curl http://127.0.0.1:8765/runs/<run_id>/status
 curl http://127.0.0.1:8765/runs/<run_id>/findings
 curl http://127.0.0.1:8765/runs/<run_id>/findings/<finding_id>
 curl http://127.0.0.1:8765/providers
