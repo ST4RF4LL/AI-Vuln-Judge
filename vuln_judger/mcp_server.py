@@ -185,6 +185,7 @@ class JudgerMCPServer:
         skills_path = self._skills_path(arguments)
         run_id = _optional_text(arguments.get("run_id")) or f"run-{uuid4().hex[:12]}"
         cli_engine = engine in CLI_ENGINES
+        agents_config = self.agent_store.default_agents_config()
         config = RunConfig(
             sarif_path=report_path,
             source_path=source_path,
@@ -210,7 +211,9 @@ class JudgerMCPServer:
             affirmative_agent=self.agent_store.agent("affirmative", _optional_text(arguments.get("affirmative_agent_profile"))),
             negative_agent=self.agent_store.agent("negative", _optional_text(arguments.get("negative_agent_profile"))),
             moderator_agent=self.agent_store.agent("moderator", _optional_text(arguments.get("moderator_agent_profile"))),
-            agents_instructions=self.agent_store.agents_instructions(),
+            agents_config_id=str(agents_config.get("id") or "") or None,
+            agents_config_path=str(agents_config.get("resolved_path") or "") or None,
+            agents_instructions=str(agents_config.get("instructions") or ""),
         )
         if cli_engine:
             if not bool(arguments.get("save", True)):

@@ -12,7 +12,9 @@ from .models import AgentConfig, to_jsonable
 DEFAULT_AGENTS_DIR = Path("agents")
 AGENT_FILE = "AGENT.md"
 AGENTS_FILE = "AGENTS.md"
+AGENTS_CONFIG_FILE = "AGENTS.json"
 AGENT_META_FILE = "AGENT.json"
+DEFAULT_AGENTS_CONFIG_ID = "Agents_default"
 
 DEFAULT_AGENTS_INSTRUCTIONS = (
     "遵循当前角色的 AGENT.md 配置，以及每个阶段 prompt 指定的输入文件、输出文件和 JSON schema。"
@@ -94,7 +96,7 @@ class AgentDirectoryStore:
         self.ensure_defaults()
         return {
             "root": str(self.root),
-            "agents_md": self.agents_file_summary(),
+            "agents_md": self.agents_configs_summary(),
             "defaults": {
                 "affirmative": DEFAULT_PROFILE_IDS["affirmative"],
                 "negative": DEFAULT_PROFILE_IDS["negative"],
@@ -110,29 +112,115 @@ class AgentDirectoryStore:
     def defaults(self) -> Dict[str, Any]:
         self.ensure_defaults()
         return {
-            "agents_md": self.agents_file_summary(),
+            "agents_md": self.default_agents_config(include_instructions=False),
             "affirmative": to_jsonable(self.agent("affirmative", DEFAULT_PROFILE_IDS["affirmative"])),
             "negative": to_jsonable(self.agent("negative", DEFAULT_PROFILE_IDS["negative"])),
             "moderator": to_jsonable(self.agent("moderator", DEFAULT_PROFILE_IDS["moderator"])),
         }
 
     def agents_instructions(self) -> str:
-        self.ensure_defaults()
-        return (self.root / AGENTS_FILE).read_text(encoding="utf-8", errors="replace").strip()
+        return str(self.default_agents_config().get("instructions") or "")
 
-    def agents_file_summary(self) -> Dict[str, Any]:
-        path = self.root / AGENTS_FILE
+    def agents_configs_summary(self) -> Dict[str, Any]:
+        self.ensure_defaults()
+        data = self._load_agents_configs()
+        default_id = str(data.get("default") or "") or None
+        configs = []
+        for item in data.get("configs") or []:
+            if not isinstance(item, dict):
+                continue
+            config_id = str(item.get("id") or "")
+            path = self._resolve_agents_path(item.get("path"))
+            configs.append(
+                {
+                    "id": config_id,
+                    "name": str(item.get("name") or config_id),
+                    "path": str(item.get("path") or ""),
+                    "resolved_path": str(path),
+                    "exists": path.is_file(),
+                    "is_default": config_id == default_id,
+                }
+            )
+        configs.sort(key=lambda item: (not item["is_default"], item["name"].lower(), item["id"].lower()))
         return {
-            "path": str(path.relative_to(Path.cwd())) if _is_under(path, Path.cwd()) else str(path),
-            "instructions": path.read_text(encoding="utf-8", errors="replace").strip() if path.exists() else "",
+            "registry_path": str(self.root / AGENTS_CONFIG_FILE),
+            "default_id": default_id,
+            "configs": configs,
         }
 
-    def save_agents_instructions(self, instructions: str) -> Dict[str, Any]:
-        text = str(instructions or "").strip()
-        self.root.mkdir(parents=True, exist_ok=True)
-        path = self.root / AGENTS_FILE
-        path.write_text(text + ("\n" if text else ""), encoding="utf-8")
-        return self.agents_file_summary()
+    def upsert_agents_config(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        config_id = _profile_id(str(payload.get("id") or ""))
+        data = self._load_agents_configs()
+        existing = next(
+            (item for item in data.get("configs") or [] if isinstance(item, dict) and item.get("id") == config_id),
+            None,
+        )
+        path_text = str(payload.get("path") or (existing or {}).get("path") or "").strip()
+        if not path_text:
+            raise ValueError("AGENTS.md 配置路径不能为空")
+        path = self._resolve_agents_path(path_text)
+        if not path.is_file():
+            raise ValueError(f"AGENTS.md 配置文件不存在：{path}")
+        stored_path = str(path.relative_to(self.root)) if _is_under(path, self.root) else str(path)
+        config = {
+            "id": config_id,
+            "name": str(payload.get("name") or (existing or {}).get("name") or config_id).strip(),
+            "path": stored_path,
+        }
+        configs = [item for item in data.get("configs") or [] if not isinstance(item, dict) or item.get("id") != config_id]
+        configs.append(config)
+        data["configs"] = configs
+        if not data.get("default"):
+            data["default"] = config_id
+        self._save_agents_configs(data)
+        return self._public_agents_config(config, default_id=str(data.get("default") or ""))
+
+    def set_default_agents_config(self, config_id: str) -> Dict[str, Any]:
+        chosen_id = _profile_id(config_id)
+        data = self._load_agents_configs()
+        config = next(
+            (item for item in data.get("configs") or [] if isinstance(item, dict) and item.get("id") == chosen_id),
+            None,
+        )
+        if config is None:
+            raise ValueError(f"未知 AGENTS.md 配置：{chosen_id}")
+        path = self._resolve_agents_path(config.get("path"))
+        if not path.is_file():
+            raise ValueError(f"AGENTS.md 配置文件不存在：{path}")
+        data["default"] = chosen_id
+        self._save_agents_configs(data)
+        return self.agents_configs_summary()
+
+    def delete_agents_config(self, config_id: str) -> Dict[str, Any]:
+        chosen_id = _profile_id(config_id)
+        data = self._load_agents_configs()
+        if str(data.get("default") or "") == chosen_id:
+            raise ValueError("默认 AGENTS.md 配置不能删除，请先选择其他默认配置")
+        configs = data.get("configs") or []
+        kept = [item for item in configs if not isinstance(item, dict) or item.get("id") != chosen_id]
+        if len(kept) == len(configs):
+            raise ValueError(f"未知 AGENTS.md 配置：{chosen_id}")
+        data["configs"] = kept
+        self._save_agents_configs(data)
+        return self.agents_configs_summary()
+
+    def default_agents_config(self, *, include_instructions: bool = True) -> Dict[str, Any]:
+        self.ensure_defaults()
+        data = self._load_agents_configs()
+        default_id = str(data.get("default") or "")
+        config = next(
+            (item for item in data.get("configs") or [] if isinstance(item, dict) and item.get("id") == default_id),
+            None,
+        )
+        if config is None:
+            raise ValueError("尚未配置默认 AGENTS.md")
+        result = self._public_agents_config(config, default_id=default_id)
+        path = Path(result["resolved_path"])
+        if not path.is_file():
+            raise ValueError(f"默认 AGENTS.md 配置文件不存在：{path}")
+        if include_instructions:
+            result["instructions"] = path.read_text(encoding="utf-8", errors="replace").strip()
+        return result
 
     def list_profiles(self, role: str) -> List[AgentConfig]:
         role_key = _role_key(role)
@@ -198,6 +286,21 @@ class AgentDirectoryStore:
         if not agents_file.exists():
             agents_file.parent.mkdir(parents=True, exist_ok=True)
             agents_file.write_text(DEFAULT_AGENTS_INSTRUCTIONS + "\n", encoding="utf-8")
+        agents_config_file = self.root / AGENTS_CONFIG_FILE
+        if not agents_config_file.exists():
+            self._save_agents_configs(
+                {
+                    "version": 1,
+                    "default": DEFAULT_AGENTS_CONFIG_ID,
+                    "configs": [
+                        {
+                            "id": DEFAULT_AGENTS_CONFIG_ID,
+                            "name": "默认 AGENTS.md",
+                            "path": AGENTS_FILE,
+                        }
+                    ],
+                }
+            )
         affirmative_file = self._role_dir("affirmative") / DEFAULT_PROFILE_IDS["affirmative"] / AGENT_FILE
         if not affirmative_file.exists():
             affirmative_file.parent.mkdir(parents=True, exist_ok=True)
@@ -213,6 +316,41 @@ class AgentDirectoryStore:
 
     def _role_dir(self, role_key: str) -> Path:
         return self.root / ROLE_DIRS[role_key]
+
+    def _load_agents_configs(self) -> Dict[str, Any]:
+        path = self.root / AGENTS_CONFIG_FILE
+        if not path.exists():
+            return {"version": 1, "default": None, "configs": []}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("AGENTS.md 配置注册表格式错误")
+        data.setdefault("version", 1)
+        data.setdefault("default", None)
+        data.setdefault("configs", [])
+        return data
+
+    def _save_agents_configs(self, data: Dict[str, Any]) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        path = self.root / AGENTS_CONFIG_FILE
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _resolve_agents_path(self, value: Any) -> Path:
+        path = Path(str(value or "")).expanduser()
+        if not path.is_absolute():
+            path = self.root / path
+        return path.resolve()
+
+    def _public_agents_config(self, config: Dict[str, Any], *, default_id: str) -> Dict[str, Any]:
+        config_id = str(config.get("id") or "")
+        path = self._resolve_agents_path(config.get("path"))
+        return {
+            "id": config_id,
+            "name": str(config.get("name") or config_id),
+            "path": str(config.get("path") or ""),
+            "resolved_path": str(path),
+            "exists": path.is_file(),
+            "is_default": config_id == default_id,
+        }
 
     def _agent_from_file(self, role_key: str, profile_id: str, path: Path) -> AgentConfig:
         metadata = self._metadata(path.parent)

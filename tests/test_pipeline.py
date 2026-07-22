@@ -2143,10 +2143,13 @@ for raw in sys.stdin.buffer:
         self.assertIn('id="provider-panel"', html)
         self.assertIn('id="open-agent-prompts"', html)
         self.assertIn('id="agent-prompts-modal"', html)
-        self.assertIn('id="agent-default-instructions"', html)
-        self.assertIn('id="save-agent-default-instructions"', html)
-        self.assertIn("action: 'save_agents_default'", html)
-        self.assertIn('async function saveAgentDefaultInstructions()', html)
+        self.assertIn('id="agents-md-config"', html)
+        self.assertIn('id="agents-md-config-path"', html)
+        self.assertIn('id="default-agents-md-config"', html)
+        self.assertIn('id="save-default-agents-md-config"', html)
+        self.assertIn('async function saveAgentsMdConfig()', html)
+        self.assertIn('async function saveDefaultAgentsMdConfig()', html)
+        self.assertNotIn('id="agent-default-instructions"', html)
         self.assertIn('id="open-integrations"', html)
         self.assertIn('id="integrations-modal"', html)
         self.assertIn('id="auto-refresh"', html)
@@ -5002,11 +5005,13 @@ for raw in sys.stdin.buffer:
                     defaults = json.loads(response.read().decode("utf-8"))
                 self.assertEqual(defaults["defaults"]["affirmative"], "Affirmative_default")
                 self.assertEqual(defaults["defaults"]["moderator"], "Moderator_default")
-                self.assertTrue(defaults["agents_md"]["path"].endswith("AGENTS.md"))
-                self.assertIn("JSON schema", defaults["agents_md"]["instructions"])
+                self.assertEqual(defaults["agents_md"]["default_id"], "Agents_default")
+                self.assertEqual(defaults["agents_md"]["configs"][0]["path"], "AGENTS.md")
+                self.assertTrue(defaults["agents_md"]["configs"][0]["exists"])
+                self.assertNotIn("instructions", defaults["agents_md"]["configs"][0])
                 with urllib.request.urlopen(f"{base}/agent-prompts/defaults", timeout=5) as response:
                     agent_defaults = json.loads(response.read().decode("utf-8"))
-                self.assertEqual(agent_defaults["agents_md"], defaults["agents_md"])
+                self.assertEqual(agent_defaults["agents_md"]["id"], "Agents_default")
                 affirmative_default = next(
                     profile for profile in defaults["roles"]["affirmative"] if profile["profile_id"] == "Affirmative_default"
                 )
@@ -5026,18 +5031,24 @@ for raw in sys.stdin.buffer:
                 self.assertIn("自主达成 Moderator 目标", moderator_default["instructions"])
                 self.assertIn("代码上下文业务逻辑", moderator_default["instructions"])
                 self.assertIn("异常读取", moderator_default["instructions"])
-                saved_agents_default = post_json(
-                    f"{base}/agent-prompts",
+                custom_agents_path = root / "custom-agents" / "AGENTS.md"
+                custom_agents_path.parent.mkdir()
+                custom_agents_path.write_text("所有 CLI 角色共同遵循这条自定义约束。\n", encoding="utf-8")
+                saved_agents_config = post_json(
+                    f"{base}/agent-prompts/agents-md",
                     {
-                        "action": "save_agents_default",
-                        "instructions": "所有 CLI 角色共同遵循这条自定义约束。",
+                        "id": "Agents_custom",
+                        "name": "自定义 AGENTS 配置",
+                        "path": str(custom_agents_path),
                     },
                 )
-                self.assertEqual(saved_agents_default["instructions"], "所有 CLI 角色共同遵循这条自定义约束。")
-                self.assertEqual(
-                    (root / "agents" / "AGENTS.md").read_text(encoding="utf-8"),
-                    "所有 CLI 角色共同遵循这条自定义约束。\n",
+                self.assertEqual(saved_agents_config["id"], "Agents_custom")
+                self.assertFalse(saved_agents_config["is_default"])
+                selected_agents_default = post_json(
+                    f"{base}/agent-prompts/agents-md/default",
+                    {"id": "Agents_custom"},
                 )
+                self.assertEqual(selected_agents_default["default_id"], "Agents_custom")
                 saved = post_json(
                     f"{base}/agent-prompts",
                     {
@@ -5099,7 +5110,25 @@ for raw in sys.stdin.buffer:
                 self.assertEqual(run["agent_configs"]["negative"]["instructions"], "质疑可达性和防护条件。")
                 self.assertEqual(run["agent_configs"]["moderator"]["profile_id"], "Moderator_default")
                 self.assertEqual(run["agent_configs"]["moderator"]["instructions"], "中立总结双方核心争议。")
+                self.assertEqual(run["config"]["agents_config_id"], "Agents_custom")
+                self.assertEqual(run["config"]["agents_config_path"], str(custom_agents_path.resolve()))
                 self.assertEqual(run["config"]["agents_instructions"], "所有 CLI 角色共同遵循这条自定义约束。")
+                default_agents_delete = urllib.request.Request(
+                    f"{base}/agent-prompts/agents-md/Agents_custom",
+                    method="DELETE",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as error:
+                    urllib.request.urlopen(default_agents_delete, timeout=5)
+                self.assertEqual(error.exception.code, 400)
+                post_json(
+                    f"{base}/agent-prompts/agents-md/default",
+                    {"id": "Agents_default"},
+                )
+                with urllib.request.urlopen(default_agents_delete, timeout=5) as response:
+                    deleted_agents_config = json.loads(response.read().decode("utf-8"))
+                self.assertFalse(
+                    any(config["id"] == "Agents_custom" for config in deleted_agents_config["configs"])
+                )
                 delete_request = urllib.request.Request(
                     f"{base}/agent-prompts/affirmative/Affirmative_custom",
                     method="DELETE",
@@ -7627,12 +7656,20 @@ class OpenCodeRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             agent_store = AgentDirectoryStore(root / "agents")
-            agent_store.save_agents_instructions("后来修改的默认配置。")
+            later_path = root / "later" / "AGENTS.md"
+            later_path.parent.mkdir()
+            later_path.write_text("后来修改的默认配置。\n", encoding="utf-8")
+            agent_store.upsert_agents_config(
+                {"id": "Agents_later", "name": "后来配置", "path": str(later_path)}
+            )
+            agent_store.set_default_agents_config("Agents_later")
             config = _config_from_payload(
                 {
                     "engine": "codex",
                     "report_path": str(root / "report.sarif"),
                     "source_path": str(root / "source"),
+                    "agents_config_id": "Agents_snapshot",
+                    "agents_config_path": "/snapshot/AGENTS.md",
                     "agents_instructions": "任务启动时保存的配置快照。",
                 },
                 root / "providers.json",
@@ -7641,6 +7678,8 @@ class OpenCodeRunnerTests(unittest.TestCase):
             )
 
         self.assertEqual(config.agents_instructions, "任务启动时保存的配置快照。")
+        self.assertEqual(config.agents_config_id, "Agents_snapshot")
+        self.assertEqual(config.agents_config_path, "/snapshot/AGENTS.md")
 
     def test_opencode_probe_only_requires_attach_tui_capabilities(self):
         responses = [

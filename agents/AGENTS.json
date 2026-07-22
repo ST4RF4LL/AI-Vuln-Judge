@@ -1,0 +1,11 @@
+{
+  "configs": [
+    {
+      "id": "Agents_default",
+      "name": "默认 AGENTS.md",
+      "path": "AGENTS.md"
+    }
+  ],
+  "default": "Agents_default",
+  "version": 1
+}

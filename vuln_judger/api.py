@@ -363,13 +363,18 @@ def make_handler(
                         )
                     )
                     return
+                if parts == ["agent-prompts", "agents-md"]:
+                    self._json(agent_store.upsert_agents_config(self._read_json()), HTTPStatus.CREATED)
+                    return
+                if parts == ["agent-prompts", "agents-md", "default"]:
+                    payload = self._read_json()
+                    self._json(agent_store.set_default_agents_config(payload.get("id")))
+                    return
                 if parts == ["agent-prompts"]:
                     payload = self._read_json()
                     if payload.get("reset"):
                         agent_store.ensure_defaults()
                         self._json(agent_store.summary())
-                    elif payload.get("action") == "save_agents_default":
-                        self._json(agent_store.save_agents_instructions(payload.get("instructions")))
                     elif payload.get("action") == "star":
                         self._json(
                             to_jsonable(
@@ -428,6 +433,13 @@ def make_handler(
 
         def do_DELETE(self) -> None:  # noqa: N802
             parts = _parts(self.path)
+            if len(parts) == 3 and parts[:2] == ["agent-prompts", "agents-md"]:
+                try:
+                    self._json(agent_store.delete_agents_config(parts[2]))
+                except Exception as exc:
+                    LOG.exception("删除 AGENTS.md 配置失败 id=%s", parts[2])
+                    self._json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
             if len(parts) == 5 and parts[0] == "runs" and parts[2] == "findings" and parts[4] == "manual-review":
                 run_id = parts[1]
                 finding_id = parts[3]
@@ -498,6 +510,9 @@ def make_handler(
                 return
             if parts == ["agent-prompts"]:
                 self._json(agent_store.summary())
+                return
+            if parts == ["agent-prompts", "agents-md"]:
+                self._json(agent_store.agents_configs_summary())
                 return
             if parts == ["agent-prompts", "defaults"]:
                 self._json(agent_store.defaults())
@@ -744,10 +759,15 @@ def _config_from_payload(
     if engine not in {*CLI_ENGINES, "builtin"}:
         raise ValueError(f"不支持的执行引擎：{engine}")
     cli_engine = engine in CLI_ENGINES
+    agents_config_id = str(payload.get("agents_config_id") or "").strip() or None
+    agents_config_path = str(payload.get("agents_config_path") or "").strip() or None
     if "agents_instructions" in payload:
         agents_instructions = str(payload.get("agents_instructions") or "").strip()
     elif agent_store is not None:
-        agents_instructions = agent_store.agents_instructions()
+        agents_config = agent_store.default_agents_config()
+        agents_config_id = str(agents_config.get("id") or "").strip() or None
+        agents_config_path = str(agents_config.get("resolved_path") or "").strip() or None
+        agents_instructions = str(agents_config.get("instructions") or "")
     else:
         agents_instructions = ""
     affirmative_agent = None
@@ -795,6 +815,8 @@ def _config_from_payload(
         affirmative_agent=affirmative_agent,
         negative_agent=negative_agent,
         moderator_agent=moderator_agent,
+        agents_config_id=agents_config_id,
+        agents_config_path=agents_config_path,
         agents_instructions=agents_instructions,
         reuse_findings_from_run_id=(str(payload.get("reuse_findings_from_run_id") or "").strip() or None),
     )
@@ -3387,18 +3409,28 @@ def app_html() -> str:
       <div class="settings-head">
         <div>
           <h2 id="agent-prompts-title">Agent 配置</h2>
-          <div class="muted">配置共享 AGENTS.md 默认约束，以及正方、反方和主持人的 AGENT.md 角色提示词。</div>
+          <div class="muted">配置默认 AGENTS.md 文件，以及正方、反方和主持人的 AGENT.md 角色提示词。</div>
         </div>
         <button id="close-agent-prompts" type="button" title="关闭 Agent 提示词设置">关闭</button>
       </div>
       <div class="settings-body">
-        <div class="detail" id="agent-default-instructions-panel">
-          <h3>CLI AGENTS.md 默认配置</h3>
+        <div class="detail" id="agents-md-config-panel">
+          <h3>AGENTS.md 默认配置</h3>
           <div class="detail-body">
-            <div class="muted">自动注入所有新建 Codex/OpenCode 角色 session；任务启动后会保存当时的配置快照。</div>
-            <label>共享 AGENTS.md<textarea id="agent-default-instructions" placeholder="输入三个角色共同遵循的默认约束"></textarea></label>
+            <div class="muted">登记已有 AGENTS.md 文件并选择默认项；Web 不修改文件内容。相对路径以 Agent 配置目录为基准。</div>
+            <div class="profile-grid" id="agents-md-config-list"></div>
+            <div class="form-grid">
+              <label>AGENTS.md 配置<select id="agents-md-config"></select></label>
+              <label>配置 ID<input id="agents-md-config-id" placeholder="Agents_custom"></label>
+              <label>配置名称<input id="agents-md-config-name" placeholder="安全审计默认配置"></label>
+              <label class="wide">文件路径<input id="agents-md-config-path" placeholder="/path/to/AGENTS.md"></label>
+              <label>默认配置<select id="default-agents-md-config"></select></label>
+            </div>
             <div class="toolbar">
-              <button id="save-agent-default-instructions" type="button">保存 AGENTS.md 默认配置</button>
+              <button id="new-agents-md-config" type="button">新增配置</button>
+              <button id="save-agents-md-config" type="button">保存配置</button>
+              <button id="delete-agents-md-config" type="button">删除配置</button>
+              <button id="save-default-agents-md-config" type="button">保存默认配置</button>
             </div>
           </div>
         </div>
@@ -3651,7 +3683,12 @@ def app_html() -> str:
       agentAffirmativeInstructions: document.getElementById('agent-affirmative-instructions'),
       agentNegativeInstructions: document.getElementById('agent-negative-instructions'),
       agentModeratorInstructions: document.getElementById('agent-moderator-instructions'),
-      agentDefaultInstructions: document.getElementById('agent-default-instructions'),
+      agentsMdConfigList: document.getElementById('agents-md-config-list'),
+      agentsMdConfig: document.getElementById('agents-md-config'),
+      agentsMdConfigId: document.getElementById('agents-md-config-id'),
+      agentsMdConfigName: document.getElementById('agents-md-config-name'),
+      agentsMdConfigPath: document.getElementById('agents-md-config-path'),
+      defaultAgentsMdConfig: document.getElementById('default-agents-md-config'),
       runSarif: document.getElementById('run-sarif'),
       runSource: document.getElementById('run-source'),
       runReuseFindingsOption: document.getElementById('run-reuse-findings-option'),
@@ -3744,7 +3781,11 @@ def app_html() -> str:
     document.getElementById('save-affirmative-agent').addEventListener('click', () => saveAgentProfile('affirmative'));
     document.getElementById('save-negative-agent').addEventListener('click', () => saveAgentProfile('negative'));
     document.getElementById('save-moderator-agent').addEventListener('click', () => saveAgentProfile('moderator'));
-    document.getElementById('save-agent-default-instructions').addEventListener('click', saveAgentDefaultInstructions);
+    document.getElementById('new-agents-md-config').addEventListener('click', newAgentsMdConfig);
+    document.getElementById('save-agents-md-config').addEventListener('click', saveAgentsMdConfig);
+    document.getElementById('delete-agents-md-config').addEventListener('click', deleteAgentsMdConfig);
+    document.getElementById('save-default-agents-md-config').addEventListener('click', saveDefaultAgentsMdConfig);
+    el.agentsMdConfig.addEventListener('change', fillAgentsMdConfigEditor);
     document.getElementById('reset-agent-prompts').addEventListener('click', resetAgentPrompts);
     document.getElementById('save-mcp').addEventListener('click', saveMcpServer);
     document.getElementById('test-mcp').addEventListener('click', testMcpServer);
@@ -4472,7 +4513,7 @@ def app_html() -> str:
       const affirmativeOptions = profileOptions('affirmative');
       const negativeOptions = profileOptions('negative');
       const moderatorOptions = profileOptions('moderator');
-      el.agentDefaultInstructions.value = (state.agentPrompts.agents_md || {{}}).instructions || '';
+      renderAgentsMdConfigs();
       el.agentAffirmativeProfile.innerHTML = affirmativeOptions;
       el.agentNegativeProfile.innerHTML = negativeOptions;
       el.agentModeratorProfile.innerHTML = moderatorOptions;
@@ -4648,14 +4689,100 @@ def app_html() -> str:
       }}
     }}
 
-    async function saveAgentDefaultInstructions() {{
+    function agentsMdConfigs() {{
+      return ((state.agentPrompts.agents_md || {{}}).configs || []);
+    }}
+
+    function findAgentsMdConfig(configId) {{
+      return agentsMdConfigs().find(config => config.id === configId) || agentsMdConfigs()[0] || null;
+    }}
+
+    function renderAgentsMdConfigs() {{
+      const metadata = state.agentPrompts.agents_md || {{}};
+      const configs = agentsMdConfigs();
+      const current = el.agentsMdConfig.value;
+      const options = configs.map(config => (
+        `<option value="${{esc(config.id)}}">${{esc(config.name || config.id)}} / ${{esc(config.path || '')}}</option>`
+      )).join('');
+      el.agentsMdConfig.innerHTML = options;
+      el.defaultAgentsMdConfig.innerHTML = options;
+      el.agentsMdConfig.value = configs.some(config => config.id === current)
+        ? current
+        : (metadata.default_id || (configs[0] && configs[0].id) || '');
+      el.defaultAgentsMdConfig.value = metadata.default_id || '';
+      el.agentsMdConfigList.innerHTML = configs.map(config => `
+        <div class="profile-card ${{config.is_default ? 'default' : ''}}">
+          <div class="profile-head">
+            <div>
+              <div class="profile-title">${{esc(config.name || config.id)}}</div>
+              <div class="profile-path">${{esc(config.path || '')}}</div>
+            </div>
+            <span class="chip">${{config.is_default ? '默认' : (config.exists ? '可用' : '文件缺失')}}</span>
+          </div>
+          <div class="profile-preview">${{esc(config.resolved_path || '')}}</div>
+          <div class="profile-actions"><button type="button" data-agents-md-edit="true" data-config-id="${{esc(config.id)}}">配置</button></div>
+        </div>`).join('') || '<div class="muted">尚未登记 AGENTS.md 配置。</div>';
+      for (const button of el.agentsMdConfigList.querySelectorAll('[data-agents-md-edit]')) {{
+        button.addEventListener('click', () => {{
+          el.agentsMdConfig.value = button.dataset.configId;
+          fillAgentsMdConfigEditor();
+        }});
+      }}
+      fillAgentsMdConfigEditor();
+    }}
+
+    function fillAgentsMdConfigEditor() {{
+      const config = findAgentsMdConfig(el.agentsMdConfig.value);
+      el.agentsMdConfigId.value = config ? config.id : '';
+      el.agentsMdConfigName.value = config ? config.name : '';
+      el.agentsMdConfigPath.value = config ? config.path : '';
+    }}
+
+    function newAgentsMdConfig() {{
+      el.agentsMdConfig.value = '';
+      el.agentsMdConfigId.value = `Agents_custom_${{String(Date.now()).slice(-6)}}`;
+      el.agentsMdConfigName.value = '';
+      el.agentsMdConfigPath.value = '';
+      el.agentPromptsResult.textContent = '请填写已有 AGENTS.md 文件路径并保存配置。';
+    }}
+
+    async function saveAgentsMdConfig() {{
       try {{
-        const saved = await fetchJson('/agent-prompts', jsonPost({{
-          action: 'save_agents_default',
-          instructions: el.agentDefaultInstructions.value,
+        const saved = await fetchJson('/agent-prompts/agents-md', jsonPost({{
+          id: el.agentsMdConfigId.value.trim(),
+          name: el.agentsMdConfigName.value.trim(),
+          path: el.agentsMdConfigPath.value.trim(),
         }}));
         await loadAgentPrompts();
+        el.agentsMdConfig.value = saved.id;
+        fillAgentsMdConfigEditor();
         el.agentPromptsResult.textContent = JSON.stringify(saved, null, 2);
+      }} catch (error) {{
+        el.agentPromptsResult.textContent = error.message;
+      }}
+    }}
+
+    async function deleteAgentsMdConfig() {{
+      try {{
+        const configId = el.agentsMdConfig.value || el.agentsMdConfigId.value.trim();
+        if (!configId) throw new Error('请先选择 AGENTS.md 配置。');
+        const result = await fetchJson(`/agent-prompts/agents-md/${{encodeURIComponent(configId)}}`, {{ method: 'DELETE' }});
+        state.agentPrompts.agents_md = result;
+        renderAgentsMdConfigs();
+        el.agentPromptsResult.textContent = `已删除 AGENTS.md 配置 ${{configId}}。`;
+      }} catch (error) {{
+        el.agentPromptsResult.textContent = error.message;
+      }}
+    }}
+
+    async function saveDefaultAgentsMdConfig() {{
+      try {{
+        const result = await fetchJson('/agent-prompts/agents-md/default', jsonPost({{
+          id: el.defaultAgentsMdConfig.value || null,
+        }}));
+        state.agentPrompts.agents_md = result;
+        renderAgentsMdConfigs();
+        el.agentPromptsResult.textContent = JSON.stringify(result, null, 2);
       }} catch (error) {{
         el.agentPromptsResult.textContent = error.message;
       }}
@@ -5200,6 +5327,7 @@ def app_html() -> str:
       const counts = run.verdict_counts || {{}};
       const providers = run.llm_providers || {{}};
       const agents = run.agent_configs || {{}};
+      const runConfig = run.config || {{}};
       const origin = runOriginLabel(run);
       const engine = run.engine || (run.config && run.config.engine) || 'builtin';
       const cliEngine = ['codex', 'opencode'].includes(engine);
@@ -5220,7 +5348,8 @@ def app_html() -> str:
           }}</div>
           <div><strong>正方 Agent：</strong> ${{esc(agentLabel(agents.affirmative))}}</div>
           <div><strong>反方 Agent：</strong> ${{esc(agentLabel(agents.negative))}}</div>
-          <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>`;
+          <div><strong>主持人 Agent：</strong> ${{esc(agentLabel(agents.moderator))}}</div>
+          <div><strong>AGENTS.md 配置：</strong> ${{esc(runConfig.agents_config_id || '未记录')}}${{runConfig.agents_config_path ? ` · ${{runConfig.agents_config_path}}` : ''}}</div>`;
       return `<details class="detail metadata-section" open>
         <summary class="detail-summary">运行元数据
           <span class="chips">
