@@ -48,6 +48,7 @@ from .run_state import (
 )
 from .sarif import parse_sarif, sarif_grouping_is_ambiguous, validate_sarif_report
 from .source import SourceIndexer
+from .vulnerability_types import infer_vulnerability_type
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -2089,10 +2090,14 @@ def _validate_report_findings_output(data: Dict[str, Any], report_path: Path) ->
 
 
 def _finding_from_local_payload(item: Dict[str, Any]) -> Finding:
+    rule_id = str(item.get("rule_id") or "unknown-rule")
+    message = str(item.get("message") or "")
+    properties = dict(item.get("properties") or {}) if isinstance(item.get("properties"), dict) else {}
+    raw = dict(item.get("raw") or {}) if isinstance(item.get("raw"), dict) else {}
     return Finding(
         finding_id=str(item.get("finding_id") or "finding"),
-        rule_id=str(item.get("rule_id") or "unknown-rule"),
-        message=str(item.get("message") or ""),
+        rule_id=rule_id,
+        message=message,
         level=str(item.get("level") or "unknown"),
         locations=[_location_from_dict(location) for location in item.get("locations") or [] if isinstance(location, dict)],
         code_flows=[
@@ -2100,8 +2105,14 @@ def _finding_from_local_payload(item: Dict[str, Any]) -> Finding:
             for flow in item.get("code_flows") or []
             if isinstance(flow, list)
         ],
-        properties=dict(item.get("properties") or {}) if isinstance(item.get("properties"), dict) else {},
-        raw=dict(item.get("raw") or {}) if isinstance(item.get("raw"), dict) else {},
+        properties=properties,
+        raw=raw,
+        vulnerability_type=str(item.get("vulnerability_type") or "") or infer_vulnerability_type(
+            rule_id=rule_id,
+            message=message,
+            properties=properties,
+            raw=raw,
+        ),
     )
 
 
@@ -2114,11 +2125,14 @@ def _findings_from_moderator(data: Dict[str, Any], report_path: Path) -> List[Fi
         if not isinstance(item, dict):
             continue
         finding_id = str(item.get("finding_id") or f"finding-{index}").strip() or f"finding-{index}"
+        rule_id = str(item.get("rule_id") or f"codex-finding-{index}")
+        message = str(item.get("message") or item.get("title") or f"Codex finding {index}")
+        report_markdown = str(item.get("report_markdown") or "")
         findings.append(
             Finding(
                 finding_id=_safe_finding_id(finding_id),
-                rule_id=str(item.get("rule_id") or f"codex-finding-{index}"),
-                message=str(item.get("message") or item.get("title") or f"Codex finding {index}"),
+                rule_id=rule_id,
+                message=message,
                 level=str(item.get("level") or "unknown"),
                 locations=[_location_from_dict(loc) for loc in item.get("locations") or [] if isinstance(loc, dict)],
                 code_flows=[
@@ -2127,7 +2141,13 @@ def _findings_from_moderator(data: Dict[str, Any], report_path: Path) -> List[Fi
                     if isinstance(flow, list)
                 ],
                 properties={"source_report": str(report_path), "codex_moderated": True},
-                raw={"format": "codex_moderated_finding", "report_markdown": str(item.get("report_markdown") or ""), "moderator": item},
+                raw={"format": "codex_moderated_finding", "report_markdown": report_markdown, "moderator": item},
+                vulnerability_type=infer_vulnerability_type(
+                    rule_id=rule_id,
+                    message=message,
+                    raw=item,
+                    extra_text=report_markdown,
+                ),
             )
         )
     if not findings:
@@ -2544,6 +2564,7 @@ def _final_report(
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
+        "vulnerability_type": finding.vulnerability_type,
         "finding_status": FINDING_COMPLETED,
         "verdict": verdict,
         "confidence": round(confidence, 2),
@@ -2588,6 +2609,7 @@ def _partial_report(
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
+        "vulnerability_type": finding.vulnerability_type,
         "finding_status": FINDING_IN_PROGRESS,
         "verdict": position,
         "confidence": _float((negative or affirmative or {}).get("confidence"), 0.3),
@@ -2618,6 +2640,7 @@ def _pending_report(finding: Finding) -> Dict[str, Any]:
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
+        "vulnerability_type": finding.vulnerability_type,
         "finding_status": FINDING_PENDING,
         "verdict": None,
         "confidence": None,
@@ -2804,6 +2827,7 @@ def _finding_to_prompt_payload(finding: Finding, source_indexer: SourceIndexer) 
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
+        "vulnerability_type": finding.vulnerability_type,
         "message": finding.message,
         "level": finding.level,
         "locations": [to_jsonable(item) for item in finding.locations],
@@ -2817,7 +2841,7 @@ def _finding_to_prompt_payload(finding: Finding, source_indexer: SourceIndexer) 
 def _verification_case(finding: Finding) -> Dict[str, Any]:
     primary = finding.primary_location.display() if finding.primary_location else ""
     return {
-        "vulnerability_type": finding.rule_id,
+        "vulnerability_type": finding.vulnerability_type or finding.rule_id,
         "reported_message": finding.message,
         "reported_location": primary,
         "reported_source": "",

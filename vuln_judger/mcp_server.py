@@ -1072,6 +1072,7 @@ def _finding_brief(finding: Any) -> Dict[str, Any]:
     return {
         "finding_id": finding.finding_id,
         "rule_id": finding.rule_id,
+        "vulnerability_type": getattr(finding, "vulnerability_type", ""),
         "level": finding.level,
         "message": finding.message,
         "locations": [location.display() for location in finding.locations],
@@ -1082,6 +1083,7 @@ def _verdict_detail(report: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "finding_id": report.get("finding_id"),
         "rule_id": report.get("rule_id"),
+        "vulnerability_type": report.get("vulnerability_type"),
         "verdict": report.get("verdict"),
         "confidence": report.get("confidence"),
         "reasoning_summary": report.get("reasoning_summary"),

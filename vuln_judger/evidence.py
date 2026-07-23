@@ -150,6 +150,7 @@ class EvidenceCollector:
                 "sarif_result_indices": properties.get("sarif_result_indices"),
                 "markdown_report": markdown_report,
                 "rule_id": finding.rule_id,
+                "vulnerability_type": finding.vulnerability_type,
                 "level": finding.level,
                 "message": finding.message,
                 "locations": [location.display() for location in finding.locations],

@@ -16,6 +16,7 @@ from .agents import DEFAULT_MODERATOR_AGENT
 from .llm import LLMClient
 from .models import AgentConfig
 from .models import Finding, SourceLocation
+from .vulnerability_types import OTHER_VULNERABILITY_TYPE, infer_vulnerability_type
 from .source import SourceIndexer
 
 
@@ -362,6 +363,11 @@ def _write_moderated_markdown_findings(
                     "title": title,
                     "markdown": body,
                 },
+                vulnerability_type=infer_vulnerability_type(
+                    rule_id=f"markdown-finding-{index}",
+                    message=title,
+                    extra_text=body,
+                ),
             )
         )
     if not findings:
@@ -686,6 +692,12 @@ def _write_moderated_sarif_findings(
                     "markdown": body,
                     "source_sarif_results": [finding.raw for finding in selected],
                 },
+                vulnerability_type=_moderated_vulnerability_type(
+                    rule_id=rule_id,
+                    title=report.title,
+                    body=body,
+                    selected=selected,
+                ),
             )
         )
     if not findings:
@@ -856,9 +868,29 @@ def parse_sarif(data: Dict[str, Any]) -> List[Finding]:
                     code_flows=code_flows,
                     properties=properties,
                     raw=result,
+                    vulnerability_type=infer_vulnerability_type(
+                        rule_id=rule_id,
+                        message=message,
+                        properties=properties,
+                        raw=result,
+                    ),
                 )
             )
     return findings
+
+
+def _moderated_vulnerability_type(
+    *,
+    rule_id: str,
+    title: str,
+    body: str,
+    selected: Sequence[Finding],
+) -> str:
+    inferred = infer_vulnerability_type(rule_id=rule_id, message=title, extra_text=body)
+    if inferred != OTHER_VULNERABILITY_TYPE:
+        return inferred
+    types = {finding.vulnerability_type for finding in selected if finding.vulnerability_type}
+    return types.pop() if len(types) == 1 else inferred
 
 
 def sarif_grouping_is_ambiguous(

@@ -69,6 +69,7 @@ class Finding:
     code_flows: List[List[SourceLocation]] = field(default_factory=list)
     properties: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
+    vulnerability_type: str = ""
 
     @property
     def primary_location(self) -> Optional[SourceLocation]:
@@ -193,6 +194,7 @@ class VerdictReport:
     verification_case: Dict[str, Any] = field(default_factory=dict)
     evidence_ledger: List[Dict[str, Any]] = field(default_factory=list)
     scorecard: Dict[str, Any] = field(default_factory=dict)
+    vulnerability_type: str = ""
 
 
 @dataclass

@@ -96,6 +96,7 @@ from vuln_judger.pipeline import run_judgement
 from vuln_judger.providers import ProviderStore
 from vuln_judger.records import RunControlStore, RunRecordStore
 from vuln_judger.sarif import ReportPreparationError, load_sarif, prepare_report_for_processing
+from vuln_judger.sarif import parse_sarif
 from vuln_judger.skills import SkillSourceStore
 from vuln_judger.source import SourceIndexer, detect_project_languages
 
@@ -229,6 +230,7 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(report.finding_count, 1)
             self.assertEqual(report.reports[0].verdict, Verdict.TRUE_POSITIVE)
+            self.assertEqual(report.reports[0].vulnerability_type, "命令注入")
             self.assertGreaterEqual(report.reports[0].confidence, 0.75)
             self.assertTrue(report.reports[0].evidence_chain)
 
@@ -2473,7 +2475,7 @@ for raw in sys.stdin.buffer:
     def test_finding_summary_adds_chinese_vulnerability_type(self):
         sql_report = {
             "finding_id": "finding-sql",
-            "rule_id": "CWE-89",
+            "rule_id": "SQL-Injection",
             "evidence_chain": [],
             "debate": [],
         }
@@ -2483,10 +2485,34 @@ for raw in sys.stdin.buffer:
             "evidence_chain": [],
             "debate": [],
         }
+        idor_report = {
+            "finding_id": "finding-idor",
+            "rule_id": "IDOR",
+            "evidence_chain": [],
+            "debate": [],
+        }
 
         self.assertEqual(_finding_summary(sql_report)["vulnerability_type"], "SQL注入")
         self.assertEqual(_finding_summary(hardcoded_report)["vulnerability_type"], "硬编码")
+        self.assertEqual(_finding_summary(idor_report)["vulnerability_type"], "越权")
         self.assertEqual(_finding_detail(sql_report, None)["vulnerability_type"], "SQL注入")
+
+    def test_vulnerability_type_is_persisted_for_new_sarif_findings(self):
+        findings = parse_sarif(
+            {
+                "runs": [
+                    {
+                        "tool": {"driver": {"rules": []}},
+                        "results": [
+                            {"ruleId": "SQL-Injection", "message": {"text": "Untrusted input reaches a SQL query."}},
+                            {"ruleId": "IDOR", "message": {"text": "Insecure Direct Object Reference."}},
+                        ],
+                    }
+                ]
+            }
+        )
+
+        self.assertEqual([finding.vulnerability_type for finding in findings], ["SQL注入", "越权"])
 
     def test_codex_terminal_page_polls_persisted_execution_log(self):
         html = _codex_terminal_page(

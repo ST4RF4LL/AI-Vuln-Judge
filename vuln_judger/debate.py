@@ -234,6 +234,11 @@ class DebateOrchestrator:
         return VerdictReport(
             finding_id=bundle.finding.finding_id,
             rule_id=bundle.finding.rule_id,
+            vulnerability_type=str(
+                getattr(bundle.finding, "vulnerability_type", "")
+                or getattr(bundle.finding, "rule_id", "")
+                or ""
+            ),
             verdict=decision.verdict,
             confidence=round(decision.confidence, 2),
             reasoning_summary=decision.reasoning_summary,
@@ -1784,7 +1789,7 @@ def _build_verification_case(bundle: EvidenceBundle) -> VerificationCase:
     expected_path = _finding_code_flow_path(getattr(finding, "code_flows", []) or []) or _evidence_flow_path(bundle.evidence)
     dangerous_function = sink_terms[0] if sink_terms else symbols[0] if symbols else ""
     return VerificationCase(
-        vulnerability_type=str(getattr(finding, "rule_id", "") or ""),
+        vulnerability_type=str(getattr(finding, "vulnerability_type", "") or getattr(finding, "rule_id", "") or ""),
         reported_message=str(getattr(finding, "message", "") or ""),
         reported_location=reported_location,
         reported_source=", ".join(source_terms[:5]),

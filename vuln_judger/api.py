@@ -51,6 +51,7 @@ from .run_state import (
     mark_incomplete_findings_pending,
 )
 from .skills import DEFAULT_SKILLS_FILE, SkillSourceStore
+from .vulnerability_types import OTHER_VULNERABILITY_TYPE, infer_vulnerability_type
 
 
 DEFAULT_RECORDS_DIR = Path(".vuln-judger") / "runs"
@@ -2301,48 +2302,32 @@ def _finding_summary(report, manual_review: Optional[dict] = None):
     }
 
 
-VULNERABILITY_TYPE_LABELS = (
-    ("SQL注入", ("sql injection", "sql注入", "sql 注入", "sqli", "cwe-089", "cwe-89", "cwe-564", "cwe-943")),
-    ("命令注入", ("command injection", "cmd injection", "shell injection", "os command injection", "命令注入", "cwe-078", "cwe-78", "cwe-077", "cwe-77")),
-    ("硬编码", ("hardcode", "hard-code", "hard coded", "hard-coded", "硬编码", "embedded credential", "credential in source", "password in source", "cwe-798", "cwe-259", "cwe-321", "cwe-547")),
-    ("跨站脚本（XSS）", ("cross-site scripting", "cross site scripting", "xss", "跨站脚本", "cwe-079", "cwe-79", "cwe-080", "cwe-80")),
-    ("路径遍历", ("path traversal", "directory traversal", "路径遍历", "路径穿越", "cwe-022", "cwe-22", "cwe-023", "cwe-23", "cwe-036", "cwe-36")),
-    ("服务端请求伪造（SSRF）", ("server-side request forgery", "server side request forgery", "ssrf", "服务端请求伪造", "cwe-918")),
-    ("XML外部实体注入（XXE）", ("xml external entity", "xxe", "外部实体", "cwe-611")),
-    ("不安全反序列化", ("insecure deserialization", "unsafe deserialization", "deserialization", "deserialize", "反序列化", "cwe-502")),
-    ("任意文件上传", ("unrestricted upload", "file upload", "文件上传", "cwe-434")),
-    ("认证/鉴权绕过", ("authentication bypass", "authorization bypass", "auth bypass", "access control", "鉴权绕过", "认证绕过", "权限绕过", "cwe-287", "cwe-306", "cwe-862", "cwe-863")),
-    ("敏感信息泄露", ("sensitive information", "information exposure", "secret exposure", "sensitive data", "敏感信息", "信息泄露", "cwe-200", "cwe-312", "cwe-319", "cwe-522")),
-    ("加密算法/配置不安全", ("weak crypt", "insecure crypt", "broken crypt", "加密", "密码学", "cwe-326", "cwe-327", "cwe-328", "cwe-330")),
-    ("缓冲区溢出", ("buffer overflow", "out-of-bounds", "out of bounds", "缓冲区溢出", "越界", "cwe-120", "cwe-121", "cwe-122", "cwe-787")),
-    ("代码注入", ("code injection", "expression injection", "代码注入", "cwe-094", "cwe-94")),
-    ("开放重定向", ("open redirect", "unvalidated redirect", "开放重定向", "cwe-601")),
-    ("拒绝服务", ("denial of service", "resource exhaustion", "拒绝服务", "cwe-400", "cwe-770", "cwe-789")),
-)
-
-
 def _vulnerability_type_label(report: dict) -> str:
-    """Return a short Chinese category inferred from the finding's report metadata."""
-    parts = [str(report.get("rule_id") or "")]
+    """Return a current Chinese category for both new and persisted reports."""
+    persisted = str(report.get("vulnerability_type") or "").strip()
+    properties = None
+    raw = None
+    message = str(report.get("reasoning_summary") or "")
+    extra_text = str(report.get("final_conclusion") or "")
     verification_case = report.get("verification_case")
     if isinstance(verification_case, dict):
-        parts.append(str(verification_case.get("vulnerability_type") or ""))
-        parts.append(str(verification_case.get("reported_message") or ""))
+        message = str(verification_case.get("reported_message") or message)
+        extra_text = "\n".join((extra_text, str(verification_case.get("vulnerability_type") or "")))
     report_evidence = _report_evidence(report)
     if report_evidence:
         data = report_evidence.get("data") if isinstance(report_evidence.get("data"), dict) else {}
-        parts.extend((str(data.get("rule_id") or ""), str(data.get("message") or "")))
+        message = str(data.get("message") or message)
         properties = data.get("properties")
-        if isinstance(properties, dict):
-            parts.append(json.dumps(properties, ensure_ascii=False, default=str))
-    else:
-        parts.append(str(report.get("reasoning_summary") or ""))
-
-    text = "\n".join(parts).lower()
-    for label, markers in VULNERABILITY_TYPE_LABELS:
-        if any(marker in text for marker in markers):
-            return label
-    return "其他安全问题"
+        raw = data.get("raw_result")
+        extra_text = "\n".join((extra_text, str(data.get("markdown_report") or "")))
+    inferred = infer_vulnerability_type(
+        rule_id=report.get("rule_id"),
+        message=message,
+        properties=properties,
+        raw=raw,
+        extra_text=extra_text,
+    )
+    return inferred if inferred != OTHER_VULNERABILITY_TYPE else (persisted or inferred)
 
 
 def _codex_delivery_summary(report: dict) -> dict:

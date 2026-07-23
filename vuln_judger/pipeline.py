@@ -304,6 +304,7 @@ def _coerce_verdict_report(value) -> VerdictReport:
         verification_case=value.get("verification_case") if isinstance(value.get("verification_case"), dict) else {},
         evidence_ledger=value.get("evidence_ledger") if isinstance(value.get("evidence_ledger"), list) else [],
         scorecard=value.get("scorecard") if isinstance(value.get("scorecard"), dict) else {},
+        vulnerability_type=str(value.get("vulnerability_type") or ""),
     )
 
 
