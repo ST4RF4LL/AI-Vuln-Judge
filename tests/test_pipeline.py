@@ -27,6 +27,7 @@ from vuln_judger.api import (
     _codex_terminal_page,
     _config_from_paused_payload,
     _config_from_payload,
+    _finding_detail,
     _finding_summary,
     _pause_payload,
     _request_pause,
@@ -2468,6 +2469,24 @@ for raw in sys.stdin.buffer:
         )
         self.assertEqual(summary["finding_status"], "in_progress")
         self.assertNotIn("codex_workflow", summary)
+
+    def test_finding_summary_adds_chinese_vulnerability_type(self):
+        sql_report = {
+            "finding_id": "finding-sql",
+            "rule_id": "CWE-89",
+            "evidence_chain": [],
+            "debate": [],
+        }
+        hardcoded_report = {
+            "finding_id": "finding-secret",
+            "rule_id": "hardcoded-credential",
+            "evidence_chain": [],
+            "debate": [],
+        }
+
+        self.assertEqual(_finding_summary(sql_report)["vulnerability_type"], "SQL注入")
+        self.assertEqual(_finding_summary(hardcoded_report)["vulnerability_type"], "硬编码")
+        self.assertEqual(_finding_detail(sql_report, None)["vulnerability_type"], "SQL注入")
 
     def test_codex_terminal_page_polls_persisted_execution_log(self):
         html = _codex_terminal_page(

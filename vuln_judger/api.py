@@ -2276,6 +2276,7 @@ def _validated_manual_review_payload(payload) -> tuple[str, str]:
 def _finding_detail(report: dict, run: Optional[dict], *, revision: Optional[str] = None) -> dict:
     detail = dict(report)
     detail["revision"] = revision
+    detail["vulnerability_type"] = _vulnerability_type_label(report)
     detail["manual_review"] = _manual_review_for(run, report.get("finding_id"))
     return detail
 
@@ -2285,6 +2286,7 @@ def _finding_summary(report, manual_review: Optional[dict] = None):
     return {
         "finding_id": report.get("finding_id"),
         "rule_id": report.get("rule_id"),
+        "vulnerability_type": _vulnerability_type_label(report),
         "finding_status": finding_report_status(report),
         "verdict": report.get("verdict"),
         "confidence": report.get("confidence"),
@@ -2297,6 +2299,50 @@ def _finding_summary(report, manual_review: Optional[dict] = None):
         "codex_delivery": delivery,
         "manual_review": dict(manual_review) if isinstance(manual_review, dict) else None,
     }
+
+
+VULNERABILITY_TYPE_LABELS = (
+    ("SQL注入", ("sql injection", "sql注入", "sql 注入", "sqli", "cwe-089", "cwe-89", "cwe-564", "cwe-943")),
+    ("命令注入", ("command injection", "cmd injection", "shell injection", "os command injection", "命令注入", "cwe-078", "cwe-78", "cwe-077", "cwe-77")),
+    ("硬编码", ("hardcode", "hard-code", "hard coded", "hard-coded", "硬编码", "embedded credential", "credential in source", "password in source", "cwe-798", "cwe-259", "cwe-321", "cwe-547")),
+    ("跨站脚本（XSS）", ("cross-site scripting", "cross site scripting", "xss", "跨站脚本", "cwe-079", "cwe-79", "cwe-080", "cwe-80")),
+    ("路径遍历", ("path traversal", "directory traversal", "路径遍历", "路径穿越", "cwe-022", "cwe-22", "cwe-023", "cwe-23", "cwe-036", "cwe-36")),
+    ("服务端请求伪造（SSRF）", ("server-side request forgery", "server side request forgery", "ssrf", "服务端请求伪造", "cwe-918")),
+    ("XML外部实体注入（XXE）", ("xml external entity", "xxe", "外部实体", "cwe-611")),
+    ("不安全反序列化", ("insecure deserialization", "unsafe deserialization", "deserialization", "deserialize", "反序列化", "cwe-502")),
+    ("任意文件上传", ("unrestricted upload", "file upload", "文件上传", "cwe-434")),
+    ("认证/鉴权绕过", ("authentication bypass", "authorization bypass", "auth bypass", "access control", "鉴权绕过", "认证绕过", "权限绕过", "cwe-287", "cwe-306", "cwe-862", "cwe-863")),
+    ("敏感信息泄露", ("sensitive information", "information exposure", "secret exposure", "sensitive data", "敏感信息", "信息泄露", "cwe-200", "cwe-312", "cwe-319", "cwe-522")),
+    ("加密算法/配置不安全", ("weak crypt", "insecure crypt", "broken crypt", "加密", "密码学", "cwe-326", "cwe-327", "cwe-328", "cwe-330")),
+    ("缓冲区溢出", ("buffer overflow", "out-of-bounds", "out of bounds", "缓冲区溢出", "越界", "cwe-120", "cwe-121", "cwe-122", "cwe-787")),
+    ("代码注入", ("code injection", "expression injection", "代码注入", "cwe-094", "cwe-94")),
+    ("开放重定向", ("open redirect", "unvalidated redirect", "开放重定向", "cwe-601")),
+    ("拒绝服务", ("denial of service", "resource exhaustion", "拒绝服务", "cwe-400", "cwe-770", "cwe-789")),
+)
+
+
+def _vulnerability_type_label(report: dict) -> str:
+    """Return a short Chinese category inferred from the finding's report metadata."""
+    parts = [str(report.get("rule_id") or "")]
+    verification_case = report.get("verification_case")
+    if isinstance(verification_case, dict):
+        parts.append(str(verification_case.get("vulnerability_type") or ""))
+        parts.append(str(verification_case.get("reported_message") or ""))
+    report_evidence = _report_evidence(report)
+    if report_evidence:
+        data = report_evidence.get("data") if isinstance(report_evidence.get("data"), dict) else {}
+        parts.extend((str(data.get("rule_id") or ""), str(data.get("message") or "")))
+        properties = data.get("properties")
+        if isinstance(properties, dict):
+            parts.append(json.dumps(properties, ensure_ascii=False, default=str))
+    else:
+        parts.append(str(report.get("reasoning_summary") or ""))
+
+    text = "\n".join(parts).lower()
+    for label, markers in VULNERABILITY_TYPE_LABELS:
+        if any(marker in text for marker in markers):
+            return label
+    return "其他安全问题"
 
 
 def _codex_delivery_summary(report: dict) -> dict:
@@ -2915,7 +2961,8 @@ def app_html() -> str:
       overflow-x: auto;
       overflow-y: visible;
     }}
-    .findings-table-wrap table {{ min-width: 620px; }}
+    .findings-table-wrap table {{ min-width: 760px; }}
+    .vulnerability-type {{ white-space: nowrap; }}
     .findings-table-wrap tbody tr {{
       content-visibility: auto;
       contain-intrinsic-size: auto 56px;
@@ -4151,6 +4198,9 @@ def app_html() -> str:
         return `<span class="chip ${{verdictClass(finding.verdict)}}">${{esc(verdictLabel(finding.verdict))}}</span>`;
       }}
       return `<span class="${{statusChipClass(status)}}">${{esc(findingStatusLabel(status))}}</span>`;
+    }}
+    function vulnerabilityTypeLabel(finding) {{
+      return (finding && finding.vulnerability_type) || '其他安全问题';
     }}
     function roleLabel(role) {{
       const labels = {{
@@ -5506,19 +5556,20 @@ def app_html() -> str:
           </div>
           ${{findings.length ? `<div class="findings-table-wrap">
             <table>
-              <thead><tr><th>状态 / 结论</th><th>规则</th><th>置信度</th><th>摘要</th><th>人工复核</th></tr></thead>
+              <thead><tr><th>状态 / 结论</th><th>漏洞类型</th><th>规则</th><th>置信度</th><th>摘要</th><th>人工复核</th></tr></thead>
               <tbody>
                 ${{findings.map(item => {{
                   const key = manualReviewKey(state.selectedRun, item.finding_id);
                   const expanded = state.expandedManualReviewKey === key;
                   return `<tr class="clickable ${{state.selectedFinding === item.finding_id ? 'active' : ''}}" data-finding-id="${{esc(item.finding_id)}}">
                     <td>${{findingStatusChip(item)}}</td>
+                    <td><span class="chip vulnerability-type">${{esc(vulnerabilityTypeLabel(item))}}</span></td>
                     <td>${{esc(item.rule_id)}}<div class="path">${{esc(item.finding_id)}}</div></td>
                     <td>${{item.finding_status === 'completed' ? esc(item.confidence) : '—'}}</td>
                     <td><span class="plain-inline">${{plainInlineText(item.summary)}}</span><div class="path">${{esc((item.source_locations || []).map(loc => loc.file + (loc.line ? ':' + loc.line : '')).join(', '))}}</div></td>
                     <td class="manual-review-cell"><button type="button" class="manual-review-toggle" data-manual-review-toggle="true" data-finding-id="${{esc(item.finding_id)}}" aria-expanded="${{expanded ? 'true' : 'false'}}">${{manualReviewButton(item.manual_review)}}</button></td>
                   </tr>
-                  <tr class="manual-review-row" data-manual-review-row="${{esc(item.finding_id)}}" ${{expanded ? '' : 'hidden'}}><td colspan="5">${{renderManualReviewCard(item)}}</td></tr>`;
+                  <tr class="manual-review-row" data-manual-review-row="${{esc(item.finding_id)}}" ${{expanded ? '' : 'hidden'}}><td colspan="6">${{renderManualReviewCard(item)}}</td></tr>`;
                 }}).join('')}}
               </tbody>
             </table>
@@ -6598,6 +6649,7 @@ def app_html() -> str:
             <div class="detail-body">
               <div class="chips">
                 ${{findingStatusChip(detail)}}
+                <span class="chip vulnerability-type">${{esc(vulnerabilityTypeLabel(detail))}}</span>
                 <span class="chip">${{esc(detail.rule_id)}}</span>
               </div>
               <div class="muted">该漏洞报告尚未完成三方复核；任务恢复后会从首个未完成项重新处理。</div>
@@ -6612,6 +6664,7 @@ def app_html() -> str:
           <div class="detail-body">
             <div class="chips">
               <span class="chip ${{verdictClass(detail.verdict)}}">${{esc(verdictLabel(detail.verdict))}}</span>
+              <span class="chip vulnerability-type">${{esc(vulnerabilityTypeLabel(detail))}}</span>
               <span class="chip">置信度 ${{esc(detail.confidence)}}</span>
               <span class="chip">${{esc(detail.rule_id)}}</span>
             </div>
