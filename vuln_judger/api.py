@@ -5515,6 +5515,7 @@ def app_html() -> str:
           </div>
           <div><strong>任务来源：</strong> ${{esc(origin)}}</div>
           <div><strong>执行引擎：</strong> ${{esc(engineLabel(engine))}}</div>
+          <div><strong>LLM 名称：</strong> ${{esc(llmNameLabel(run))}}</div>
           ${{renderCodexSessionButtons(run)}}
           <div><strong>创建时间：</strong> ${{esc(fmtDate(run.created_at))}}</div>
           <div><strong>报告：</strong> <span class="path">${{esc(run.sarif_path)}}</span></div>
@@ -6023,6 +6024,38 @@ def app_html() -> str:
       }}
     }}
 
+    function llmNameLabel(run) {{
+      const engine = run.engine || (run.config && run.config.engine) || 'builtin';
+      const runConfig = run.config || {{}};
+      const providers = run.llm_providers || {{}};
+      if (['codex', 'opencode'].includes(engine)) {{
+        const workflow = run.cli_workflow || run.codex_workflow || {{}};
+        const sessionGroups = [run.cli_sessions, run.codex_sessions, workflow.sessions];
+        const sessions = sessionGroups.find(items => Array.isArray(items) && items.length) || [];
+        const models = [...new Set(
+          sessions
+            .map(session => String((session && session.model) || '').trim())
+            .filter(Boolean)
+        )];
+        if (models.length) return models.join('、');
+        if (runConfig.llm_model) return String(runConfig.llm_model);
+        return `${{engineLabel(engine)}} 默认模型（名称未记录）`;
+      }}
+      if (providers.enabled === false) return '未启用';
+      const roleModels = [
+        ['正方', providers.affirmative && providers.affirmative.model],
+        ['反方', providers.negative && providers.negative.model],
+        ['主持人', providers.moderator && providers.moderator.model],
+      ].filter(([, model]) => model);
+      const models = [...new Set(roleModels.map(([, model]) => String(model)))];
+      if (models.length === 1) return models[0];
+      if (models.length > 1) {{
+        return roleModels.map(([role, model]) => `${{role}}：${{model}}`).join('；');
+      }}
+      if (runConfig.llm_model) return String(runConfig.llm_model);
+      return '未记录';
+    }}
+
     function providerLabel(value, llmEnabled) {{
       if (!value || (!value.provider_id && !value.provider_name && !value.model && !value.client_available)) {{
         return '未配置';
@@ -6204,10 +6237,21 @@ def app_html() -> str:
     function renderOriginalReportBody(detail) {{
       const item = findingReportEvidence(detail);
       const data = item && item.data ? item.data : {{}};
+      const rich = data.report_detail && typeof data.report_detail === 'object' ? data.report_detail : {{}};
       const locations = Array.isArray(data.locations) ? data.locations : [];
       const codeFlows = Array.isArray(data.code_flows) ? data.code_flows : [];
-      const properties = data.properties && typeof data.properties === 'object' ? data.properties : null;
+      const detailedLocations = Array.isArray(rich.locations) ? rich.locations : [];
+      const detailedCodeFlows = Array.isArray(rich.code_flows) ? rich.code_flows : [];
+      const relatedLocations = Array.isArray(rich.related_locations) ? rich.related_locations : [];
+      const messages = Array.isArray(rich.messages) ? rich.messages : [];
+      const fragments = Array.isArray(rich.fragments) ? rich.fragments : [];
+      const properties = rich.properties && typeof rich.properties === 'object'
+        ? rich.properties
+        : (data.properties && typeof data.properties === 'object' ? data.properties : null);
       const rawResult = data.raw_result && typeof data.raw_result === 'object' ? data.raw_result : null;
+      const sourceArtifact = rich.source_artifact && typeof rich.source_artifact === 'object'
+        ? rich.source_artifact
+        : (data.source_artifact && typeof data.source_artifact === 'object' ? data.source_artifact : null);
       const rawLines = [
         data.rule_id ? `规则：${{data.rule_id}}` : '',
         data.level ? `等级：${{data.level}}` : '',
@@ -6215,10 +6259,21 @@ def app_html() -> str:
       ].filter(Boolean).join('\\n');
       return `
         ${{rawLines ? `<div class="plain-text">${{rawText(rawLines)}}</div>` : '<div class="muted">未找到输入报告摘要。</div>'}}
+        ${{sourceArtifact ? `<div><strong>原始报告快照：</strong><pre>${{esc(jsonBlock(sourceArtifact))}}</pre></div>` : ''}}
+        ${{messages.length ? `<div><strong>完整消息：</strong><pre>${{esc(jsonBlock(messages))}}</pre></div>` : ''}}
+        ${{rich.rule && typeof rich.rule === 'object' && Object.keys(rich.rule).length ? `<div><strong>规则定义：</strong><pre>${{esc(jsonBlock(rich.rule))}}</pre></div>` : ''}}
+        ${{Array.isArray(rich.rules) && rich.rules.length > 1 ? `<div><strong>合并规则定义：</strong><pre>${{esc(jsonBlock(rich.rules))}}</pre></div>` : ''}}
+        ${{rich.severity && typeof rich.severity === 'object' ? `<div><strong>严重性元数据：</strong><pre>${{esc(jsonBlock(rich.severity))}}</pre></div>` : ''}}
         ${{locations.length ? `<div><strong>报告位置：</strong><div class="plain-text">${{rawText(locations.join('\\n'))}}</div></div>` : ''}}
         ${{codeFlows.length ? `<div><strong>报告代码流：</strong><pre>${{esc(codeFlows.map((flow, index) => `Flow ${{index + 1}}:\\n${{flow.join('\\n')}}`).join('\\n\\n'))}}</pre></div>` : ''}}
+        ${{detailedLocations.length ? `<details><summary>完整位置对象（${{detailedLocations.length}}）</summary><pre>${{esc(jsonBlock(detailedLocations))}}</pre></details>` : ''}}
+        ${{detailedCodeFlows.length ? `<details><summary>完整代码流对象（${{detailedCodeFlows.length}}）</summary><pre>${{esc(jsonBlock(detailedCodeFlows))}}</pre></details>` : ''}}
+        ${{relatedLocations.length ? `<details><summary>相关位置（${{relatedLocations.length}}）</summary><pre>${{esc(jsonBlock(relatedLocations))}}</pre></details>` : ''}}
+        ${{fragments.length ? `<div><strong>原始报告片段：</strong>${{fragments.map(fragment => `<details open><summary>${{esc(fragment.segment_id || '片段')}} · 行 ${{esc(fragment.start_line ?? '?')}}-${{esc(fragment.end_line ?? '?')}}</summary><pre>${{esc(fragment.content || '')}}</pre></details>`).join('')}}</div>` : ''}}
         ${{properties ? `<div><strong>报告 properties：</strong><pre>${{esc(jsonBlock(properties))}}</pre></div>` : ''}}
-        ${{rawResult ? `<div><strong>原始 SARIF result：</strong><pre>${{esc(jsonBlock(rawResult))}}</pre></div>` : ''}}`;
+        ${{rich.fingerprints && typeof rich.fingerprints === 'object' ? `<details><summary>指纹与关联信息</summary><pre>${{esc(jsonBlock(rich.fingerprints))}}</pre></details>` : ''}}
+        ${{rich.provenance && typeof rich.provenance === 'object' ? `<details><summary>来源映射</summary><pre>${{esc(jsonBlock(rich.provenance))}}</pre></details>` : ''}}
+        ${{rawResult ? `<details><summary>原始结果 JSON</summary><pre>${{esc(jsonBlock(rawResult))}}</pre></details>` : ''}}`;
     }}
 
     function renderOriginalReportSection(_detail) {{

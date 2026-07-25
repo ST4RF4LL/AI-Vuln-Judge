@@ -363,6 +363,24 @@ def _write_moderated_markdown_findings(
                     "title": title,
                     "markdown": body,
                 },
+                report_detail={
+                    "format": "markdown",
+                    "messages": [{"text": title, "source": "moderator"}],
+                    "severity": {"level": "warning"},
+                    "fragments": [
+                        {
+                            "segment_id": f"moderator-report-{index:04d}",
+                            "start_line": 1,
+                            "end_line": len(body.splitlines()),
+                            "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                            "content": body,
+                        }
+                    ],
+                    "provenance": {
+                        "source_refs": [{"type": "moderator_generated_report", "index": index}],
+                        "source_report": str(original_path),
+                    },
+                },
                 vulnerability_type=infer_vulnerability_type(
                     rule_id=f"markdown-finding-{index}",
                     message=title,
@@ -692,6 +710,11 @@ def _write_moderated_sarif_findings(
                     "markdown": body,
                     "source_sarif_results": [finding.raw for finding in selected],
                 },
+                report_detail=_moderated_sarif_report_detail(
+                    selected=selected,
+                    report=report,
+                    body=body,
+                ),
                 vulnerability_type=_moderated_vulnerability_type(
                     rule_id=rule_id,
                     title=report.title,
@@ -703,6 +726,81 @@ def _write_moderated_sarif_findings(
     if not findings:
         raise ReportPreparationError("Moderator LLM 未生成任何可处理的 SARIF 单漏洞报告")
     return findings, temp_paths
+
+
+def _moderated_sarif_report_detail(
+    *,
+    selected: Sequence[Finding],
+    report: ModeratedSarifReport,
+    body: str,
+) -> Dict[str, Any]:
+    details = [
+        finding.report_detail
+        for finding in selected
+        if isinstance(finding.report_detail, dict) and finding.report_detail
+    ]
+
+    def combined(key: str) -> List[Any]:
+        return [
+            copy.deepcopy(value)
+            for detail in details
+            for value in (detail.get(key) if isinstance(detail.get(key), list) else [])
+        ]
+
+    rules = [
+        copy.deepcopy(detail.get("rule"))
+        for detail in details
+        if isinstance(detail.get("rule"), dict) and detail.get("rule")
+    ]
+    refs = [
+        copy.deepcopy(ref)
+        for detail in details
+        for ref in (
+            (detail.get("provenance") or {}).get("source_refs")
+            if isinstance(detail.get("provenance"), dict)
+            and isinstance((detail.get("provenance") or {}).get("source_refs"), list)
+            else []
+        )
+    ]
+    return {
+        "format": "sarif",
+        "messages": combined("messages"),
+        "rule": rules[0] if len(rules) == 1 else {},
+        "rules": rules,
+        "severity": {
+            "level": _strongest_level(finding.level for finding in selected),
+            "source_levels": [finding.level for finding in selected],
+        },
+        "locations": combined("locations"),
+        "code_flows": combined("code_flows"),
+        "related_locations": combined("related_locations"),
+        "stacks": combined("stacks"),
+        "attachments": combined("attachments"),
+        "properties": {
+            "sources": [copy.deepcopy(detail.get("properties") or {}) for detail in details]
+        },
+        "fingerprints": {
+            "sources": [copy.deepcopy(detail.get("fingerprints") or {}) for detail in details]
+        },
+        "fragments": [
+            {
+                "segment_id": "moderator-sarif-report",
+                "start_line": 1,
+                "end_line": len(body.splitlines()),
+                "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                "content": body,
+            }
+        ],
+        "provenance": {
+            "source_refs": refs,
+            "sarif_result_indices": list(report.result_indices),
+            "moderator_preprocessed": True,
+        },
+        "original": {
+            "raw_results": [copy.deepcopy(finding.raw) for finding in selected],
+            "raw_rules": rules,
+        },
+    }
 
 
 def _dedupe_source_locations(locations: Iterable[SourceLocation]) -> List[SourceLocation]:
@@ -868,6 +966,17 @@ def parse_sarif(data: Dict[str, Any]) -> List[Finding]:
                     code_flows=code_flows,
                     properties=properties,
                     raw=result,
+                    report_detail=_sarif_report_detail(
+                        run_index=run_index,
+                        result_index=result_index,
+                        result=result,
+                        rule=rule,
+                        level=str(
+                            result.get("level")
+                            or rule.get("defaultConfiguration", {}).get("level")
+                            or "warning"
+                        ),
+                    ),
                     vulnerability_type=infer_vulnerability_type(
                         rule_id=rule_id,
                         message=message,
@@ -877,6 +986,57 @@ def parse_sarif(data: Dict[str, Any]) -> List[Finding]:
                 )
             )
     return findings
+
+
+def _sarif_report_detail(
+    *,
+    run_index: int,
+    result_index: int,
+    result: Dict[str, Any],
+    rule: Dict[str, Any],
+    level: str,
+) -> Dict[str, Any]:
+    return {
+        "format": "sarif",
+        "messages": [copy.deepcopy(result.get("message"))] if result.get("message") is not None else [],
+        "rule": copy.deepcopy(rule),
+        "severity": {
+            "level": level,
+            "rank": result.get("rank"),
+            "security_severity": (result.get("properties") or {}).get("security-severity")
+            if isinstance(result.get("properties"), dict)
+            else None,
+        },
+        "locations": copy.deepcopy(result.get("locations") or []),
+        "code_flows": copy.deepcopy(result.get("codeFlows") or []),
+        "related_locations": copy.deepcopy(result.get("relatedLocations") or []),
+        "stacks": copy.deepcopy(result.get("stacks") or []),
+        "attachments": copy.deepcopy(result.get("attachments") or []),
+        "graphs": copy.deepcopy(result.get("graphs") or []),
+        "properties": {
+            "rule": copy.deepcopy(rule.get("properties") or {}),
+            "result": copy.deepcopy(result.get("properties") or {}),
+        },
+        "fingerprints": {
+            "fingerprints": copy.deepcopy(result.get("fingerprints") or {}),
+            "partial_fingerprints": copy.deepcopy(result.get("partialFingerprints") or {}),
+            "correlation_guid": result.get("correlationGuid"),
+        },
+        "provenance": {
+            "source_refs": [
+                {
+                    "type": "sarif_result",
+                    "run_index": run_index,
+                    "result_index": result_index,
+                    "json_pointer": f"/runs/{run_index}/results/{result_index}",
+                }
+            ]
+        },
+        "original": {
+            "raw_results": [copy.deepcopy(result)],
+            "raw_rules": [copy.deepcopy(rule)] if rule else [],
+        },
+    }
 
 
 def _moderated_vulnerability_type(

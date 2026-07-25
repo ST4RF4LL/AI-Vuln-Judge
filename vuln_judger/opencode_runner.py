@@ -60,6 +60,7 @@ class OpenCodeSessionInfo:
     provider_session_id: Optional[str]
     version: str
     event_log: Optional[str]
+    model: Optional[str] = None
 
 
 class OpenCodeTmuxSession:
@@ -123,6 +124,7 @@ class OpenCodeTmuxSession:
             provider_session_id=self._provider_session_id,
             version=self.capabilities.version,
             event_log=str(self._current_event_path) if self._current_event_path else None,
+            model=self._effective_model(),
         )
 
     def start(self) -> None:
@@ -313,6 +315,29 @@ class OpenCodeTmuxSession:
         if self.server_log.exists():
             parts.append(_tail_text(self.server_log, min(lines, 80)))
         return "\n".join(part for part in parts if part)
+
+    def _effective_model(self) -> Optional[str]:
+        if self._current_event_path and self._current_event_path.exists():
+            try:
+                lines = self._current_event_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).splitlines()
+            except OSError:
+                lines = []
+            for line in reversed(lines):
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                model = event.get("model") if isinstance(event, dict) else None
+                if not isinstance(model, dict):
+                    continue
+                provider_id = str(model.get("providerID") or "").strip()
+                model_id = str(model.get("modelID") or "").strip()
+                if provider_id and model_id:
+                    return f"{provider_id}/{model_id}"
+        return self.model
 
     def activity_snapshot(self) -> tuple[str, bool]:
         self._refresh_provider_session_id()

@@ -7,7 +7,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 
 DEFAULT_SILENCE_REMINDER_MINUTES = 30
-REPORT_FINDINGS_SCHEMA = "vuln_judger.report_findings.v1"
+REPORT_FINDINGS_SCHEMA_V1 = "vuln_judger.report_findings.v1"
+REPORT_FINDINGS_SCHEMA = "vuln_judger.report_findings.v2"
 
 
 class Verdict(str, Enum):
@@ -69,6 +70,7 @@ class Finding:
     code_flows: List[List[SourceLocation]] = field(default_factory=list)
     properties: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
+    report_detail: Dict[str, Any] = field(default_factory=dict)
     vulnerability_type: str = ""
 
     @property

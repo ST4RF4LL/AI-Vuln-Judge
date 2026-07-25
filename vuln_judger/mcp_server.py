@@ -1637,15 +1637,26 @@ def _normalized_report_detail(
                 break
     data = report_evidence.get("data") if isinstance(report_evidence, dict) else {}
     data = data if isinstance(data, dict) else {}
-    detail = {
+    rich_detail = split.get("report_detail")
+    if not isinstance(rich_detail, dict) or not rich_detail:
+        rich_detail = data.get("report_detail")
+    detail = _json_copy(rich_detail) if isinstance(rich_detail, dict) else {}
+    detail.update({
         "rule_id": split.get("rule_id") or data.get("rule_id") or (report or {}).get("rule_id"),
         "level": split.get("level") or data.get("level"),
         "message": split.get("message") or data.get("message") or (report_evidence or {}).get("summary"),
         "locations": _json_copy(split.get("locations") or data.get("locations") or (report_evidence or {}).get("locations") or []),
         "code_flows": _json_copy(split.get("code_flows") or data.get("code_flows") or []),
-        "properties": _json_copy(data.get("properties")),
+        "properties": _json_copy(
+            (rich_detail or {}).get("properties")
+            if isinstance(rich_detail, dict) and (rich_detail or {}).get("properties") is not None
+            else data.get("properties")
+        ),
         "raw_result": _json_copy(data.get("raw_result")),
-    }
+        "source_artifact": _json_copy(
+            (rich_detail or {}).get("source_artifact") or data.get("source_artifact")
+        ),
+    })
     if not any(value not in (None, "", [], {}) for value in detail.values()):
         return None
     return detail

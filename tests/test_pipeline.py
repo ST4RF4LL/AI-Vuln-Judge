@@ -47,11 +47,16 @@ from vuln_judger.codex_runner import (
     CodexRunnerStopped,
     CodexTmuxSession,
     _base_payload,
+    _codex_config_model,
     _ensure_codex_project_trust,
     _finalize_markdown_findings,
+    _evidence_chain,
+    _materialize_report_findings,
     _moderator_report_prompt,
     _prepare_codex_agent_dirs,
+    _report_segments,
     _safe_tmux_name,
+    _snapshot_report_artifact,
     session_live,
     _validate_and_stamp_pipeline_output,
     _validate_report_findings_output,
@@ -2270,6 +2275,10 @@ for raw in sys.stdin.buffer:
         self.assertIn('原始报告详情', html)
         self.assertIn('renderOriginalReportSection(detail)', html)
         self.assertIn('raw_result', html)
+        self.assertIn('data.report_detail', html)
+        self.assertIn('原始报告快照', html)
+        self.assertIn('完整位置对象', html)
+        self.assertIn('原始报告片段', html)
         self.assertIn('调用链 / 数据流概览', html)
         self.assertIn('function renderPathOverviewSection(detail)', html)
         self.assertIn('function buildPathOverview(graph)', html)
@@ -2388,6 +2397,8 @@ for raw in sys.stdin.buffer:
         self.assertNotIn("affirmative_agent_profile: codexMode ? null", html)
         self.assertNotIn("el.runProviderAgentGrid.hidden = codexMode", html)
         self.assertIn('Codex 三方复核使用项目 .codex/config.toml', html)
+        self.assertIn('<strong>LLM 名称：</strong>', html)
+        self.assertIn('function llmNameLabel(run)', html)
         self.assertIn('当前活动 Agent', html)
         self.assertIn('function renderCodexActiveAgent(run, findings, status)', html)
         self.assertIn('function inferCodexActiveAgent(run, findings, status)', html)
@@ -3109,6 +3120,158 @@ for raw in sys.stdin.buffer:
         prompt = _moderator_report_prompt({"report_path": "/tmp/report.md"}, Path("/tmp/findings.json"))
         self.assertIn("单 finding 时可留空", prompt)
         self.assertIn("不要对 report_markdown 与源文件做逐字节相等校验", prompt)
+
+    def test_report_findings_v2_materializes_exact_markdown_segments_and_snapshot(self):
+        report_text = (
+            "# Finding one\n\n"
+            "完整描述 one，包含不能丢失的上下文。\n\n"
+            "## Evidence\n\n"
+            "```python\nos.system(user_input)\n```\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report.md"
+            report.write_text(report_text, encoding="utf-8")
+            run_dir = root / "run"
+            (run_dir / "input").mkdir(parents=True)
+            artifact = _snapshot_report_artifact(report, run_dir)
+            segments = _report_segments(report_text, report)
+            output = run_dir / "findings.json"
+            materialized = _materialize_report_findings(
+                output,
+                {
+                    "findings": [
+                        {
+                            "finding_id": "finding-one",
+                            "rule_id": "command-injection",
+                            "message": "命令注入完整报告",
+                            "level": "error",
+                            "segment_ids": [segment["segment_id"] for segment in segments],
+                        }
+                    ]
+                },
+                report_path=report,
+                source_findings=[],
+                report_segments=segments,
+                source_artifact=artifact,
+                moderation_reason="markdown",
+            )
+            report.write_text("# changed after run started\n", encoding="utf-8")
+            resumed_artifact = _snapshot_report_artifact(report, run_dir)
+            snapshot_text = Path(resumed_artifact["path"]).read_text(encoding="utf-8")
+
+        self.assertEqual(materialized["schema"], REPORT_FINDINGS_SCHEMA)
+        self.assertEqual(materialized["source_artifact"]["sha256"], artifact["sha256"])
+        self.assertEqual(resumed_artifact["sha256"], artifact["sha256"])
+        self.assertEqual(snapshot_text, report_text)
+        finding = materialized["findings"][0]
+        self.assertEqual(
+            "".join(fragment["content"] for fragment in finding["report_detail"]["fragments"]),
+            report_text,
+        )
+        self.assertIn("os.system(user_input)", finding["raw"]["report_markdown"])
+        self.assertEqual(
+            [ref["segment_id"] for ref in finding["report_detail"]["provenance"]["source_refs"]],
+            [segment["segment_id"] for segment in segments],
+        )
+
+    def test_sarif_report_detail_and_cli_evidence_preserve_original_objects(self):
+        sarif = {
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {
+                        "driver": {
+                            "name": "demo",
+                            "rules": [
+                                {
+                                    "id": "RULE-1",
+                                    "name": "Dangerous call",
+                                    "fullDescription": {"text": "完整规则描述"},
+                                    "help": {"markdown": "修复建议正文"},
+                                    "properties": {"tags": ["security"], "precision": "high"},
+                                }
+                            ],
+                        }
+                    },
+                    "results": [
+                        {
+                            "ruleId": "RULE-1",
+                            "level": "error",
+                            "message": {"markdown": "**完整结果消息**"},
+                            "locations": [
+                                {
+                                    "physicalLocation": {
+                                        "artifactLocation": {"uri": "src/app.py"},
+                                        "region": {
+                                            "startLine": 7,
+                                            "endLine": 9,
+                                            "snippet": {"text": "danger(user)"},
+                                        },
+                                    }
+                                }
+                            ],
+                            "relatedLocations": [{"id": 1, "message": {"text": "入口"}}],
+                            "codeFlows": [{"threadFlows": [{"locations": []}]}],
+                            "stacks": [{"message": {"text": "stack"}}],
+                            "attachments": [{"description": {"text": "request"}}],
+                            "properties": {"security-severity": "9.8", "custom": {"owner": "team-a"}},
+                            "fingerprints": {"primary": "abc"},
+                        }
+                    ],
+                }
+            ],
+        }
+        source = parse_sarif(sarif)[0]
+        self.assertEqual(source.report_detail["rule"]["fullDescription"]["text"], "完整规则描述")
+        self.assertEqual(source.report_detail["locations"][0]["physicalLocation"]["region"]["snippet"]["text"], "danger(user)")
+        self.assertEqual(source.report_detail["related_locations"][0]["message"]["text"], "入口")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report.sarif"
+            report.write_text(json.dumps(sarif), encoding="utf-8")
+            run_dir = root / "run"
+            (run_dir / "input").mkdir(parents=True)
+            artifact = _snapshot_report_artifact(report, run_dir)
+            materialized = _materialize_report_findings(
+                run_dir / "findings.json",
+                {
+                    "findings": [
+                        {
+                            "finding_id": "group-1",
+                            "rule_id": "RULE-1",
+                            "message": "分组标题",
+                            "result_indices": [0],
+                        }
+                    ]
+                },
+                report_path=report,
+                source_findings=[source],
+                report_segments=[],
+                source_artifact=artifact,
+                moderation_reason="grouping_ambiguous",
+            )
+            restored = Finding(**{
+                **{
+                    key: value
+                    for key, value in materialized["findings"][0].items()
+                    if key not in {"locations", "code_flows"}
+                },
+                "locations": [SourceLocation(**item) for item in materialized["findings"][0]["locations"]],
+                "code_flows": [],
+            })
+            evidence = _evidence_chain(restored, {}, {}, {})[0]
+
+        self.assertEqual(
+            evidence["data"]["report_detail"]["original"]["raw_results"][0]["message"]["markdown"],
+            "**完整结果消息**",
+        )
+        self.assertEqual(
+            evidence["data"]["report_detail"]["rules"][0]["help"]["markdown"],
+            "修复建议正文",
+        )
+        self.assertEqual(evidence["data"]["properties"]["custom"]["owner"], "team-a")
 
     def test_wait_json_reminds_idle_next_agent_after_previous_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3987,6 +4150,31 @@ for raw in sys.stdin.buffer:
             for workspace in workspaces:
                 self.assertEqual(config.count(f'[projects."{workspace.resolve()}"]'), 1)
             self.assertEqual(config.count('trust_level = "trusted"'), len(workspaces))
+
+    def test_codex_config_model_prefers_project_then_global_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project_config = project / ".codex" / "config.toml"
+            project_config.parent.mkdir(parents=True)
+            global_config = root / "codex-home" / "config.toml"
+            global_config.parent.mkdir(parents=True)
+            global_config.write_text('model = "global-model"\n', encoding="utf-8")
+
+            with patch.dict(os.environ, {"CODEX_HOME": str(global_config.parent)}, clear=False):
+                project_config.write_text(
+                    'model = "project-model" # selected for this project\n[mcp_servers]\n',
+                    encoding="utf-8",
+                )
+                self.assertEqual(
+                    _codex_config_model(project_path=project),
+                    "project-model",
+                )
+                project_config.write_text("[mcp_servers]\n", encoding="utf-8")
+                self.assertEqual(
+                    _codex_config_model(project_path=project),
+                    "global-model",
+                )
 
     def test_codex_project_trust_preserves_symlinked_config(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5875,6 +6063,8 @@ for raw in sys.stdin.buffer:
                 self.assertEqual(structured["coverage"]["returned"], 1)
                 self.assertEqual(structured["findings"][0]["finding_id"], finding_id)
                 self.assertIsNotNone(structured["findings"][0]["report_detail"])
+                self.assertIn("messages", structured["findings"][0]["report_detail"])
+                self.assertIn("original", structured["findings"][0]["report_detail"])
                 self.assertIsNotNone(structured["findings"][0]["finding_detail"])
 
     def test_mcp_structured_export_covers_split_pending_findings_and_detail_levels(self):
@@ -7957,6 +8147,31 @@ class OpenCodeRunnerTests(unittest.TestCase):
             self.assertEqual(create_session.call_args.kwargs["model"], "openai/gpt-5")
             self.assertEqual(session.info().provider_session_id, "ses-2")
             self.assertEqual(session.info().transport, "serve+prompt-api")
+            self.assertEqual(session.info().model, "openai/gpt-5")
+
+    def test_opencode_session_info_prefers_model_detected_from_event_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = OpenCodeTmuxSession(
+                role="affirmative",
+                run_id="run-model-event",
+                cwd=root,
+                source_path=root,
+                run_dir=root,
+                command="opencode",
+                capabilities=OpenCodeCapabilities("1.17.20"),
+                model="configured/model",
+            )
+            event_log = root / "events.ndjson"
+            event_log.write_text(
+                '{"type":"prompt_status","model":{"providerID":"actual","modelID":"resolved"}}\n',
+                encoding="utf-8",
+            )
+            session._current_event_path = event_log
+            session._provider_session_id = "ses-model-event"
+
+            with patch.object(session, "_ensure_tui"):
+                self.assertEqual(session.info().model, "actual/resolved")
 
     def test_opencode_prompt_records_tmux_launch_without_waiting_for_worker_marker(self):
         with tempfile.TemporaryDirectory() as tmp:

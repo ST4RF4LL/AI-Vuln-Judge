@@ -23,13 +23,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Sequence
 
 from .agents import DEFAULT_AFFIRMATIVE_AGENT, DEFAULT_MODERATOR_AGENT, DEFAULT_NEGATIVE_AGENT
 from .logging_config import logger
 from .models import (
     DEFAULT_SILENCE_REMINDER_MINUTES,
     REPORT_FINDINGS_SCHEMA,
+    REPORT_FINDINGS_SCHEMA_V1,
     AgentConfig,
     Finding,
     RunConfig,
@@ -37,6 +38,7 @@ from .models import (
     run_config_snapshot,
     to_jsonable,
 )
+from .report_detail import report_evidence_data, report_evidence_summary, report_markdown
 from .records import RunRecordStore
 from .run_state import (
     FINDING_COMPLETED,
@@ -126,6 +128,7 @@ class CodexSessionInfo:
     window_name: str
     target: str
     cwd: str
+    model: Optional[str] = None
     backend: str = CODEX_ENGINE
     transport: str = "tmux-tui"
     event_log: Optional[str] = None
@@ -148,6 +151,7 @@ class CodexTmuxSession:
         self.source_path = source_path.resolve()
         self.run_dir = run_dir.resolve()
         self.command = command
+        self.model = _codex_config_model()
         self.session_name = _safe_tmux_name(f"vj-{run_id}-{role}")
         self.window_name = "codex"
         self.target = f"{self.session_name}:{self.window_name}"
@@ -164,6 +168,7 @@ class CodexTmuxSession:
             window_name=self.window_name,
             target=self.target,
             cwd=str(self.cwd),
+            model=self.model,
         )
 
     def start(self) -> None:
@@ -611,7 +616,21 @@ class CliDrivenRunner:
             )
         emit("running", diagnostics=[f"{self.cli_name}-driven 任务已启动，正在准备漏洞报告。"])
 
-        report_text, local_findings, parse_error, moderation_reason = _parse_report_locally(report_path)
+        source_artifact = _snapshot_report_artifact(report_path, run_dir)
+        report_text, local_findings, parse_error, moderation_reason = _parse_report_locally(
+            Path(str(source_artifact["path"]))
+        )
+        report_segments = _report_segments(report_text, report_path)
+        report_segments_path = run_dir / "input" / "report-segments.json"
+        _write_json_object(
+            report_segments_path,
+            {
+                "schema": "vuln_judger.report_segments.v1",
+                "source_artifact": source_artifact,
+                "segment_count": len(report_segments),
+                "segments": report_segments,
+            },
+        )
         input_payload = _input_payload(
             config,
             report_path,
@@ -622,6 +641,9 @@ class CliDrivenRunner:
             parsed_findings=local_findings,
             parse_error=parse_error,
             moderation_reason=moderation_reason,
+            source_artifact=source_artifact,
+            report_segments=report_segments,
+            report_segments_path=report_segments_path,
         )
         (run_dir / "input" / "task.json").write_text(
             json.dumps(input_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -635,7 +657,13 @@ class CliDrivenRunner:
         moderator_report_prompt = _moderator_report_prompt(input_payload, findings_path)
 
         def validate_report_findings(data: Dict[str, Any]) -> None:
-            _validate_report_findings_output(data, report_path)
+            _validate_report_findings_output(
+                data,
+                report_path,
+                source_findings=local_findings,
+                report_segments=report_segments,
+                moderation_reason=moderation_reason,
+            )
 
         if resume_findings:
             findings_data = _wait_json(
@@ -651,7 +679,11 @@ class CliDrivenRunner:
         elif copied_findings:
             findings_data = _persist_findings_payload(findings_path, config.reused_findings_payload)
         elif moderation_reason is None:
-            findings_data = _persist_local_sarif_findings(findings_path, local_findings)
+            findings_data = _persist_local_sarif_findings(
+                findings_path,
+                local_findings,
+                source_artifact=source_artifact,
+            )
         else:
             findings_path.unlink(missing_ok=True)
             sessions["moderator"].send(moderator_report_prompt)
@@ -665,8 +697,19 @@ class CliDrivenRunner:
                 validator=validate_report_findings,
                 complete_on_valid=True,
             )
-        if moderation_reason == "markdown" and not copied_findings:
-            findings_data = _finalize_markdown_findings(findings_path, findings_data, report_text)
+        if (
+            not copied_findings
+            and findings_data.get("schema") not in {REPORT_FINDINGS_SCHEMA, REPORT_FINDINGS_SCHEMA_V1}
+        ):
+            findings_data = _materialize_report_findings(
+                findings_path,
+                findings_data,
+                report_path=report_path,
+                source_findings=local_findings,
+                report_segments=report_segments,
+                source_artifact=source_artifact,
+                moderation_reason=moderation_reason,
+            )
         findings = _findings_from_persisted(findings_data, report_path)
         finding_briefs = _persist_finding_briefs(findings, source_indexer, run_dir)
         reports = _reconcile_finding_reports(findings, config.resume_reports)
@@ -674,11 +717,13 @@ class CliDrivenRunner:
         start_index = first_incomplete_finding_index(reports, len(findings))
         payload["finding_count"] = len(findings)
         payload["reports"] = reports
-        payload.pop("report_findings", None)
+        payload["report_findings"] = findings_data
         payload["completed_finding_count"] = completed_count
         payload["resume_from_finding_index"] = start_index
         payload["resume_from_finding_id"] = findings[start_index].finding_id if start_index < len(findings) else None
         payload["cli_workflow"]["findings_path"] = str(findings_path)
+        payload["cli_workflow"]["source_artifact"] = source_artifact
+        payload["cli_workflow"]["report_segments_path"] = str(report_segments_path)
         preparation_origin = (
             "reused" if config.reuse_findings_from_run_id else str(findings_data.get("origin") or "moderator")
         )
@@ -1416,6 +1461,59 @@ def _env_flag(name: str, *, default: bool = False) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
+def _codex_config_model(
+    config_path: Optional[Path] = None,
+    *,
+    project_path: Optional[Path] = None,
+) -> Optional[str]:
+    candidates: List[Path] = []
+    if project_path is not None:
+        candidates.append(project_path.expanduser().resolve() / ".codex" / "config.toml")
+    elif config_path is None:
+        candidates.append(REPO_ROOT / ".codex" / "config.toml")
+    if config_path is not None:
+        candidates.append(config_path.expanduser())
+    else:
+        codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+        candidates.append(codex_home / "config.toml")
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        model = _top_level_toml_string(text, "model")
+        if model:
+            return model
+    return None
+
+
+def _top_level_toml_string(text: str, key: str) -> Optional[str]:
+    assignment = re.compile(
+        rf"^\s*{re.escape(key)}\s*=\s*(?P<quote>[\"'])(?P<value>.*?)(?P=quote)\s*(?:#.*)?$"
+    )
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            break
+        match = assignment.match(line)
+        if match is None:
+            continue
+        value = match.group("value")
+        if match.group("quote") == '"':
+            try:
+                value = json.loads(f'"{value}"')
+            except json.JSONDecodeError:
+                return None
+        return str(value).strip() or None
+    return None
+
+
 def _ensure_codex_project_trust(path: Path, config_path: Optional[Path] = None) -> None:
     trusted_path = str(path.expanduser().resolve())
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
@@ -1881,6 +1979,80 @@ def _parse_report_locally(report_path: Path) -> tuple[str, List[Finding], str, O
     return report_text, findings, "", None
 
 
+def _snapshot_report_artifact(report_path: Path, run_dir: Path) -> Dict[str, Any]:
+    suffix = report_path.suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9_-]{1,16}", suffix):
+        suffix = ".txt"
+    snapshot_path = run_dir / "input" / f"original-report{suffix}"
+    if not snapshot_path.exists():
+        shutil.copy2(report_path, snapshot_path)
+    content = snapshot_path.read_bytes()
+    media_type = {
+        ".json": "application/json",
+        ".sarif": "application/sarif+json",
+        ".md": "text/markdown",
+        ".markdown": "text/markdown",
+    }.get(suffix, "text/plain")
+    return {
+        "path": str(snapshot_path),
+        "source_path": str(report_path),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "size_bytes": len(content),
+        "media_type": media_type,
+    }
+
+
+def _report_segments(report_text: str, report_path: Path) -> List[Dict[str, Any]]:
+    lines = report_text.splitlines(keepends=True)
+    if not lines:
+        return []
+    markdown = report_path.suffix.lower() in {".md", ".markdown"}
+    boundaries = [0]
+    if markdown:
+        for index, line in enumerate(lines):
+            if index and re.match(r"^\s{0,3}#{1,6}\s+\S", line):
+                boundaries.append(index)
+    if len(boundaries) == 1:
+        chunk_chars = 0
+        last_boundary = 0
+        for index, line in enumerate(lines):
+            chunk_chars += len(line)
+            if (
+                index + 1 < len(lines)
+                and not line.strip()
+                and chunk_chars >= 6000
+                and index + 1 > last_boundary
+            ):
+                boundaries.append(index + 1)
+                last_boundary = index + 1
+                chunk_chars = 0
+    boundaries.append(len(lines))
+
+    segments: List[Dict[str, Any]] = []
+    for segment_index, (start, end) in enumerate(zip(boundaries, boundaries[1:]), start=1):
+        content = "".join(lines[start:end])
+        if not content:
+            continue
+        heading = ""
+        for line in lines[start:end]:
+            match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+            if match:
+                heading = match.group(1).strip()
+                break
+        segment_id = f"segment-{segment_index:04d}"
+        segments.append(
+            {
+                "segment_id": segment_id,
+                "start_line": start + 1,
+                "end_line": end,
+                "heading": heading,
+                "sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "content": content,
+            }
+        )
+    return segments
+
+
 def _input_payload(
     config: RunConfig,
     report_path: Path,
@@ -1892,7 +2064,18 @@ def _input_payload(
     parsed_findings: Sequence[Finding],
     parse_error: str,
     moderation_reason: Optional[str],
+    source_artifact: Dict[str, Any],
+    report_segments: Sequence[Dict[str, Any]],
+    report_segments_path: Path,
 ) -> Dict[str, Any]:
+    parsed_payloads = []
+    for result_index, item in enumerate(parsed_findings):
+        parsed_payloads.append(
+            {
+                "result_index": result_index,
+                **_finding_to_prompt_payload(item, source_indexer),
+            }
+        )
     return {
         "run_id": config.run_id,
         "report_path": str(report_path),
@@ -1900,9 +2083,22 @@ def _input_payload(
         "skills_path": str(config.skills_path) if config.skills_path else None,
         "run_dir": str(run_dir),
         "max_rounds": config.max_rounds,
-        "parsed_findings": [_finding_to_prompt_payload(item, source_indexer) for item in parsed_findings],
+        "parsed_findings": parsed_payloads,
         "parse_error": parse_error,
         "moderation_reason": moderation_reason,
+        "source_artifact": source_artifact,
+        "report_segments_path": str(report_segments_path),
+        "report_segments": [
+            {
+                "segment_id": segment.get("segment_id"),
+                "start_line": segment.get("start_line"),
+                "end_line": segment.get("end_line"),
+                "heading": segment.get("heading"),
+                "sha256": segment.get("sha256"),
+                "preview": str(segment.get("content") or "")[:500],
+            }
+            for segment in report_segments
+        ],
         "report_excerpt": report_text[:60000],
         "report_truncated": len(report_text) > 60000,
     }
@@ -1911,7 +2107,10 @@ def _input_payload(
 def _moderator_report_prompt(input_payload: Dict[str, Any], findings_path: Path) -> str:
     return (
         "当前阶段：报告拆分。请遵循本 session 初始 AGENTS.md 中的 Moderator 角色约束；本阶段只处理输入漏洞报告，不做最终真假裁决。\n"
-        "请完整理解报告，将其拆分为独立 finding。SARIF 已解析结果如果存在，可以作为候选；Markdown/raw 报告需要你自行拆分。\n"
+        "请完整理解报告，将其拆分为独立 finding。你只负责分组和命名，调度器会从原始报告确定性回填全部事实，"
+        "不要手工压缩或重写原始证据。\n"
+        "SARIF 存在 parsed_findings 时，每个 finding 必须用 result_indices 引用原始 result；"
+        "Markdown/raw 报告必须先读取 report_segments_path，再用 segment_ids 引用原文分段。\n"
         "输出必须写入下面 JSON 文件，不能只在终端回答：\n"
         f"{findings_path}\n\n"
         "JSON schema：\n"
@@ -1922,14 +2121,16 @@ def _moderator_report_prompt(input_payload: Dict[str, Any], findings_path: Path)
         "      \"rule_id\": \"规则或漏洞类型\",\n"
         "      \"message\": \"报告原始描述摘要\",\n"
         "      \"level\": \"error|warning|note|unknown\",\n"
-        "      \"locations\": [{\"file\":\"相对或报告路径\",\"line\":1,\"column\":1,\"symbol\":\"可选\"}],\n"
-        "      \"code_flows\": [[{\"file\":\"...\",\"line\":1}]],\n"
-        "      \"report_markdown\": \"该 finding 对应的报告原文片段；单 finding 时可留空\"\n"
+        "      \"result_indices\": [0],\n"
+        "      \"segment_ids\": [\"segment-0001\"],\n"
+        "      \"locations\": [{\"file\":\"仅用于 Markdown/raw 的报告位置\",\"line\":1,\"column\":1,\"symbol\":\"可选\"}],\n"
+        "      \"code_flows\": [[{\"file\":\"...\",\"line\":1}]]\n"
         "    }\n"
         "  ]\n"
         "}\n\n"
-        "约束：不要新增报告没有支持的事实。若报告只有一个 finding，report_markdown 可留空，调度器会从源文件精确补齐；"
-        "不要手工复制整份报告，也不要对 report_markdown 与源文件做逐字节相等校验。多 finding 时仅保留各自对应的原文片段。\n"
+        "约束：不要新增报告没有支持的事实；所有原始 result/segment 必须至少归入一个 finding。"
+        "单 finding 时可留空 result_indices 或 segment_ids，调度器会引用全部来源。"
+        "兼容字段 report_markdown 可留空；不要手工复制整份报告，也不要对 report_markdown 与源文件做逐字节相等校验。\n"
         "输入任务 JSON：\n"
         "```json\n"
         + json.dumps(input_payload, ensure_ascii=False, indent=2, sort_keys=True)
@@ -2016,10 +2217,29 @@ def _moderator_final_prompt(
     )
 
 
-def _persist_local_sarif_findings(path: Path, findings: Sequence[Finding]) -> Dict[str, Any]:
+def _persist_local_sarif_findings(
+    path: Path,
+    findings: Sequence[Finding],
+    *,
+    source_artifact: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    serialized = [to_jsonable(finding) for finding in findings]
+    if source_artifact:
+        for item in serialized:
+            properties = item.setdefault("properties", {})
+            properties.setdefault("source_format", "sarif")
+            properties.setdefault("source_report_format", "sarif")
+            properties.setdefault("source_report", source_artifact.get("source_path"))
+            properties["source_artifact"] = dict(source_artifact)
+            detail = item.setdefault("report_detail", {})
+            detail.setdefault("format", "sarif")
+            detail["source_artifact"] = dict(source_artifact)
     data = {
+        "schema": REPORT_FINDINGS_SCHEMA,
         "origin": LOCAL_SARIF_FINDINGS_ORIGIN,
-        "findings": [to_jsonable(finding) for finding in findings],
+        "finding_count": len(serialized),
+        "source_artifact": dict(source_artifact or {}),
+        "findings": serialized,
     }
     return _persist_findings_payload(path, data)
 
@@ -2046,6 +2266,381 @@ def _finalize_markdown_findings(path: Path, data: Dict[str, Any], report_text: s
     return _persist_findings_payload(path, finalized)
 
 
+def _materialize_report_findings(
+    path: Path,
+    data: Dict[str, Any],
+    *,
+    report_path: Path,
+    source_findings: Sequence[Finding],
+    report_segments: Sequence[Dict[str, Any]],
+    source_artifact: Dict[str, Any],
+    moderation_reason: Optional[str],
+) -> Dict[str, Any]:
+    raw_findings = data.get("findings")
+    if not isinstance(raw_findings, list) or not raw_findings:
+        raise CodexRunnerError("Moderator findings.json 缺少 findings 数组")
+    materialized: List[Finding] = []
+    segment_by_id = {
+        str(segment.get("segment_id")): segment
+        for segment in report_segments
+        if isinstance(segment, dict) and segment.get("segment_id")
+    }
+    segment_order = {segment_id: index for index, segment_id in enumerate(segment_by_id)}
+
+    for index, item in enumerate(raw_findings, start=1):
+        if not isinstance(item, dict):
+            continue
+        finding_id = _safe_finding_id(
+            str(item.get("finding_id") or f"finding-{index}").strip() or f"finding-{index}"
+        )
+        if source_findings:
+            result_indices = _moderator_result_indices(item)
+            if not result_indices:
+                if len(raw_findings) == len(source_findings):
+                    result_indices = [index - 1]
+                else:
+                    result_indices = list(range(len(source_findings)))
+            selected = [
+                source_findings[result_index]
+                for result_index in result_indices
+                if 0 <= result_index < len(source_findings)
+            ]
+            if not selected:
+                raise CodexRunnerError(f"Moderator finding {finding_id} 未引用有效 SARIF result")
+            materialized.append(
+                _materialize_sarif_finding(
+                    item,
+                    finding_id=finding_id,
+                    result_indices=result_indices,
+                    selected=selected,
+                    report_path=report_path,
+                    source_artifact=source_artifact,
+                )
+            )
+            continue
+
+        segment_ids = _moderator_segment_ids(item)
+        if not segment_ids:
+            segment_ids = list(segment_by_id)
+        selected_segments = [
+            segment_by_id[segment_id]
+            for segment_id in sorted(
+                set(segment_ids),
+                key=lambda segment_id: segment_order.get(segment_id, len(segment_order)),
+            )
+            if segment_id in segment_by_id
+        ]
+        if report_segments and not selected_segments:
+            raise CodexRunnerError(f"Moderator finding {finding_id} 未引用有效原始报告 segment")
+        materialized.append(
+            _materialize_text_finding(
+                item,
+                finding_id=finding_id,
+                selected_segments=selected_segments,
+                report_path=report_path,
+                source_artifact=source_artifact,
+                moderation_reason=moderation_reason,
+            )
+        )
+
+    if not materialized:
+        raise CodexRunnerError("Moderator findings.json 未包含有效 finding")
+    payload = _normalized_findings_payload(materialized, origin="moderator")
+    payload["source_artifact"] = dict(source_artifact)
+    payload["materialization"] = {
+        "strategy": "deterministic-source-references",
+        "moderation_reason": moderation_reason,
+        "source_finding_count": len(source_findings),
+        "source_segment_count": len(report_segments),
+    }
+    return _persist_findings_payload(path, payload)
+
+
+def _materialize_sarif_finding(
+    item: Dict[str, Any],
+    *,
+    finding_id: str,
+    result_indices: Sequence[int],
+    selected: Sequence[Finding],
+    report_path: Path,
+    source_artifact: Dict[str, Any],
+) -> Finding:
+    rule_id = str(
+        item.get("rule_id")
+        or (selected[0].rule_id if len(selected) == 1 else f"moderated-sarif-{finding_id}")
+    )
+    message = str(item.get("message") or item.get("title") or selected[0].message)
+    locations = _dedupe_locations(location for finding in selected for location in finding.locations)
+    code_flows = [list(flow) for finding in selected for flow in finding.code_flows]
+    level = str(item.get("level") or _strongest_report_level(finding.level for finding in selected) or "unknown")
+    source_properties = [dict(finding.properties) for finding in selected]
+    properties = dict(source_properties[0]) if len(source_properties) == 1 else {}
+    properties.update(
+        {
+            "source_format": "sarif",
+            "source_report_format": "sarif",
+            "source_report": str(report_path),
+            "source_artifact": dict(source_artifact),
+            "sarif_result_indices": list(result_indices),
+            "codex_moderated": True,
+        }
+    )
+    if len(source_properties) > 1:
+        properties["source_properties"] = source_properties
+    detail = _merge_sarif_report_details(selected)
+    detail["source_artifact"] = dict(source_artifact)
+    detail["moderator_grouping"] = {
+        "finding_id": finding_id,
+        "result_indices": list(result_indices),
+        "rule_id": rule_id,
+        "message": message,
+    }
+    raw = {
+        "format": "codex_moderated_sarif_finding",
+        "source_report": str(report_path),
+        "sarif_result_indices": list(result_indices),
+        "moderator": json.loads(json.dumps(item, ensure_ascii=False)),
+        "source_sarif_results": [
+            json.loads(json.dumps(finding.raw, ensure_ascii=False)) for finding in selected
+        ],
+    }
+    return Finding(
+        finding_id=finding_id,
+        rule_id=rule_id,
+        message=message,
+        level=level,
+        locations=locations,
+        code_flows=code_flows,
+        properties=properties,
+        raw=raw,
+        report_detail=detail,
+        vulnerability_type=infer_vulnerability_type(
+            rule_id=rule_id,
+            message=message,
+            properties=properties,
+            raw=raw,
+        ),
+    )
+
+
+def _materialize_text_finding(
+    item: Dict[str, Any],
+    *,
+    finding_id: str,
+    selected_segments: Sequence[Dict[str, Any]],
+    report_path: Path,
+    source_artifact: Dict[str, Any],
+    moderation_reason: Optional[str],
+) -> Finding:
+    rule_id = str(item.get("rule_id") or f"moderated-report-{finding_id}")
+    message = str(item.get("message") or item.get("title") or rule_id)
+    fragment_copies = [
+        {
+            "segment_id": segment.get("segment_id"),
+            "start_line": segment.get("start_line"),
+            "end_line": segment.get("end_line"),
+            "heading": segment.get("heading"),
+            "sha256": segment.get("sha256"),
+            "content": str(segment.get("content") or ""),
+        }
+        for segment in selected_segments
+    ]
+    segment_ids = [str(fragment["segment_id"]) for fragment in fragment_copies]
+    report_body = "".join(str(fragment.get("content") or "") for fragment in fragment_copies)
+    source_format = "markdown" if report_path.suffix.lower() in {".md", ".markdown"} else "text"
+    start_lines = [int(fragment["start_line"]) for fragment in fragment_copies if fragment.get("start_line")]
+    end_lines = [int(fragment["end_line"]) for fragment in fragment_copies if fragment.get("end_line")]
+    properties: Dict[str, Any] = {
+        "source_format": source_format,
+        "source_report_format": source_format,
+        "source_report": str(report_path),
+        "source_artifact": dict(source_artifact),
+        "segment_ids": segment_ids,
+        "codex_moderated": True,
+    }
+    if start_lines:
+        properties["markdown_start_line"] = min(start_lines)
+    if end_lines:
+        properties["markdown_end_line"] = max(end_lines)
+    raw = {
+        "format": "codex_moderated_text_finding",
+        "source_report": str(report_path),
+        "segment_ids": segment_ids,
+        "report_markdown": report_body,
+        "moderator": json.loads(json.dumps(item, ensure_ascii=False)),
+    }
+    detail = {
+        "format": source_format,
+        "source_artifact": dict(source_artifact),
+        "messages": [{"text": message, "source": "moderator"}],
+        "severity": {"level": str(item.get("level") or "unknown")},
+        "locations": json.loads(json.dumps(item.get("locations") or [], ensure_ascii=False)),
+        "code_flows": json.loads(json.dumps(item.get("code_flows") or [], ensure_ascii=False)),
+        "fragments": fragment_copies,
+        "properties": {"moderator": json.loads(json.dumps(item, ensure_ascii=False))},
+        "provenance": {
+            "source_refs": [
+                {
+                    "type": "report_segment",
+                    "segment_id": fragment["segment_id"],
+                    "start_line": fragment["start_line"],
+                    "end_line": fragment["end_line"],
+                    "sha256": fragment["sha256"],
+                }
+                for fragment in fragment_copies
+            ],
+            "moderation_reason": moderation_reason,
+        },
+    }
+    return Finding(
+        finding_id=finding_id,
+        rule_id=rule_id,
+        message=message,
+        level=str(item.get("level") or "unknown"),
+        locations=[
+            _location_from_dict(location)
+            for location in item.get("locations") or []
+            if isinstance(location, dict)
+        ],
+        code_flows=[
+            [_location_from_dict(location) for location in flow if isinstance(location, dict)]
+            for flow in item.get("code_flows") or []
+            if isinstance(flow, list)
+        ],
+        properties=properties,
+        raw=raw,
+        report_detail=detail,
+        vulnerability_type=infer_vulnerability_type(
+            rule_id=rule_id,
+            message=message,
+            raw=raw,
+            extra_text=report_body,
+        ),
+    )
+
+
+def _merge_sarif_report_details(selected: Sequence[Finding]) -> Dict[str, Any]:
+    details = [
+        finding.report_detail
+        for finding in selected
+        if isinstance(finding.report_detail, dict) and finding.report_detail
+    ]
+
+    def combined_list(key: str) -> List[Any]:
+        return [
+            json.loads(json.dumps(value, ensure_ascii=False))
+            for detail in details
+            for value in (detail.get(key) if isinstance(detail.get(key), list) else [])
+        ]
+
+    rules = [
+        json.loads(json.dumps(detail.get("rule"), ensure_ascii=False))
+        for detail in details
+        if isinstance(detail.get("rule"), dict) and detail.get("rule")
+    ]
+    source_refs = [
+        json.loads(json.dumps(ref, ensure_ascii=False))
+        for detail in details
+        for ref in (
+            (detail.get("provenance") or {}).get("source_refs")
+            if isinstance(detail.get("provenance"), dict)
+            and isinstance((detail.get("provenance") or {}).get("source_refs"), list)
+            else []
+        )
+    ]
+    return {
+        "format": "sarif",
+        "messages": combined_list("messages"),
+        "rule": rules[0] if len(rules) == 1 else {},
+        "rules": rules,
+        "severity": {
+            "level": _strongest_report_level(finding.level for finding in selected),
+            "source_levels": [finding.level for finding in selected],
+        },
+        "locations": combined_list("locations"),
+        "code_flows": combined_list("code_flows"),
+        "related_locations": combined_list("related_locations"),
+        "stacks": combined_list("stacks"),
+        "attachments": combined_list("attachments"),
+        "graphs": combined_list("graphs"),
+        "properties": {
+            "sources": [
+                json.loads(json.dumps(detail.get("properties") or {}, ensure_ascii=False))
+                for detail in details
+            ]
+        },
+        "fingerprints": {
+            "sources": [
+                json.loads(json.dumps(detail.get("fingerprints") or {}, ensure_ascii=False))
+                for detail in details
+            ]
+        },
+        "provenance": {"source_refs": source_refs, "materialized": True},
+        "original": {
+            "raw_results": [
+                json.loads(json.dumps(finding.raw, ensure_ascii=False)) for finding in selected
+            ],
+            "raw_rules": rules,
+        },
+    }
+
+
+def _moderator_result_indices(item: Dict[str, Any]) -> List[int]:
+    raw = (
+        item.get("result_indices")
+        or item.get("resultIndexes")
+        or item.get("sarif_result_indices")
+        or item.get("sarifResultIndices")
+        or item.get("result_index")
+        or item.get("resultIndex")
+    )
+    values = raw if isinstance(raw, list) else ([] if raw is None else [raw])
+    indices: List[int] = []
+    for value in values:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed not in indices:
+            indices.append(parsed)
+    return indices
+
+
+def _moderator_segment_ids(item: Dict[str, Any]) -> List[str]:
+    raw = item.get("segment_ids") or item.get("segmentIds") or item.get("segment_id")
+    values = raw if isinstance(raw, list) else ([] if raw is None else [raw])
+    segment_ids: List[str] = []
+    for value in values:
+        segment_id = str(value or "").strip()
+        if segment_id and segment_id not in segment_ids:
+            segment_ids.append(segment_id)
+    return segment_ids
+
+
+def _dedupe_locations(locations: Iterable[SourceLocation]) -> List[SourceLocation]:
+    result: List[SourceLocation] = []
+    seen: set[tuple[Any, ...]] = set()
+    for location in locations:
+        marker = (
+            location.file,
+            location.line,
+            location.column,
+            location.end_line,
+            location.end_column,
+            location.symbol,
+        )
+        if marker not in seen:
+            seen.add(marker)
+            result.append(location)
+    return result
+
+
+def _strongest_report_level(levels: Any) -> str:
+    ranks = {"error": 4, "warning": 3, "note": 2, "none": 1, "unknown": 0}
+    values = [str(level or "") for level in levels]
+    return max(values, key=lambda level: ranks.get(level.lower(), -1), default="")
+
+
 def _normalized_findings_payload(
     findings: Sequence[Finding],
     *,
@@ -2058,13 +2653,27 @@ def _normalized_findings_payload(
         "finding_count": len(findings),
         "findings": [to_jsonable(finding) for finding in findings],
     }
+    source_artifact = next(
+        (
+            finding.properties.get("source_artifact")
+            for finding in findings
+            if isinstance(finding.properties, dict)
+            and isinstance(finding.properties.get("source_artifact"), dict)
+        ),
+        None,
+    )
+    if source_artifact:
+        payload["source_artifact"] = json.loads(json.dumps(source_artifact, ensure_ascii=False))
     if reused_from_run_id:
         payload["reused_from_run_id"] = reused_from_run_id
     return payload
 
 
 def _findings_from_persisted(data: Dict[str, Any], report_path: Path) -> List[Finding]:
-    if data.get("origin") != LOCAL_SARIF_FINDINGS_ORIGIN and data.get("schema") != REPORT_FINDINGS_SCHEMA:
+    if data.get("origin") != LOCAL_SARIF_FINDINGS_ORIGIN and data.get("schema") not in {
+        REPORT_FINDINGS_SCHEMA,
+        REPORT_FINDINGS_SCHEMA_V1,
+    }:
         return _findings_from_moderator(data, report_path)
     raw = data.get("findings")
     if not isinstance(raw, list) or not raw:
@@ -2075,7 +2684,14 @@ def _findings_from_persisted(data: Dict[str, Any], report_path: Path) -> List[Fi
     return findings
 
 
-def _validate_report_findings_output(data: Dict[str, Any], report_path: Path) -> None:
+def _validate_report_findings_output(
+    data: Dict[str, Any],
+    report_path: Path,
+    *,
+    source_findings: Sequence[Finding] = (),
+    report_segments: Sequence[Dict[str, Any]] = (),
+    moderation_reason: Optional[str] = None,
+) -> None:
     """Require a complete, reusable report-split artifact before advancing the pipeline."""
 
     findings = _findings_from_persisted(data, report_path)
@@ -2087,6 +2703,40 @@ def _validate_report_findings_output(data: Dict[str, Any], report_path: Path) ->
         seen_ids.add(finding.finding_id)
     if duplicate_ids:
         raise CodexRunnerError(f"Moderator findings.json 包含重复 finding_id：{', '.join(sorted(duplicate_ids))}")
+    if data.get("schema") in {REPORT_FINDINGS_SCHEMA, REPORT_FINDINGS_SCHEMA_V1}:
+        return
+    raw_findings = [item for item in data.get("findings") or [] if isinstance(item, dict)]
+    if source_findings:
+        covered: set[int] = set()
+        for item in raw_findings:
+            indices = _moderator_result_indices(item)
+            if len(raw_findings) == 1 and not indices:
+                indices = list(range(len(source_findings)))
+            invalid = [index for index in indices if index < 0 or index >= len(source_findings)]
+            if invalid:
+                raise CodexRunnerError(f"Moderator findings.json 包含无效 result_indices：{invalid}")
+            covered.update(indices)
+        missing = sorted(set(range(len(source_findings))) - covered)
+        if missing:
+            raise CodexRunnerError(f"Moderator findings.json 未覆盖 SARIF result_indices：{missing}")
+    elif report_segments and moderation_reason in {"markdown", "parse_failed"}:
+        known_ids = {
+            str(segment.get("segment_id"))
+            for segment in report_segments
+            if isinstance(segment, dict) and segment.get("segment_id")
+        }
+        covered_ids: set[str] = set()
+        for item in raw_findings:
+            segment_ids = _moderator_segment_ids(item)
+            if len(raw_findings) == 1 and not segment_ids:
+                segment_ids = list(known_ids)
+            invalid_ids = sorted(set(segment_ids) - known_ids)
+            if invalid_ids:
+                raise CodexRunnerError(f"Moderator findings.json 包含无效 segment_ids：{invalid_ids}")
+            covered_ids.update(segment_ids)
+        missing_ids = sorted(known_ids - covered_ids)
+        if missing_ids:
+            raise CodexRunnerError(f"Moderator findings.json 未覆盖原始报告 segment_ids：{missing_ids}")
 
 
 def _finding_from_local_payload(item: Dict[str, Any]) -> Finding:
@@ -2094,6 +2744,11 @@ def _finding_from_local_payload(item: Dict[str, Any]) -> Finding:
     message = str(item.get("message") or "")
     properties = dict(item.get("properties") or {}) if isinstance(item.get("properties"), dict) else {}
     raw = dict(item.get("raw") or {}) if isinstance(item.get("raw"), dict) else {}
+    report_detail = (
+        dict(item.get("report_detail") or {})
+        if isinstance(item.get("report_detail"), dict)
+        else {}
+    )
     return Finding(
         finding_id=str(item.get("finding_id") or "finding"),
         rule_id=rule_id,
@@ -2107,6 +2762,7 @@ def _finding_from_local_payload(item: Dict[str, Any]) -> Finding:
         ],
         properties=properties,
         raw=raw,
+        report_detail=report_detail,
         vulnerability_type=str(item.get("vulnerability_type") or "") or infer_vulnerability_type(
             rule_id=rule_id,
             message=message,
@@ -2142,6 +2798,9 @@ def _findings_from_moderator(data: Dict[str, Any], report_path: Path) -> List[Fi
                 ],
                 properties={"source_report": str(report_path), "codex_moderated": True},
                 raw={"format": "codex_moderated_finding", "report_markdown": report_markdown, "moderator": item},
+                report_detail=dict(item.get("report_detail") or {})
+                if isinstance(item.get("report_detail"), dict)
+                else {},
                 vulnerability_type=infer_vulnerability_type(
                     rule_id=rule_id,
                     message=message,
@@ -2712,22 +3371,17 @@ def _evidence_chain(
     negative: Dict[str, Any],
     final: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
+    report_data = report_evidence_data(finding)
     items = [
         {
             "evidence_id": f"{finding.finding_id}-report",
             "kind": "REPORT",
             "strength": "STRONG",
-            "summary": finding.message,
+            "summary": report_evidence_summary(finding),
             "source": "input-report",
             "locations": [to_jsonable(item) for item in finding.locations],
-            "snippet": finding.raw.get("report_markdown") if isinstance(finding.raw, dict) else None,
-            "data": {
-                "rule_id": finding.rule_id,
-                "level": finding.level,
-                "message": finding.message,
-                "locations": [item.display() for item in finding.locations],
-                "code_flows": [[item.display() for item in flow] for flow in finding.code_flows],
-            },
+            "snippet": report_markdown(finding) or None,
+            "data": report_data,
         }
     ]
     for role, data in (("affirmative", affirmative), ("negative", negative), ("moderator", final)):
@@ -2834,6 +3488,7 @@ def _finding_to_prompt_payload(finding: Finding, source_indexer: SourceIndexer) 
         "code_flows": [[to_jsonable(item) for item in flow] for flow in finding.code_flows],
         "properties": finding.properties,
         "raw": finding.raw,
+        "report_detail": finding.report_detail,
         "source_context": contexts,
     }
 

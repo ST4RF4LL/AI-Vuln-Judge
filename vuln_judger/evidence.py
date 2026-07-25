@@ -5,6 +5,7 @@ from typing import List, Sequence
 
 from .analyzers import AnalyzerSettings, AnalyzerSuite
 from .models import CodeEvidence, EvidenceKind, EvidenceStrength, Finding, ProjectContext
+from .report_detail import report_evidence_data, report_evidence_summary, report_markdown
 from .source import SourceIndexer, detect_language, evidence_id, supported_language_for_finding
 
 
@@ -110,56 +111,16 @@ class EvidenceCollector:
         )
 
     def _report_evidence(self, finding: Finding) -> CodeEvidence:
-        raw_result = dict(finding.raw)
-        properties = dict(finding.properties)
-        markdown_report = str(raw_result.get("markdown") or "") if properties.get("source_format") == "markdown" else ""
-        locations = [location.display() for location in finding.locations]
-        if markdown_report:
-            start_line = properties.get("markdown_start_line")
-            end_line = properties.get("markdown_end_line")
-            range_text = f"；原始行号 {start_line}-{end_line}" if start_line and end_line else ""
-            if properties.get("source_report_format") == "sarif":
-                indices = properties.get("sarif_result_indices") or []
-                index_text = f"；SARIF results {indices}" if indices else ""
-                summary = f"输入 SARIF 经 Moderator 整理后的单漏洞报告：{finding.message or finding.rule_id}{index_text}"
-            else:
-                summary = f"输入 Markdown 单漏洞报告：{finding.message or finding.rule_id}{range_text}"
-        else:
-            summary = f"输入报告发现：{finding.rule_id}（{finding.level}）"
-            if finding.message:
-                summary += f"，消息：{finding.message}"
-            if locations:
-                summary += f"，位置：{'; '.join(locations[:5])}"
-            if finding.code_flows:
-                summary += f"，报告内代码流 {len(finding.code_flows)} 条"
+        markdown_report = report_markdown(finding)
         return CodeEvidence(
             evidence_id=evidence_id(finding.finding_id, "input-report"),
             kind=EvidenceKind.REPORT,
             strength=EvidenceStrength.STRONG,
-            summary=summary,
+            summary=report_evidence_summary(finding),
             source="input-report",
             locations=list(finding.locations),
             snippet=markdown_report or None,
-            data={
-                "source_format": properties.get("source_format") or "sarif",
-                "source_report_format": properties.get("source_report_format"),
-                "source_report": properties.get("source_report"),
-                "temporary_markdown_report": properties.get("temporary_markdown_report"),
-                "markdown_start_line": properties.get("markdown_start_line"),
-                "markdown_end_line": properties.get("markdown_end_line"),
-                "sarif_result_indices": properties.get("sarif_result_indices"),
-                "markdown_report": markdown_report,
-                "rule_id": finding.rule_id,
-                "vulnerability_type": finding.vulnerability_type,
-                "level": finding.level,
-                "message": finding.message,
-                "locations": [location.display() for location in finding.locations],
-                "code_flows": [[location.display() for location in flow] for flow in finding.code_flows],
-                "location_count": len(finding.locations),
-                "code_flow_count": len(finding.code_flows),
-                "properties": properties,
-                "raw_result": raw_result,
-            },
+            data=report_evidence_data(finding),
         )
 
     def _impact_evidence(self, finding: Finding) -> List[CodeEvidence]:
