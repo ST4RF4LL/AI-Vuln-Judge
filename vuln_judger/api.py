@@ -2946,6 +2946,33 @@ def app_html() -> str:
       overflow-x: auto;
       overflow-y: visible;
     }}
+    .findings-filter-bar {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(150px, 1fr)) auto;
+      gap: 10px;
+      align-items: end;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #f8fafc;
+    }}
+    .findings-filter-bar label {{
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .findings-filter-bar select {{
+      min-width: 0;
+      width: 100%;
+      background: #ffffff;
+      color: var(--text);
+      font-weight: 400;
+    }}
+    .findings-filter-bar > .muted {{ grid-column: 1 / -1; }}
+    .findings-filter-reset {{ white-space: nowrap; }}
     .findings-table-wrap table {{ min-width: 760px; }}
     .vulnerability-type {{ white-space: nowrap; }}
     .findings-table-wrap tbody tr {{
@@ -3403,6 +3430,7 @@ def app_html() -> str:
       .form-grid {{ grid-template-columns: 1fr; }}
       .run-agent-grid {{ grid-template-columns: 1fr; }}
       .profile-grid {{ grid-template-columns: 1fr; }}
+      .findings-filter-bar {{ grid-template-columns: 1fr; align-items: stretch; }}
     }}
   </style>
 </head>
@@ -3694,7 +3722,7 @@ def app_html() -> str:
     </section>
   </div>
   <script>
-    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentRun: null, currentFindings: [], providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, pollTimer: null, pollInFlight: false, autoRefreshEnabled: false, runListSignature: '', findingDetailCache: {{}}, reuseFindingsFromRunId: null, deleteConfirmRunId: null, expandedManualReviewKey: null, floatingManualReviewKey: null, manualReviewDrafts: {{}} }};
+    const state = {{ runs: [], selectedRun: null, selectedFinding: null, currentRun: null, currentFindings: [], findingFilters: {{ statusConclusion: '', vulnerabilityType: '', manualReview: '' }}, providers: [], defaults: {{}}, agentPrompts: {{}}, mcpServers: [], mcpDefaults: {{}}, skillSources: [], skillDefaults: {{}}, pollTimer: null, pollInFlight: false, autoRefreshEnabled: false, runListSignature: '', findingDetailCache: {{}}, reuseFindingsFromRunId: null, deleteConfirmRunId: null, expandedManualReviewKey: null, floatingManualReviewKey: null, manualReviewDrafts: {{}} }};
     const MANUAL_REVIEW_EVIDENCE_MAX_LENGTH = {MANUAL_REVIEW_EVIDENCE_MAX_LENGTH};
     const el = {{
       list: document.getElementById('run-list'),
@@ -3849,6 +3877,7 @@ def app_html() -> str:
       state.selectedRun = null;
       state.selectedFinding = null;
       state.currentFindings = [];
+      state.findingFilters = emptyFindingFilters();
       updateSelectedRunCard(previousRunId, null);
       renderEmpty('选择一个任务查看发现、证据和博弈回合。');
     }});
@@ -5375,6 +5404,7 @@ def app_html() -> str:
         state.selectedFinding = null;
         state.expandedManualReviewKey = null;
         state.floatingManualReviewKey = null;
+        state.findingFilters = emptyFindingFilters();
       }}
       updateSelectedRunCard(previousRunId, runId);
       const summary = state.runs.find(run => run.run_id === runId);
@@ -5532,19 +5562,104 @@ def app_html() -> str:
       </details>`;
     }}
 
+    function emptyFindingFilters() {{
+      return {{ statusConclusion: '', vulnerabilityType: '', manualReview: '' }};
+    }}
+
+    function findingFiltersActive() {{
+      const filters = state.findingFilters || emptyFindingFilters();
+      return Boolean(filters.statusConclusion || filters.vulnerabilityType || filters.manualReview);
+    }}
+
+    function findingMatchesFilters(finding) {{
+      const filters = state.findingFilters || emptyFindingFilters();
+      const statusFilter = String(filters.statusConclusion || '');
+      if (statusFilter.startsWith('status:')) {{
+        if (String(finding.finding_status || 'completed') !== statusFilter.slice(7)) return false;
+      }} else if (statusFilter.startsWith('verdict:')) {{
+        if (String(finding.verdict || '') !== statusFilter.slice(8)) return false;
+      }}
+      if (filters.vulnerabilityType && vulnerabilityTypeLabel(finding) !== filters.vulnerabilityType) {{
+        return false;
+      }}
+      const reviewDecision = String(finding.manual_review?.decision || '');
+      const reviewFilter = String(filters.manualReview || '');
+      if (reviewFilter === 'reviewed' && !reviewDecision) return false;
+      if (reviewFilter === 'unreviewed' && reviewDecision) return false;
+      if (reviewFilter.startsWith('decision:') && reviewDecision !== reviewFilter.slice(9)) return false;
+      return true;
+    }}
+
+    function filteredFindings(findings = state.currentFindings || []) {{
+      return (Array.isArray(findings) ? findings : []).filter(findingMatchesFilters);
+    }}
+
+    function findingFilterOption(value, label, selectedValue) {{
+      return `<option value="${{esc(value)}}" ${{selectedValue === value ? 'selected' : ''}}>${{esc(label)}}</option>`;
+    }}
+
+    function renderFindingFilters(findings, visibleFindings) {{
+      const filters = state.findingFilters || emptyFindingFilters();
+      const statusOptions = [
+        ['', '全部状态 / 结论'],
+        ['status:pending', '状态：未完成'],
+        ['status:in_progress', '状态：处理中'],
+        ['status:completed', '状态：已完成'],
+        ['verdict:TRUE_POSITIVE', '结论：真实漏洞'],
+        ['verdict:FALSE_POSITIVE', '结论：误报'],
+        ['verdict:INCONCLUSIVE', '结论：证据不足'],
+      ];
+      const manualReviewOptions = [
+        ['', '全部人工复核'],
+        ['reviewed', '已复核'],
+        ['unreviewed', '未复核'],
+        ['decision:TRUE_POSITIVE', '人工结论：真实漏洞'],
+        ['decision:FALSE_POSITIVE', '人工结论：误报'],
+        ['decision:INCONCLUSIVE', '人工结论：证据不足'],
+      ];
+      const vulnerabilityTypes = [...new Set(
+        (findings || []).map(vulnerabilityTypeLabel).filter(Boolean)
+      )].sort((left, right) => left.localeCompare(right, 'zh-CN'));
+      if (filters.vulnerabilityType && !vulnerabilityTypes.includes(filters.vulnerabilityType)) {{
+        vulnerabilityTypes.push(filters.vulnerabilityType);
+      }}
+      return `<div class="findings-filter-bar" data-findings-filter-bar="true">
+        <label>状态 / 结论
+          <select data-finding-filter="statusConclusion" aria-label="按状态或结论筛选">
+            ${{statusOptions.map(([value, label]) => findingFilterOption(value, label, filters.statusConclusion)).join('')}}
+          </select>
+        </label>
+        <label>漏洞类型
+          <select data-finding-filter="vulnerabilityType" aria-label="按漏洞类型筛选">
+            ${{findingFilterOption('', '全部漏洞类型', filters.vulnerabilityType)}}
+            ${{vulnerabilityTypes.map(value => findingFilterOption(value, value, filters.vulnerabilityType)).join('')}}
+          </select>
+        </label>
+        <label>人工复核
+          <select data-finding-filter="manualReview" aria-label="按人工复核筛选">
+            ${{manualReviewOptions.map(([value, label]) => findingFilterOption(value, label, filters.manualReview)).join('')}}
+          </select>
+        </label>
+        <button type="button" class="findings-filter-reset" data-findings-filter-reset="true" ${{findingFiltersActive() ? '' : 'disabled'}}>清除筛选</button>
+        <div class="muted">${{findingFiltersActive() ? `当前显示 ${{visibleFindings.length}} / ${{findings.length}} 个发现` : `共 ${{findings.length}} 个发现`}}</div>
+      </div>`;
+    }}
+
     function renderFindingsOverview(findings) {{
+      const visibleFindings = filteredFindings(findings);
       return `<div class="detail findings-section" id="findings-section">
         <h3>漏洞发现</h3>
         <div class="detail-body">
           <div class="chips">
             <span class="chip">${{esc(findings.length)}} 个发现</span>
-            <span class="chip">默认完整展示</span>
+            <span class="chip">${{findingFiltersActive() ? `筛选结果 ${{visibleFindings.length}} 个` : '默认完整展示'}}</span>
           </div>
+          ${{renderFindingFilters(findings, visibleFindings)}}
           ${{findings.length ? `<div class="findings-table-wrap">
             <table>
               <thead><tr><th>状态 / 结论</th><th>漏洞类型</th><th>规则</th><th>置信度</th><th>摘要</th><th>人工复核</th></tr></thead>
               <tbody>
-                ${{findings.map(item => {{
+                ${{visibleFindings.map(item => {{
                   const key = manualReviewKey(state.selectedRun, item.finding_id);
                   const expanded = state.expandedManualReviewKey === key;
                   return `<tr class="clickable ${{state.selectedFinding === item.finding_id ? 'active' : ''}}" data-finding-id="${{esc(item.finding_id)}}">
@@ -5556,7 +5671,7 @@ def app_html() -> str:
                     <td class="manual-review-cell"><button type="button" class="manual-review-toggle" data-manual-review-toggle="true" data-finding-id="${{esc(item.finding_id)}}" aria-expanded="${{expanded ? 'true' : 'false'}}">${{manualReviewButton(item.manual_review)}}</button></td>
                   </tr>
                   <tr class="manual-review-row" data-manual-review-row="${{esc(item.finding_id)}}" ${{expanded ? '' : 'hidden'}}><td colspan="6">${{renderManualReviewCard(item)}}</td></tr>`;
-                }}).join('')}}
+                }}).join('') || '<tr><td colspan="6"><div class="muted">没有符合当前筛选条件的漏洞发现。</div></td></tr>'}}
               </tbody>
             </table>
           </div>` : '<div class="muted">暂无漏洞发现。</div>'}}
@@ -5641,8 +5756,10 @@ def app_html() -> str:
 
     function renderSelectedFindingSticky(finding) {{
       if (!finding) return '';
+      const navigationFindings = filteredFindings();
       const index = selectedFindingIndex();
-      const total = (state.currentFindings || []).length;
+      const total = navigationFindings.length;
+      if (index < 0 || !total) return '';
       const reviewKey = manualReviewKey(state.selectedRun, finding.finding_id);
       const reviewOpen = state.floatingManualReviewKey === reviewKey;
       return `
@@ -5651,6 +5768,7 @@ def app_html() -> str:
           <div class="chips">
             ${{findingStatusChip(finding)}}
             <span class="chip">${{esc(index + 1)}} / ${{esc(total)}}</span>
+            ${{findingFiltersActive() ? '<span class="chip">筛选集合</span>' : ''}}
             ${{finding.finding_status === 'completed' ? `<span class="chip">置信度 ${{esc(finding.confidence)}}</span>` : ''}}
             <span class="chip">${{esc(finding.rule_id)}}</span>
           </div>
@@ -5839,6 +5957,7 @@ def app_html() -> str:
     }}
 
     function bindFindingRows(findings) {{
+      bindFindingFilters();
       for (const row of el.detail.querySelectorAll('tr[data-finding-id]')) {{
         row.addEventListener('click', () => selectFinding(row.dataset.findingId, {{ scrollToDetail: true }}));
       }}
@@ -5853,21 +5972,50 @@ def app_html() -> str:
         }});
       }}
       bindManualReviewControls(el.detail);
-      if (!findings.length) {{
+      const visibleFindings = filteredFindings(findings);
+      if (!visibleFindings.length) {{
         state.selectedFinding = null;
+        state.expandedManualReviewKey = null;
+        state.floatingManualReviewKey = null;
         updateSelectedFindingSticky();
         const emptyContainer = document.getElementById('finding-detail');
-        if (emptyContainer) emptyContainer.innerHTML = '<div class="empty">暂无可加载的漏洞详情。</div>';
+        if (emptyContainer) {{
+          emptyContainer.innerHTML = findingFiltersActive()
+            ? '<div class="empty">没有符合当前筛选条件的漏洞详情。</div>'
+            : '<div class="empty">暂无可加载的漏洞详情。</div>';
+        }}
         return;
       }}
-      if (state.selectedFinding && findings.some(item => item.finding_id === state.selectedFinding)) {{
+      if (state.selectedFinding && visibleFindings.some(item => item.finding_id === state.selectedFinding)) {{
         selectFinding(state.selectedFinding, {{ scrollToDetail: false }});
+        return;
+      }}
+      if (state.selectedFinding) {{
+        state.expandedManualReviewKey = null;
+        state.floatingManualReviewKey = null;
+        selectFinding(visibleFindings[0].finding_id, {{ scrollToDetail: false }});
         return;
       }}
       state.selectedFinding = null;
       updateSelectedFindingSticky();
       const container = document.getElementById('finding-detail');
       if (container) container.innerHTML = '<div class="empty">点击上方漏洞条目后加载完整详情。</div>';
+    }}
+
+    function bindFindingFilters() {{
+      for (const select of el.detail.querySelectorAll('[data-finding-filter]')) {{
+        select.addEventListener('change', () => {{
+          const name = select.dataset.findingFilter;
+          state.findingFilters = {{ ...(state.findingFilters || emptyFindingFilters()), [name]: select.value }};
+          rerenderRunDetailPreservingScroll();
+        }});
+      }}
+      for (const button of el.detail.querySelectorAll('[data-findings-filter-reset]')) {{
+        button.addEventListener('click', () => {{
+          state.findingFilters = emptyFindingFilters();
+          rerenderRunDetailPreservingScroll();
+        }});
+      }}
     }}
 
     function bindManualReviewControls(root) {{
@@ -6161,7 +6309,7 @@ def app_html() -> str:
     }}
 
     function selectedFindingIndex() {{
-      return (state.currentFindings || []).findIndex(item => item.finding_id === state.selectedFinding);
+      return filteredFindings().findIndex(item => item.finding_id === state.selectedFinding);
     }}
 
     function updateSelectedFindingSticky() {{
@@ -6196,7 +6344,7 @@ def app_html() -> str:
     }}
 
     function switchFinding(delta) {{
-      const findings = state.currentFindings || [];
+      const findings = filteredFindings();
       if (!findings.length) return;
       const index = selectedFindingIndex();
       const nextIndex = Math.min(Math.max((index < 0 ? 0 : index) + delta, 0), findings.length - 1);
