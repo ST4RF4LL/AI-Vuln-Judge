@@ -48,7 +48,7 @@ from .run_state import (
     finding_report_completed,
     first_incomplete_finding_index,
 )
-from .sarif import parse_sarif, sarif_grouping_is_ambiguous, validate_sarif_report
+from .sarif import parse_sarif, validate_sarif_report
 from .source import SourceIndexer
 from .vulnerability_types import infer_vulnerability_type
 
@@ -1974,8 +1974,6 @@ def _parse_report_locally(report_path: Path) -> tuple[str, List[Finding], str, O
     if issues:
         return report_text, [], "；".join(issues), "parse_failed"
     findings = parse_sarif(data)
-    if sarif_grouping_is_ambiguous(data, findings):
-        return report_text, findings, "", "grouping_ambiguous"
     return report_text, findings, "", None
 
 
@@ -2107,10 +2105,15 @@ def _input_payload(
 def _moderator_report_prompt(input_payload: Dict[str, Any], findings_path: Path) -> str:
     return (
         "当前阶段：报告拆分。请遵循本 session 初始 AGENTS.md 中的 Moderator 角色约束；本阶段只处理输入漏洞报告，不做最终真假裁决。\n"
-        "请完整理解报告，将其拆分为独立 finding。你只负责分组和命名，调度器会从原始报告确定性回填全部事实，"
+        "请忠实保留原报告已经列出的 finding 边界：原报告列出几个 finding，就必须按相同顺序输出几个 finding。"
+        "严禁把原报告中的多个 finding 合并成一个“综合性 finding”“汇总 finding”或攻击链 finding；"
+        "即使它们规则相同、位置相近、共享根因、属于同一攻击链或可能组合利用，也必须保持为原报告中的独立条目。"
+        "你只负责识别边界和命名，调度器会从原始报告确定性回填全部事实，"
         "不要手工压缩或重写原始证据。\n"
-        "SARIF 存在 parsed_findings 时，每个 finding 必须用 result_indices 引用原始 result；"
-        "Markdown/raw 报告必须先读取 report_segments_path，再用 segment_ids 引用原文分段。\n"
+        "SARIF 存在 parsed_findings 时，必须一条 result 对应一个输出 finding；每个 finding 的 result_indices "
+        "必须且只能包含一个索引，输出数量必须等于 parsed_findings 数量。"
+        "Markdown/raw 报告必须先读取 report_segments_path，逐项识别原文明确列出的 finding（包括标题、编号、"
+        "列表项或表格行），再用 segment_ids 引用原文分段；不得因为整份报告有共同主题而合并条目。\n"
         "输出必须写入下面 JSON 文件，不能只在终端回答：\n"
         f"{findings_path}\n\n"
         "JSON schema：\n"
@@ -2129,7 +2132,8 @@ def _moderator_report_prompt(input_payload: Dict[str, Any], findings_path: Path)
         "  ]\n"
         "}\n\n"
         "约束：不要新增报告没有支持的事实；所有原始 result/segment 必须至少归入一个 finding。"
-        "单 finding 时可留空 result_indices 或 segment_ids，调度器会引用全部来源。"
+        "只有原报告确实只列出一个 finding 时，输出才可以只有一个 finding；不得用空 result_indices 或 "
+        "segment_ids 把多条 finding 隐式归入一个输出。"
         "兼容字段 report_markdown 可留空；不要手工复制整份报告，也不要对 report_markdown 与源文件做逐字节相等校验。\n"
         "输入任务 JSON：\n"
         "```json\n"
@@ -2295,11 +2299,11 @@ def _materialize_report_findings(
         )
         if source_findings:
             result_indices = _moderator_result_indices(item)
-            if not result_indices:
-                if len(raw_findings) == len(source_findings):
-                    result_indices = [index - 1]
-                else:
-                    result_indices = list(range(len(source_findings)))
+            if len(result_indices) != 1:
+                raise CodexRunnerError(
+                    f"Moderator finding {finding_id} 必须且只能引用一个 SARIF result_index，"
+                    "禁止合并原报告中的多个 finding"
+                )
             selected = [
                 source_findings[result_index]
                 for result_index in result_indices
@@ -2703,18 +2707,63 @@ def _validate_report_findings_output(
         seen_ids.add(finding.finding_id)
     if duplicate_ids:
         raise CodexRunnerError(f"Moderator findings.json 包含重复 finding_id：{', '.join(sorted(duplicate_ids))}")
-    if data.get("schema") in {REPORT_FINDINGS_SCHEMA, REPORT_FINDINGS_SCHEMA_V1}:
-        return
     raw_findings = [item for item in data.get("findings") or [] if isinstance(item, dict)]
+    if data.get("schema") in {REPORT_FINDINGS_SCHEMA, REPORT_FINDINGS_SCHEMA_V1}:
+        if source_findings and len(raw_findings) != len(source_findings):
+            raise CodexRunnerError(
+                "报告拆分结果改变了 SARIF finding 数量："
+                f"原报告 {len(source_findings)} 个，拆分结果 {len(raw_findings)} 个；"
+                "禁止把多个原始 finding 合并为综合 finding"
+            )
+        if source_findings and data.get("origin") != LOCAL_SARIF_FINDINGS_ORIGIN:
+            covered: set[int] = set()
+            for item in raw_findings:
+                properties = item.get("properties")
+                indices = _moderator_result_indices(
+                    properties if isinstance(properties, dict) else {}
+                )
+                if len(indices) != 1:
+                    raise CodexRunnerError(
+                        "持久化的 SARIF finding 必须且只能引用一个 result_index；"
+                        "禁止创建综合 finding"
+                    )
+                if indices[0] < 0 or indices[0] >= len(source_findings):
+                    raise CodexRunnerError(
+                        f"持久化的 SARIF finding 引用了无效 result_index：{indices[0]}"
+                    )
+                if indices[0] in covered:
+                    raise CodexRunnerError(
+                        f"持久化的 SARIF findings 重复引用 result_index：{indices[0]}"
+                    )
+                covered.add(indices[0])
+            missing = sorted(set(range(len(source_findings))) - covered)
+            if missing:
+                raise CodexRunnerError(
+                    f"持久化的 SARIF findings 未覆盖 result_indices：{missing}"
+                )
+        return
     if source_findings:
+        if len(raw_findings) != len(source_findings):
+            raise CodexRunnerError(
+                "Moderator findings.json 必须与原始 SARIF findings 一一对应："
+                f"原报告 {len(source_findings)} 个，输出 {len(raw_findings)} 个；"
+                "禁止合并或遗漏原报告中的 finding"
+            )
         covered: set[int] = set()
         for item in raw_findings:
             indices = _moderator_result_indices(item)
-            if len(raw_findings) == 1 and not indices:
-                indices = list(range(len(source_findings)))
+            if len(indices) != 1:
+                raise CodexRunnerError(
+                    "Moderator findings.json 中每个 SARIF finding 必须且只能引用一个 result_index；"
+                    "禁止创建综合 finding"
+                )
             invalid = [index for index in indices if index < 0 or index >= len(source_findings)]
             if invalid:
                 raise CodexRunnerError(f"Moderator findings.json 包含无效 result_indices：{invalid}")
+            if indices[0] in covered:
+                raise CodexRunnerError(
+                    f"Moderator findings.json 重复引用 SARIF result_index：{indices[0]}"
+                )
             covered.update(indices)
         missing = sorted(set(range(len(source_findings))) - covered)
         if missing:

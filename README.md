@@ -420,8 +420,9 @@ Dashboard 使用单一全局轮询器查询运行中任务的 `status/revision`�
 用户点击后加载，并按 run revision 缓存；原始报告、CLI 三方材料、博弈过程和证据链在展开章节时
 才生成 DOM。JSON API 默认使用紧凑编码，客户端声明 `Accept-Encoding: gzip` 时会压缩较大响应。
 
-Codex/OpenCode 三方复核引擎会直接复用合法、无分组歧义的 SARIF results；Markdown、解析失败或
-分组存在歧义时才调用 Moderator 拆分。报告准备完成后会立即把全部 finding 写入运行记录，并在
+Codex/OpenCode 三方复核引擎会直接复用合法 SARIF results，并严格保持一条 result 对应一个
+finding；Markdown 或解析失败的报告才调用 Moderator 拆分。Moderator 必须保持原报告已经列出的
+finding 数量、顺序和边界，禁止把多个条目合并为综合 finding。报告准备完成后会立即把全部 finding 写入运行记录，并在
 `.workspaces/runs/<run-id>/findings/<finding-id>/brief.json` 保存各自的输入材料。前端会将
 尚未裁决的 finding 标记为“未完成”或“处理中”，并同时展示三个角色槽当前处理的 finding。
 Markdown 只拆出一个 finding 时，调度器会直接从源报告补齐完整 `report_markdown`，避免模型复制

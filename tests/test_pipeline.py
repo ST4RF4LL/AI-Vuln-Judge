@@ -598,7 +598,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(len(prepared.findings or []), 1)
             self.assertEqual(prepared.findings[0].rule_id, "python-command-injection")
             self.assertEqual(moderator.calls, [])
-            self.assertTrue(any("直接按原始 results 处理" in item for item in prepared.diagnostics))
+            self.assertTrue(any("每条原始 result 固定保留" in item for item in prepared.diagnostics))
 
     def test_structurally_invalid_sarif_uses_moderator_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -622,7 +622,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(prepared.temporary)
             self.assertTrue(any("解析失败的 SARIF" in item for item in prepared.diagnostics))
 
-    def test_ambiguous_sarif_report_is_moderated_with_source_into_markdown_findings(self):
+    def test_ambiguous_sarif_results_remain_separate_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sarif, _skills = write_python_fixture(root)
@@ -631,46 +631,16 @@ class PipelineTests(unittest.TestCase):
             first_result["partialFingerprints"] = {"primaryLocationLineHash": "shared-fingerprint"}
             sarif_data["runs"][0]["results"].append(json.loads(json.dumps(first_result)))
             sarif.write_text(json.dumps(sarif_data), encoding="utf-8")
-            response = {
-                "reports": [
-                    {
-                        "title": "命令注入独立报告",
-                        "result_indices": [0, 1],
-                        "markdown": "\n".join(
-                            [
-                                "# 命令注入独立报告",
-                                "",
-                                "- SARIF 位置：app.py:5:5",
-                                "- 源码上下文：request.args['cmd'] 进入 os.system。",
-                                "- 待正反方核验：入口可达性和防护措施。",
-                            ]
-                        ),
-                    }
-                ]
-            }
-            moderator = FakeLLM(json.dumps(response, ensure_ascii=False))
+            moderator = FakeLLM("unused")
 
-            tmp_dir = root / ".vuln-judger" / "tmp"
-            with patch.dict(os.environ, {"VULN_JUDGER_TMP_DIR": str(tmp_dir)}):
-                prepared = prepare_report_for_processing(sarif, moderator_client=moderator, source_path=root)
+            prepared = prepare_report_for_processing(sarif, moderator_client=moderator, source_path=root)
 
-            self.assertTrue(prepared.temporary)
-            self.assertEqual(prepared.effective_path.parent, tmp_dir.resolve())
-            self.assertEqual(len(prepared.findings or []), 1)
-            finding = prepared.findings[0]
-            self.assertEqual(finding.rule_id, "moderated-sarif-finding-1")
-            self.assertEqual(finding.message, "命令注入独立报告")
-            self.assertEqual(finding.locations[0].display(), "app.py:5:5")
-            self.assertEqual(finding.code_flows[0][0].display(), "app.py:4:11")
-            self.assertEqual(finding.properties["source_report_format"], "sarif")
-            self.assertEqual(finding.properties["sarif_result_indices"], [0, 1])
-            self.assertIn("request.args['cmd']", finding.raw["markdown"])
-            self.assertEqual(prepared.effective_path.read_text(encoding="utf-8"), finding.raw["markdown"])
-            self.assertIn("os.system(cmd)", moderator.calls[0][1])
-            self.assertIn('"result_index": 0', moderator.calls[0][1])
-            self.assertTrue(any("结合源码整理 SARIF" in item for item in prepared.diagnostics))
+            self.assertFalse(prepared.temporary)
+            self.assertEqual(len(prepared.findings or []), 2)
+            self.assertEqual(moderator.calls, [])
+            self.assertTrue(any("每条原始 result 固定保留" in item for item in prepared.diagnostics))
 
-    def test_sarif_moderation_failure_falls_back_to_original_sarif(self):
+    def test_valid_sarif_never_invokes_moderator_for_grouping(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             sarif, _skills = write_python_fixture(root)
@@ -685,8 +655,8 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(len(prepared.findings or []), 2)
             self.assertFalse(prepared.temporary)
-            self.assertEqual(len(moderator.calls), 3)
-            self.assertTrue(any("Moderator SARIF 预处理失败，回退原始 SARIF" in item for item in prepared.diagnostics))
+            self.assertEqual(len(moderator.calls), 0)
+            self.assertTrue(any("每条原始 result 固定保留" in item for item in prepared.diagnostics))
             fallback = load_sarif(prepared.effective_path)
             self.assertEqual(fallback[0].rule_id, "python-command-injection")
 
@@ -3152,7 +3122,8 @@ for raw in sys.stdin.buffer:
         self.assertEqual(data["findings"][0]["report_markdown"], "# Finding\n\nEvidence\n")
 
         prompt = _moderator_report_prompt({"report_path": "/tmp/report.md"}, Path("/tmp/findings.json"))
-        self.assertIn("单 finding 时可留空", prompt)
+        self.assertIn("严禁把原报告中的多个 finding 合并", prompt)
+        self.assertIn("原报告确实只列出一个 finding", prompt)
         self.assertIn("不要对 report_markdown 与源文件做逐字节相等校验", prompt)
 
     def test_report_findings_v2_materializes_exact_markdown_segments_and_snapshot(self):
@@ -4052,6 +4023,111 @@ for raw in sys.stdin.buffer:
 
             with self.assertRaisesRegex(CodexRunnerError, "重复 finding_id"):
                 _validate_report_findings_output(duplicate, report)
+
+    def test_report_findings_validator_rejects_composite_sarif_finding(self):
+        source_findings = [
+            Finding(
+                finding_id="ssrf",
+                rule_id="CWE-918",
+                message="SSRF",
+                level="error",
+                locations=[],
+            ),
+            Finding(
+                finding_id="privilege-escalation",
+                rule_id="privilege-escalation",
+                message="提权",
+                level="error",
+                locations=[],
+            ),
+        ]
+        composite = {
+            "findings": [
+                {
+                    "finding_id": "composite",
+                    "rule_id": "combined",
+                    "message": "综合性 finding",
+                    "result_indices": [0, 1],
+                }
+            ]
+        }
+        report = Path("/tmp/report.sarif")
+
+        with self.assertRaisesRegex(CodexRunnerError, "禁止合并"):
+            _validate_report_findings_output(
+                composite,
+                report,
+                source_findings=source_findings,
+                moderation_reason="grouping_ambiguous",
+            )
+
+        separate = {
+            "findings": [
+                {
+                    "finding_id": "ssrf",
+                    "rule_id": "CWE-918",
+                    "message": "SSRF",
+                    "result_indices": [0],
+                },
+                {
+                    "finding_id": "privilege-escalation",
+                    "rule_id": "privilege-escalation",
+                    "message": "提权",
+                    "result_indices": [1],
+                },
+            ]
+        }
+        _validate_report_findings_output(
+            separate,
+            report,
+            source_findings=source_findings,
+            moderation_reason="grouping_ambiguous",
+        )
+
+    def test_materializer_rejects_composite_sarif_finding(self):
+        source_findings = [
+            Finding(
+                finding_id="ssrf",
+                rule_id="CWE-918",
+                message="SSRF",
+                level="error",
+                locations=[],
+            ),
+            Finding(
+                finding_id="privilege-escalation",
+                rule_id="privilege-escalation",
+                message="提权",
+                level="error",
+                locations=[],
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            report = root / "report.sarif"
+            report.write_text("{}", encoding="utf-8")
+            run_dir = root / "run"
+            (run_dir / "input").mkdir(parents=True)
+            artifact = _snapshot_report_artifact(report, run_dir)
+
+            with self.assertRaisesRegex(CodexRunnerError, "禁止合并"):
+                _materialize_report_findings(
+                    run_dir / "findings.json",
+                    {
+                        "findings": [
+                            {
+                                "finding_id": "composite",
+                                "rule_id": "combined",
+                                "message": "综合性 finding",
+                                "result_indices": [0, 1],
+                            }
+                        ]
+                    },
+                    report_path=report,
+                    source_findings=source_findings,
+                    report_segments=[],
+                    source_artifact=artifact,
+                    moderation_reason="grouping_ambiguous",
+                )
 
     def test_opencode_runner_accepts_valid_report_split_before_moderator_turn_exits(self):
         with tempfile.TemporaryDirectory() as tmp:

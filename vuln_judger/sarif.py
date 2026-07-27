@@ -147,36 +147,7 @@ def prepare_report_for_processing(
         )
     diagnostics.extend(f"Moderator 修复 SARIF 读取异常：{item}" for item in repairs)
     source_findings = parse_sarif(reviewed)
-    grouping_ambiguous = sarif_grouping_is_ambiguous(reviewed, source_findings)
-    if moderator_client is not None and source_path is not None and grouping_ambiguous:
-        try:
-            findings, temp_paths, sarif_diagnostics = moderator_prepare_sarif_report(
-                reviewed,
-                report_path,
-                source_path,
-                moderator_client=moderator_client,
-                moderator_agent=moderator_agent,
-                source_indexer=source_indexer,
-            )
-        except ReportPreparationError as exc:
-            diagnostics.append(f"Moderator SARIF 预处理失败，回退原始 SARIF：{exc}")
-        else:
-            diagnostics.extend(sarif_diagnostics)
-            diagnostics.append(f"Moderator 已将 SARIF 报告整理为 {len(findings)} 个持久单漏洞 Markdown 报告")
-            return PreparedReport(
-                report_path,
-                temp_paths[0] if temp_paths else report_path,
-                diagnostics,
-                temporary=bool(temp_paths),
-                findings=findings,
-                temporary_paths=temp_paths,
-            )
-    elif not grouping_ambiguous:
-        diagnostics.append("合法 SARIF 已在本地解析，直接按原始 results 处理")
-    elif moderator_client is None:
-        diagnostics.append("SARIF 分组存在歧义，但 Moderator LLM 未启用，按原始 results 处理")
-    elif source_path is None:
-        diagnostics.append("SARIF 分组存在歧义，但未提供源码路径，按原始 results 处理")
+    diagnostics.append("合法 SARIF 已在本地解析；每条原始 result 固定保留为一个独立 finding")
     if repairs:
         temp_path = _write_temp_sarif(reviewed, report_path)
         diagnostics.append(f"Moderator 已将修复后的 SARIF 写入临时文件：{temp_path}")
@@ -251,6 +222,9 @@ def _markdown_moderation_prompt(
     system = (
         f"你是 {agent.name or '中立 Moderator'}，负责读取完整 Markdown 静态漏洞报告，"
         "并整理成若干份可直接交给正反方研判的单漏洞 Markdown 报告。"
+        "必须忠实保留原报告已有的 finding 边界和顺序：原报告列出几个 finding，就输出几个报告。"
+        "严禁把多个 finding 合并成“综合性 finding”“汇总 finding”或攻击链 finding；"
+        "即使它们规则相同、共享根因、位置相近或能够组合利用，也必须分别输出。"
         "不要返回行号范围，不要把 Markdown 转换为 SARIF，不要输出正反方结论或真实漏洞/误报判定。"
         "只输出 JSON object，不要输出代码块、额外解释或 SARIF。"
     )
@@ -261,7 +235,8 @@ def _markdown_moderation_prompt(
         "输出要求：\n"
         "1. 输出 JSON 格式：{\"reports\":[{\"title\":\"...\",\"markdown\":\"# ...\"}]}。\n"
         "2. 每个 reports[].markdown 必须是一份完整单漏洞报告，保留原始报告中的规则、描述、文件路径、行号、代码块、表格行、调用链、数据流、影响和待核验缺口。\n"
-        "3. 如果原报告只有一个漏洞或无法可靠拆分，输出一份包含完整原始上下文的单漏洞报告。\n"
+        "3. 按原报告明确列出的标题、编号、列表项或表格行逐项输出，数量和顺序必须与原报告一致；"
+        "不得因为无法判断多个条目的关系而合并，无法判断时仍按原始条目分别输出。\n"
         "4. 不要输出 start_line、end_line、line_range 或任何只供本地切片的字段；由你直接生成最终 Markdown 报告正文。\n"
         "5. 不要新增没有原文支持的漏洞事实，不要做最终真实漏洞/误报裁决。\n\n"
         f"source_report: {source_name}\n\n"
@@ -487,6 +462,7 @@ def _moderator_sarif_reports_with_retries(
             reports = _moderated_sarif_reports_from_response(data, len(source_findings))
             if not reports:
                 raise ReportPreparationError("Moderator LLM SARIF 预处理结果未包含有效 reports")
+            _validate_moderated_sarif_reports(reports, len(source_findings))
         except ReportPreparationError as exc:
             last_error = str(exc)
             if attempt < attempts:
@@ -513,8 +489,9 @@ def _sarif_moderation_prompt(
     agent_instructions = (agent.instructions or "").strip()
     system = (
         f"你是 {agent.name or '中立 Moderator'}，负责预处理 SARIF 静态漏洞报告。"
-        "你必须结合 SARIF result、codeFlow 和项目源码片段，判断哪些 result 属于同一个独立漏洞，"
-        "并整理成若干份可直接交给正反方研判的单漏洞 Markdown 报告。"
+        "SARIF 中每条 result 已经是原报告明确列出的独立 finding；"
+        "你必须逐条整理成可直接交给正反方研判的单漏洞 Markdown 报告，保持数量和顺序不变。"
+        "严禁把多个 result 合并成“综合性 finding”“汇总 finding”或攻击链 finding。"
         "不要只做关键词匹配；不要丢弃 SARIF 中的路径、消息、代码流和源码上下文；"
         "只输出 JSON object，不要输出代码块、额外解释或 SARIF。"
     )
@@ -527,13 +504,14 @@ def _sarif_moderation_prompt(
         "results": _sarif_results_for_moderator(source_findings, source_path, source_indexer=source_indexer),
     }
     user = (
-        "请读取下面 SARIF 结果和源码上下文，拆分/合并为独立漏洞报告。\n"
+        "请读取下面 SARIF 结果和源码上下文，逐条整理为独立漏洞报告。\n"
         "输出要求：\n"
         "1. 输出 JSON 格式：{\"reports\":[{\"title\":\"...\",\"result_indices\":[0],\"markdown\":\"# ...\"}]}。\n"
-        "2. result_indices 必须引用下方 results[].result_index，使用 0-based 编号；同一漏洞可包含多个 result_index。\n"
+        "2. 每个 reports[] 的 result_indices 必须且只能引用一个 results[].result_index，使用 0-based 编号；"
+        "reports 数量必须等于 results 数量，并按 result_index 顺序输出，禁止合并、遗漏或重复。\n"
         "3. markdown 必须是一份完整单漏洞报告，保留 SARIF 原始消息、位置、codeFlow、相关源码片段、Moderator 对分组/拆分的依据和仍需正反方核验的缺口。\n"
         "4. 不要输出正反方结论，不要判定真实漏洞/误报；这里只做报告拆分整理。\n"
-        "5. 如果无法确认多个 result 属于同一漏洞，应拆成多份报告而不是强行合并。\n\n"
+        "5. 规则相同、位置相近、共享根因或属于同一攻击链都不是合并理由；始终保持原始 result 边界。\n\n"
         "SARIF 与源码上下文 JSON：\n"
         + json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
     )
@@ -635,6 +613,30 @@ def _moderated_sarif_reports_from_response(data: Dict[str, Any], finding_count: 
         title = str(item.get("title") or item.get("name") or f"SARIF moderated finding {report_index}").strip()
         reports.append(ModeratedSarifReport(title=title or f"SARIF moderated finding {report_index}", result_indices=indices, markdown=markdown))
     return reports
+
+
+def _validate_moderated_sarif_reports(
+    reports: Sequence[ModeratedSarifReport],
+    finding_count: int,
+) -> None:
+    if len(reports) != finding_count:
+        raise ReportPreparationError(
+            "Moderator LLM SARIF 预处理必须与原始 results 一一对应："
+            f"原报告 {finding_count} 个，输出 {len(reports)} 个；禁止合并或遗漏"
+        )
+    referenced: List[int] = []
+    for report in reports:
+        if len(report.result_indices) != 1:
+            raise ReportPreparationError(
+                "每个 SARIF 单漏洞报告必须且只能引用一个 result_index；禁止创建综合 finding"
+            )
+        referenced.append(report.result_indices[0])
+    expected = list(range(finding_count))
+    if referenced != expected:
+        raise ReportPreparationError(
+            "SARIF 单漏洞报告必须按原始 result_index 顺序逐条覆盖且不得重复："
+            f"期望 {expected}，实际 {referenced}"
+        )
 
 
 def _sarif_result_indices_from_item(item: Dict[str, Any], finding_count: int, fallback_index: int) -> List[int]:
