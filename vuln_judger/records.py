@@ -5,7 +5,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from uuid import uuid4
 
 from .models import RunReport, to_jsonable
@@ -139,11 +139,10 @@ class RunRecordStore:
 
     def list(self) -> List[Dict[str, Any]]:
         records = []
-        for path in sorted(self.root.glob("run-*.json")):
+        for path, payload in self._record_payloads():
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
                 stat = path.stat()
-            except (json.JSONDecodeError, OSError):
+            except OSError:
                 continue
             records.append(_summary(payload, revision=_revision_from_stat(stat)))
         records.sort(key=lambda item: item.get("created_at") or "", reverse=True)
@@ -152,11 +151,7 @@ class RunRecordStore:
     def recover_unfinished(self) -> List[Dict[str, Any]]:
         recovered = []
         control_store = RunControlStore(self.root)
-        for path in sorted(self.root.glob("run-*.json")):
-            try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                continue
+        for path, payload in self._record_payloads():
             status = str(payload.get("status") or "completed")
             if status not in {"running", "pausing", "queued", "stopping"}:
                 continue
@@ -169,6 +164,18 @@ class RunRecordStore:
             self.save_payload(updated)
             recovered.append(updated)
         return recovered
+
+    def _record_payloads(self) -> Iterator[Tuple[Path, Dict[str, Any]]]:
+        for path in sorted(self.root.glob("*.json")):
+            payload = self._read_path(path)
+            if payload is None:
+                continue
+            run_id = payload.get("run_id")
+            if not isinstance(run_id, str) or not run_id.strip():
+                continue
+            if self._path(run_id) != path:
+                continue
+            yield path, payload
 
     def _path(self, run_id: str) -> Path:
         safe = _safe_run_id(run_id)

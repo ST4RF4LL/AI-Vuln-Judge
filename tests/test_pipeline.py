@@ -1768,6 +1768,31 @@ for raw in sys.stdin.buffer:
             self.assertIsNone(store.get(report.run_id))
             self.assertFalse(store.delete(report.run_id))
 
+    def test_record_store_lists_and_recovers_custom_run_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunRecordStore(Path(tmp) / "records")
+            run_id = "external-review"
+            store.save_payload(
+                {
+                    "run_id": run_id,
+                    "status": "queued",
+                    "engine": "opencode",
+                    "created_at": "2026-07-27T00:00:00Z",
+                    "finding_count": 0,
+                    "reports": [],
+                    "diagnostics": [],
+                }
+            )
+            (store.root / "settings.json").write_text('{"enabled": true}\n', encoding="utf-8")
+            (store.root / "broken.json").write_text("{\n", encoding="utf-8")
+
+            records = store.list()
+            recovered = store.recover_unfinished()
+
+            self.assertEqual([record["run_id"] for record in records], [run_id])
+            self.assertEqual([record["run_id"] for record in recovered], [run_id])
+            self.assertEqual(store.get(run_id)["status"], "paused")
+
     def test_record_store_recovers_unfinished_run_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = RunRecordStore(Path(tmp) / "records")
