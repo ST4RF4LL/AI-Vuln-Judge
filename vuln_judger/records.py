@@ -150,20 +150,43 @@ class RunRecordStore:
 
     def recover_unfinished(self) -> List[Dict[str, Any]]:
         recovered = []
-        control_store = RunControlStore(self.root)
         for path, payload in self._record_payloads():
             status = str(payload.get("status") or "completed")
             if status not in {"running", "pausing", "queued", "stopping"}:
                 continue
-            if control_store.has_live_owner(str(payload.get("run_id") or path.stem)):
-                continue
-            if status == "stopping":
-                updated = _stopped_after_restart(payload)
-            else:
-                updated = _paused_after_restart(payload)
-            self.save_payload(updated)
-            recovered.append(updated)
+            updated = self.recover_unfinished_run(
+                str(payload.get("run_id") or path.stem),
+                action="stop" if status == "stopping" else "pause",
+                reason="restart",
+            )
+            if updated is not None:
+                recovered.append(updated)
         return recovered
+
+    def recover_unfinished_run(
+        self,
+        run_id: str,
+        *,
+        action: str = "pause",
+        reason: str = "owner_lost",
+    ) -> Optional[Dict[str, Any]]:
+        control_store = RunControlStore(self.root)
+
+        def recover() -> Optional[Dict[str, Any]]:
+            payload = self.get(run_id)
+            if payload is None:
+                return None
+            status = str(payload.get("status") or "completed")
+            if status not in {"running", "pausing", "queued", "stopping"}:
+                return None
+            if action == "stop" or status == "stopping":
+                updated = _stopped_after_restart(payload, reason=reason)
+            else:
+                updated = _paused_after_restart(payload, reason=reason)
+            self.save_payload(updated)
+            return updated
+
+        return control_store.run_if_unowned(run_id, recover)
 
     def _record_payloads(self) -> Iterator[Tuple[Path, Dict[str, Any]]]:
         for path in sorted(self.root.glob("*.json")):
@@ -278,6 +301,18 @@ class RunControlStore:
             owner_id = str(state.get("owner_id") or "")
             owner_pid = _optional_int(state.get("owner_pid"))
             return bool(owner_id and owner_pid and _pid_alive(owner_pid))
+        finally:
+            self._unlock(lock_file)
+
+    def run_if_unowned(self, run_id: str, callback: Callable[[], Any]) -> Any:
+        """Run callback while ownership is atomically confirmed absent."""
+        lock_file, state = self._locked_state(run_id)
+        try:
+            owner_id = str(state.get("owner_id") or "")
+            owner_pid = _optional_int(state.get("owner_pid"))
+            if owner_id and owner_pid and _pid_alive(owner_pid):
+                return None
+            return callback()
         finally:
             self._unlock(lock_file)
 
@@ -398,7 +433,7 @@ def normalize_run_origin(payload: Dict[str, Any]) -> str:
     return "unknown"
 
 
-def _paused_after_restart(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _paused_after_restart(payload: Dict[str, Any], *, reason: str = "restart") -> Dict[str, Any]:
     updated = dict(payload)
     reports = mark_incomplete_findings_pending(
         updated.get("reports") or [],
@@ -430,12 +465,15 @@ def _paused_after_restart(payload: Dict[str, Any]) -> Dict[str, Any]:
     updated["current_finding_ids"] = {}
     updated["error"] = None
     diagnostics = list(updated.get("diagnostics") or [])
-    diagnostics.append(f"{_now()} 服务重启时发现任务未完成，已保存为暂停状态，可从恢复点继续。")
+    if reason == "restart":
+        diagnostics.append(f"{_now()} 服务重启时发现任务未完成，已保存为暂停状态，可从恢复点继续。")
+    else:
+        diagnostics.append(f"{_now()} 运行任务的控制 owner 已失效，已自动保存为暂停状态，可从恢复点继续。")
     updated["diagnostics"] = diagnostics
     return updated
 
 
-def _stopped_after_restart(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _stopped_after_restart(payload: Dict[str, Any], *, reason: str = "restart") -> Dict[str, Any]:
     updated = dict(payload)
     updated["status"] = "stopped"
     updated["current_finding_id"] = None
@@ -443,7 +481,10 @@ def _stopped_after_restart(payload: Dict[str, Any]) -> Dict[str, Any]:
     updated["current_finding_ids"] = {}
     updated["error"] = None
     diagnostics = list(updated.get("diagnostics") or [])
-    diagnostics.append(f"{_now()} 服务重启时发现任务正在停止，已标记为已停止。")
+    if reason == "restart":
+        diagnostics.append(f"{_now()} 服务重启时发现任务正在停止，已标记为已停止。")
+    else:
+        diagnostics.append(f"{_now()} 运行任务的控制 owner 已失效，已按停止请求标记为已停止。")
     updated["diagnostics"] = diagnostics
     return updated
 

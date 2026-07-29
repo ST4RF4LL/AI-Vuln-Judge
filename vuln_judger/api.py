@@ -153,6 +153,8 @@ def make_handler(
     control_store = RunControlStore(store.root)
     recovered = store.recover_unfinished()
     if recovered:
+        for payload in recovered:
+            stop_sessions(payload)
         LOG.info("恢复未完成运行记录 count=%s ids=%s", len(recovered), ",".join(str(item.get("run_id")) for item in recovered))
     tasks = {}
     stop_events = {}
@@ -1988,7 +1990,10 @@ def _request_stop(
         requested_by=RUN_ORIGIN_WEB,
         before_signal=lambda: store.save_payload(updated),
     ):
-        return None
+        recovered = store.recover_unfinished_run(run_id, action="stop")
+        if recovered is not None:
+            stop_sessions(stored)
+        return recovered
     return updated
 
 
@@ -2046,7 +2051,10 @@ def _request_pause(
         requested_by=RUN_ORIGIN_WEB,
         before_signal=lambda: store.save_payload(updated),
     ):
-        return None
+        recovered = store.recover_unfinished_run(run_id, action="pause")
+        if recovered is not None:
+            stop_sessions(stored)
+        return recovered
     return updated
 
 

@@ -95,9 +95,14 @@ class JudgerMCPServer:
                 if response is not None:
                     _write_message(self.stdout, response, framing)
         finally:
-            self.close()
+            # The stdio transport belongs to the MCP client, but asynchronous
+            # reviews are persisted jobs. A client disconnect must not cancel
+            # an otherwise healthy review.
+            self.close(cancel_active=False)
 
-    def close(self) -> None:
+    def close(self, *, cancel_active: bool = True) -> None:
+        if not cancel_active:
+            return
         with self._active_runs_lock:
             active = list(self._active_runs.items())
         for run_id, task in active:
@@ -219,11 +224,7 @@ class JudgerMCPServer:
             if not bool(arguments.get("save", True)):
                 raise ValueError("save=false is not supported by CLI engines because progress is persisted for polling")
             if bool(arguments.get("wait_for_completion", False)):
-                try:
-                    payload = self._run_codex_report(config)
-                except Exception as exc:
-                    self._record_codex_failure(config, exc)
-                    raise
+                payload = self._wait_for_codex_report(config)
                 return self._completed_run_result(payload, include_report=bool(arguments.get("include_report", False)))
             return self._start_codex_report(config)
         return self._run_builtin_report(config, arguments)
@@ -284,7 +285,7 @@ class JudgerMCPServer:
                 target=self._codex_run_worker,
                 args=(config, stop_event, owner_id, run_origin),
                 name=f"vuln-judger-mcp-{run_id}",
-                daemon=True,
+                daemon=False,
             )
             self._active_runs[run_id] = _ActiveRun(
                 stop_event=stop_event,
@@ -321,6 +322,23 @@ class JudgerMCPServer:
             }
         )
         return result
+
+    def _wait_for_codex_report(self, config: RunConfig) -> Dict[str, Any]:
+        run_id = str(config.run_id)
+        self._start_codex_report(config)
+        with self._active_runs_lock:
+            active = self._active_runs.get(run_id)
+        if active is not None:
+            active.thread.join()
+        payload = self.records.get(run_id)
+        if payload is None:
+            raise RuntimeError(f"Run record disappeared while waiting: {run_id}")
+        status = str(payload.get("status") or "")
+        if status == "failed":
+            raise RuntimeError(str(payload.get("error") or f"Run failed: {run_id}"))
+        if status not in {"completed", "paused", "stopped"}:
+            raise RuntimeError(f"Run worker exited without a terminal state: {run_id} ({status or 'unknown'})")
+        return payload
 
     def _codex_run_worker(
         self,

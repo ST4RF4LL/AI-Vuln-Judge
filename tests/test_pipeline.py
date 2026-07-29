@@ -1,5 +1,6 @@
 import http.client
 import gzip
+import io
 import json
 import os
 import subprocess
@@ -32,6 +33,7 @@ from vuln_judger.api import (
     _pause_payload,
     _request_pause,
     _request_resume,
+    _request_stop,
     _resume_checkpoint_payload,
     _send_codex_session_input,
     _stop_codex_sessions,
@@ -1850,6 +1852,55 @@ for raw in sys.stdin.buffer:
             self.assertTrue(control.release("run-live-mcp", owner))
             self.assertEqual(len(store.recover_unfinished()), 1)
             self.assertEqual(store.get("run-live-mcp")["status"], "paused")
+
+    def test_web_controls_recover_orphaned_mcp_runs_instead_of_returning_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RunRecordStore(Path(tmp) / "records")
+            control = RunControlStore(store.root)
+            base_payload = {
+                "run_origin": "mcp",
+                "engine": "opencode",
+                "finding_count": 1,
+                "completed_finding_count": 0,
+                "reports": [],
+                "diagnostics": [],
+            }
+
+            store.save_payload(
+                {
+                    **base_payload,
+                    "run_id": "run-orphan-pause",
+                    "status": "running",
+                }
+            )
+            paused = _request_pause(
+                {},
+                {},
+                Lock(),
+                "run-orphan-pause",
+                store=store,
+                control_store=control,
+            )
+            self.assertEqual(paused["status"], "paused")
+            self.assertIn("控制 owner 已失效", paused["diagnostics"][-1])
+
+            store.save_payload(
+                {
+                    **base_payload,
+                    "run_id": "run-orphan-stop",
+                    "status": "running",
+                }
+            )
+            stopped = _request_stop(
+                {},
+                {},
+                Lock(),
+                "run-orphan-stop",
+                store=store,
+                control_store=control,
+            )
+            self.assertEqual(stopped["status"], "stopped")
+            self.assertIn("控制 owner 已失效", stopped["diagnostics"][-1])
 
     def test_record_store_preserves_latest_manual_review_across_pipeline_writes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5847,6 +5898,163 @@ for raw in sys.stdin.buffer:
             self.assertFalse(captured["config"].enable_llm)
             self.assertEqual(captured["config"].silence_reminder_minutes, 23)
             self.assertEqual(captured["run_origin"], "mcp")
+
+    def test_mcp_wait_for_completion_registers_owner_for_web_pause(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = JudgerMCPSettings(
+                records_dir=root / "records",
+                providers_file=root / "providers.json",
+                mcp_servers_file=root / "mcp.json",
+                skills_file=root / "skills.json",
+                agents_dir=root / "agents",
+            )
+            server = JudgerMCPServer(settings)
+            entered = Event()
+            result = {}
+
+            class BlockingOpenCodeRunner:
+                def __init__(self, *, records_dir):
+                    self.records_dir = records_dir
+
+                def run(self, config, *, store, run_origin, should_stop=None):
+                    payload = dict(store.get(str(config.run_id)) or {})
+                    payload.update(
+                        {
+                            "run_id": str(config.run_id),
+                            "status": "running",
+                            "run_origin": run_origin,
+                            "engine": "opencode",
+                            "finding_count": 0,
+                            "completed_finding_count": 0,
+                            "reports": [],
+                            "diagnostics": [],
+                            "cli_sessions": [
+                                {
+                                    "role": "moderator",
+                                    "session_name": "fake-moderator-session",
+                                }
+                            ],
+                        }
+                    )
+                    store.save_payload(payload)
+                    entered.set()
+                    while should_stop is None or not should_stop():
+                        time.sleep(0.005)
+                    raise CodexRunnerStopped("paused by test")
+
+            def invoke():
+                result["value"] = server._judge_report(
+                    {
+                        "run_id": "run-mcp-wait-pause",
+                        "report_path": str(root / "report.md"),
+                        "source_path": str(root / "source"),
+                        "engine": "opencode",
+                        "wait_for_completion": True,
+                    }
+                )
+
+            try:
+                with patch("vuln_judger.mcp_server.OpenCodeDrivenRunner", BlockingOpenCodeRunner):
+                    call_thread = Thread(target=invoke)
+                    call_thread.start()
+                    self.assertTrue(entered.wait(2))
+                    self.assertTrue(server.control_store.has_live_owner("run-mcp-wait-pause"))
+
+                    pause_result = _request_pause(
+                        {},
+                        {},
+                        Lock(),
+                        "run-mcp-wait-pause",
+                        store=server.records,
+                        control_store=RunControlStore(server.records.root),
+                    )
+                    self.assertEqual(pause_result["status"], "pausing")
+                    call_thread.join(timeout=2)
+
+                self.assertFalse(call_thread.is_alive())
+                self.assertEqual(result["value"]["status"], "paused")
+                self.assertFalse(result["value"]["asynchronous"])
+                self.assertFalse(server.control_store.has_live_owner("run-mcp-wait-pause"))
+            finally:
+                server.close()
+
+    def test_mcp_stdio_eof_detaches_non_daemon_async_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = JudgerMCPServer(
+                JudgerMCPSettings(
+                    records_dir=root / "records",
+                    providers_file=root / "providers.json",
+                    mcp_servers_file=root / "mcp.json",
+                    skills_file=root / "skills.json",
+                    agents_dir=root / "agents",
+                ),
+                stdin=io.StringIO(""),
+                stdout=io.StringIO(),
+            )
+            entered = Event()
+            release = Event()
+
+            class CompletingOpenCodeRunner:
+                def __init__(self, *, records_dir):
+                    self.records_dir = records_dir
+
+                def run(self, config, *, store, run_origin, should_stop=None):
+                    payload = dict(store.get(str(config.run_id)) or {})
+                    payload.update(
+                        {
+                            "run_id": str(config.run_id),
+                            "status": "running",
+                            "run_origin": run_origin,
+                            "engine": "opencode",
+                            "finding_count": 0,
+                            "completed_finding_count": 0,
+                            "reports": [],
+                            "diagnostics": [],
+                            "cli_sessions": [
+                                {
+                                    "role": "moderator",
+                                    "session_name": "fake-moderator-session",
+                                }
+                            ],
+                        }
+                    )
+                    store.save_payload(payload)
+                    entered.set()
+                    release.wait(2)
+                    payload["status"] = "completed"
+                    store.save_payload(payload)
+                    return payload
+
+            try:
+                with patch("vuln_judger.mcp_server.OpenCodeDrivenRunner", CompletingOpenCodeRunner):
+                    started = server._judge_report(
+                        {
+                            "run_id": "run-mcp-eof",
+                            "report_path": str(root / "report.md"),
+                            "source_path": str(root / "source"),
+                            "engine": "opencode",
+                        }
+                    )
+                    self.assertTrue(entered.wait(2))
+                    with server._active_runs_lock:
+                        active = server._active_runs[started["run_id"]]
+                    self.assertFalse(active.thread.daemon)
+
+                    server.serve_forever()
+
+                    self.assertTrue(active.thread.is_alive())
+                    self.assertTrue(server.control_store.has_live_owner(started["run_id"]))
+                    release.set()
+                    active.thread.join(timeout=2)
+
+                self.assertFalse(active.thread.is_alive())
+                self.assertEqual(server.records.get(started["run_id"])["status"], "completed")
+                self.assertFalse(server.control_store.has_live_owner(started["run_id"]))
+            finally:
+                release.set()
+                server.close()
 
     def test_vuln_judger_mcp_server_can_stop_async_codex_run(self):
         with tempfile.TemporaryDirectory() as tmp:
