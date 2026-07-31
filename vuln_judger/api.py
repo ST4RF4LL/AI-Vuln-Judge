@@ -198,7 +198,13 @@ def make_handler(
                         created,
                     )
                     self._json(
-                        {"run_id": run_id, "finding_id": finding_id, "created": created, "manual_review": review},
+                        {
+                            "run_id": run_id,
+                            "finding_id": finding_id,
+                            "created": created,
+                            "manual_review": review,
+                            "revision": store.revision(run_id),
+                        },
                         HTTPStatus.CREATED if created else HTTPStatus.OK,
                     )
                     return
@@ -457,7 +463,14 @@ def make_handler(
                     self._json({"error": "发现未找到"}, HTTPStatus.NOT_FOUND)
                     return
                 deleted = bool(store.delete_manual_review(run_id, finding_id))
-                self._json({"deleted": deleted, "run_id": run_id, "finding_id": finding_id})
+                self._json(
+                    {
+                        "deleted": deleted,
+                        "run_id": run_id,
+                        "finding_id": finding_id,
+                        "revision": store.revision(run_id),
+                    }
+                )
                 return
             if len(parts) == 2 and parts[0] == "runs":
                 deleted_record = store.delete(parts[1])
@@ -6112,6 +6125,14 @@ def app_html() -> str:
       rerenderRunDetailPreservingScroll();
     }}
 
+    function syncManualReviewRevision(revision) {{
+      if (!revision) return;
+      if (state.currentRun?.run_id === state.selectedRun) state.currentRun.revision = revision;
+      const run = state.runs.find(item => item.run_id === state.selectedRun);
+      if (run) run.revision = revision;
+      state.findingDetailCache = {{}};
+    }}
+
     async function saveManualReview(findingId, button) {{
       const item = findingSummaryById(findingId);
       if (!item) return;
@@ -6145,6 +6166,7 @@ def app_html() -> str:
           message: result.created ? '人工复核已创建。' : '人工复核已更新。',
           error: false,
         }};
+        syncManualReviewRevision(result.revision);
         rerenderRunDetailPreservingScroll();
       }} catch (error) {{
         draft.message = error.message;
@@ -6162,7 +6184,7 @@ def app_html() -> str:
       button.disabled = true;
       button.textContent = '清除中...';
       try {{
-        await fetchJson(
+        const result = await fetchJson(
           `/runs/${{encodeURIComponent(state.selectedRun)}}/findings/${{encodeURIComponent(findingId)}}/manual-review`,
           {{ method: 'DELETE' }}
         );
@@ -6172,6 +6194,7 @@ def app_html() -> str:
         state.manualReviewDrafts[manualReviewKey(state.selectedRun, findingId)] = {{
           decision: '', evidence: '', dirty: false, savedUpdatedAt: '', message: '人工复核已清除。', error: false,
         }};
+        syncManualReviewRevision(result.revision);
         rerenderRunDetailPreservingScroll();
       }} catch (error) {{
         setManualReviewStatus(findingId, error.message, true);

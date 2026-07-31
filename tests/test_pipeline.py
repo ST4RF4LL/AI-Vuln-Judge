@@ -2137,6 +2137,7 @@ for raw in sys.stdin.buffer:
                     created_review = json.loads(response.read().decode("utf-8"))
                     self.assertEqual(response.status, HTTPStatus.CREATED)
                 self.assertTrue(created_review["created"])
+                self.assertTrue(created_review["revision"])
                 first_created_at = created_review["manual_review"]["created_at"]
 
                 update_review_request = urllib.request.Request(
@@ -2151,6 +2152,7 @@ for raw in sys.stdin.buffer:
                     updated_review = json.loads(response.read().decode("utf-8"))
                     self.assertEqual(response.status, HTTPStatus.OK)
                 self.assertFalse(updated_review["created"])
+                self.assertTrue(updated_review["revision"])
                 self.assertEqual(updated_review["manual_review"]["created_at"], first_created_at)
 
                 with urllib.request.urlopen(f"{base}/runs/{created['run_id']}/findings", timeout=5) as response:
@@ -2215,6 +2217,7 @@ for raw in sys.stdin.buffer:
                 with urllib.request.urlopen(clear_review_request, timeout=5) as response:
                     cleared_review = json.loads(response.read().decode("utf-8"))
                 self.assertTrue(cleared_review["deleted"])
+                self.assertTrue(cleared_review["revision"])
                 with urllib.request.urlopen(
                     f"{base}/runs/{created['run_id']}/findings/{finding_id}", timeout=5
                 ) as response:
@@ -2419,6 +2422,8 @@ for raw in sys.stdin.buffer:
         self.assertIn("option('INCONCLUSIVE', '证据不足')", html)
         self.assertIn('async function saveManualReview(findingId, button)', html)
         self.assertIn('async function clearManualReview(findingId, button)', html)
+        self.assertIn('function syncManualReviewRevision(revision)', html)
+        self.assertIn('syncManualReviewRevision(result.revision);', html)
         self.assertIn('state.manualReviewDrafts[key]', html)
         self.assertIn('draft.dirty = true', html)
         self.assertIn("method: 'PUT'", html)
